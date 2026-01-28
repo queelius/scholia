@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>texwatch</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+</head>
+<body>
+    <header>
+        <div class="header-left">
+            <h1>texwatch: <span id="filename">loading...</span></h1>
+        </div>
+        <div class="header-right">
+            <span id="status-indicator" class="status watching">Watching</span>
+            <button id="btn-refresh" title="Force recompile">&#x21bb;</button>
+            <button id="btn-settings" title="Settings">&#x2699;</button>
+        </div>
+    </header>
+
+    <main>
+        <div id="pdf-container">
+            <canvas id="pdf-canvas"></canvas>
+        </div>
+    </main>
+
+    <footer>
+        <div id="error-panel" class="collapsed">
+            <div id="error-header">
+                <span id="error-summary">No issues</span>
+                <button id="btn-toggle-errors">&#x25bc;</button>
+            </div>
+            <div id="error-list"></div>
+        </div>
+        <div id="status-bar">
+            <span id="page-info">Page 1/1</span>
+            <span id="line-info"></span>
+            <span id="compile-info">Ready</span>
+        </div>
+    </footer>
+
+    <script src="/static/viewer.js"></script>
+</body>
+</html>

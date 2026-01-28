@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "texwatch"
+version = "0.1.0"
+description = "TeX file watcher with browser-based PDF viewer"
+# readme = "README.md"  # Uncomment when README exists
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "spinoza" }
+]
+keywords = ["tex", "latex", "pdf", "watcher", "viewer"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Markup :: LaTeX",
+]
+
+dependencies = [
+    "watchdog>=3.0.0",
+    "aiohttp>=3.9.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+texwatch = "texwatch.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/spinoza/texwatch"
+Repository = "https://github.com/spinoza/texwatch"
+
+[tool.hatch.build.targets.wheel]
+packages = ["texwatch"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --cov=texwatch --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["texwatch"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]

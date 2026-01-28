@@ -1,0 +1,141 @@
+"""Configuration loading and validation for texwatch."""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclass
+class Config:
+    """texwatch configuration."""
+
+    main: str
+    watch: list[str] = field(default_factory=lambda: ["*.tex"])
+    ignore: list[str] = field(default_factory=list)
+    compiler: str = "latexmk"
+    port: int = 8765
+    config_path: Path | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], config_path: Path | None = None) -> "Config":
+        """Create Config from dictionary."""
+        return cls(
+            main=data.get("main", "main.tex"),
+            watch=data.get("watch", ["*.tex"]),
+            ignore=data.get("ignore", []),
+            compiler=data.get("compiler", "latexmk"),
+            port=data.get("port", 8765),
+            config_path=config_path,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert config to dictionary (for API responses)."""
+        return {
+            "main": self.main,
+            "watch": self.watch,
+            "ignore": self.ignore,
+            "compiler": self.compiler,
+            "port": self.port,
+        }
+
+
+DEFAULT_CONFIG_NAME = "texwatch.yaml"
+
+
+def find_config(start_dir: Path | None = None) -> Path | None:
+    """Find texwatch.yaml in current or parent directories."""
+    if start_dir is None:
+        start_dir = Path.cwd()
+
+    current = start_dir.resolve()
+    while current != current.parent:
+        config_path = current / DEFAULT_CONFIG_NAME
+        if config_path.exists():
+            return config_path
+        current = current.parent
+
+    return None
+
+
+def load_config(path: Path | None = None, main_file: str | None = None) -> Config:
+    """Load configuration from file or create default.
+
+    Args:
+        path: Explicit path to config file. If None, searches for texwatch.yaml.
+        main_file: Override main file from CLI argument.
+
+    Returns:
+        Config instance.
+    """
+    config_path = path
+    data: dict[str, Any] = {}
+
+    if config_path is None:
+        config_path = find_config()
+
+    if config_path and config_path.exists():
+        with open(config_path) as f:
+            data = yaml.safe_load(f) or {}
+
+    # CLI argument overrides config file
+    if main_file:
+        data["main"] = main_file
+
+    # Default main file if not specified
+    if "main" not in data:
+        data["main"] = "main.tex"
+
+    return Config.from_dict(data, config_path=config_path)
+
+
+def create_config(
+    main: str = "main.tex",
+    watch: list[str] | None = None,
+    ignore: list[str] | None = None,
+    compiler: str = "latexmk",
+    port: int = 8765,
+    output_path: Path | None = None,
+) -> Path:
+    """Create a new texwatch.yaml configuration file.
+
+    Args:
+        main: Main TeX file.
+        watch: List of glob patterns to watch.
+        ignore: List of glob patterns to ignore.
+        compiler: Compiler to use.
+        port: Server port.
+        output_path: Where to write config. Defaults to ./texwatch.yaml.
+
+    Returns:
+        Path to created config file.
+    """
+    if output_path is None:
+        output_path = Path.cwd() / DEFAULT_CONFIG_NAME
+
+    config_data = {
+        "main": main,
+        "watch": watch or ["*.tex", "**/*.tex"],
+        "ignore": ignore or ["*_backup.tex"],
+        "compiler": compiler,
+        "port": port,
+    }
+
+    with open(output_path, "w") as f:
+        yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+
+    return output_path
+
+
+def get_watch_dir(config: Config) -> Path:
+    """Get the directory to watch based on config."""
+    if config.config_path:
+        return config.config_path.parent
+    return Path.cwd()
+
+
+def get_main_file(config: Config) -> Path:
+    """Get the absolute path to the main TeX file."""
+    watch_dir = get_watch_dir(config)
+    return watch_dir / config.main
