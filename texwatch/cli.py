@@ -718,7 +718,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     """Handle scan command — discover projects in a directory."""
-    from .workspace import discover_projects, load_workspace, save_workspace, merge_discovered, WorkspaceConfig, _resolve_default
+    from .workspace import discover_projects, load_workspace, save_workspace, merge_discovered, reset_directory, WorkspaceConfig, _resolve_default
 
     scan_dir = Path(args.directory).resolve()
     if not scan_dir.is_dir():
@@ -776,10 +776,78 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     # Load or create workspace, merge, save
     ws = load_workspace() or WorkspaceConfig()
+    if getattr(args, "reset", False):
+        removed = reset_directory(ws, scan_dir)
+        if removed and not getattr(args, "json", False):
+            print(f"Reset {removed} existing project(s) under {scan_dir}")
     ws = merge_discovered(ws, found)
     ws_path = save_workspace(ws)
     print(f"Updated {ws_path}")
     return EXIT_OK
+
+
+def cmd_workspace(args: argparse.Namespace) -> int:
+    """Handle workspace subcommand."""
+    ws_cmd = getattr(args, "ws_command", None)
+    dispatch = {
+        "purge": _cmd_workspace_purge,
+        "show": _cmd_workspace_show,
+        "path": _cmd_workspace_path,
+        "edit": _cmd_workspace_edit,
+    }
+    handler = dispatch.get(ws_cmd)
+    if handler:
+        return handler(args)
+    print("Usage: texwatch workspace {purge,show,path,edit}")
+    return EXIT_FAIL
+
+
+def _cmd_workspace_purge(args: argparse.Namespace) -> int:
+    from .workspace import load_workspace, save_workspace, purge_projects
+    ws = load_workspace()
+    if ws is None:
+        print("No workspace found.")
+        return EXIT_OK
+    removed = purge_projects(ws)
+    if removed == 0:
+        print("Workspace already empty.")
+        return EXIT_OK
+    save_workspace(ws)
+    print(f"Removed {removed} project(s) from workspace.")
+    return EXIT_OK
+
+
+def _cmd_workspace_show(args: argparse.Namespace) -> int:
+    from .workspace import load_workspace, workspace_path
+    ws_path = workspace_path()
+    ws = load_workspace()
+    if ws is None:
+        print(f"No workspace found at {ws_path}")
+        return EXIT_FAIL
+    print(f"Workspace: {ws_path}")
+    print(f"Port:      {ws.port}")
+    if ws.defaults:
+        print(f"Defaults:  {ws.defaults}")
+    print(f"Projects:  {len(ws.projects)}")
+    return EXIT_OK
+
+
+def _cmd_workspace_path(args: argparse.Namespace) -> int:
+    from .workspace import workspace_path
+    print(workspace_path())
+    return EXIT_OK
+
+
+def _cmd_workspace_edit(args: argparse.Namespace) -> int:
+    import os
+    import subprocess
+    from .workspace import workspace_path
+    ws_path = workspace_path()
+    if not ws_path.exists():
+        print(f"No workspace found at {ws_path}")
+        return EXIT_FAIL
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR", "vi")
+    return subprocess.call([editor, str(ws_path)])
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -1015,6 +1083,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--skip-dirs", type=str, default=None,
                         help="Comma-separated glob patterns of directories to skip")
     p_scan.add_argument("--json", action="store_true", help="Output as JSON")
+    p_scan.add_argument("--reset", action="store_true",
+                        help="Remove existing projects under scanned directory before re-discovering")
 
     # --- add ---
     p_add = subparsers.add_parser("add", help="Register a project directory")
@@ -1025,6 +1095,14 @@ def build_parser() -> argparse.ArgumentParser:
     # --- remove ---
     p_remove = subparsers.add_parser("remove", help="Unregister a project")
     p_remove.add_argument("name", help="Project name to remove")
+
+    # --- workspace ---
+    p_workspace = subparsers.add_parser("workspace", help="Manage workspace")
+    ws_sub = p_workspace.add_subparsers(dest="ws_command")
+    ws_sub.add_parser("purge", help="Remove all projects from workspace")
+    ws_sub.add_parser("show", help="Show workspace info")
+    ws_sub.add_parser("path", help="Print workspace file path")
+    ws_sub.add_parser("edit", help="Open workspace in $EDITOR")
 
     # --- projects ---
     p_projects = subparsers.add_parser("projects", help="List registered projects")
@@ -1067,6 +1145,7 @@ _DISPATCH = {
     "remove": cmd_remove,
     "projects": cmd_projects,
     "serve": cmd_serve,
+    "workspace": cmd_workspace,
 }
 
 

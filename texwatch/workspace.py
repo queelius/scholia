@@ -220,6 +220,25 @@ def merge_discovered(
     return ws
 
 
+def reset_directory(ws: WorkspaceConfig, root: Path) -> int:
+    """Remove projects whose directory is under *root*. Returns count removed."""
+    root = root.resolve()
+    to_remove = [
+        name for name, pc in ws.projects.items()
+        if pc.directory == root or pc.directory.is_relative_to(root)
+    ]
+    for name in to_remove:
+        del ws.projects[name]
+    return len(to_remove)
+
+
+def purge_projects(ws: WorkspaceConfig) -> int:
+    """Remove all projects. Returns count removed."""
+    count = len(ws.projects)
+    ws.projects.clear()
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

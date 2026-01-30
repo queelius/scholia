@@ -13,6 +13,8 @@ from texwatch.workspace import (
     load_workspace,
     merge_discovered,
     project_config_from_dir,
+    purge_projects,
+    reset_directory,
     save_workspace,
     workspace_path,
 )
@@ -633,3 +635,79 @@ class TestSkipDirs:
         names = {c.name for c in configs}
         assert "real" in names
         assert "wip" not in names
+
+
+# ---------------------------------------------------------------------------
+# reset_directory
+# ---------------------------------------------------------------------------
+
+
+class TestResetDirectory:
+    """Tests for reset_directory."""
+
+    def test_reset_removes_scoped(self, tmp_path):
+        """Test that projects under root are removed, others preserved."""
+        root = tmp_path / "papers"
+        other = tmp_path / "other"
+        ws = WorkspaceConfig(projects={
+            "papers/thesis": ProjectConfig(name="papers/thesis", directory=root / "thesis"),
+            "papers/icml": ProjectConfig(name="papers/icml", directory=root / "icml"),
+            "other/notes": ProjectConfig(name="other/notes", directory=other / "notes"),
+        })
+        removed = reset_directory(ws, root)
+        assert removed == 2
+        assert "other/notes" in ws.projects
+        assert "papers/thesis" not in ws.projects
+        assert "papers/icml" not in ws.projects
+
+    def test_reset_root_itself(self, tmp_path):
+        """Test that a project at the exact root directory is removed."""
+        root = tmp_path / "project"
+        ws = WorkspaceConfig(projects={
+            "project": ProjectConfig(name="project", directory=root),
+        })
+        removed = reset_directory(ws, root)
+        assert removed == 1
+        assert len(ws.projects) == 0
+
+    def test_reset_no_match(self, tmp_path):
+        """Test that reset returns 0 when no projects match."""
+        ws = WorkspaceConfig(projects={
+            "elsewhere": ProjectConfig(name="elsewhere", directory=tmp_path / "elsewhere"),
+        })
+        removed = reset_directory(ws, tmp_path / "nonexistent")
+        assert removed == 0
+        assert len(ws.projects) == 1
+
+    def test_reset_empty_workspace(self, tmp_path):
+        """Test reset on empty workspace does not error."""
+        ws = WorkspaceConfig()
+        removed = reset_directory(ws, tmp_path)
+        assert removed == 0
+        assert len(ws.projects) == 0
+
+
+# ---------------------------------------------------------------------------
+# purge_projects
+# ---------------------------------------------------------------------------
+
+
+class TestPurgeProjects:
+    """Tests for purge_projects."""
+
+    def test_purge_all(self, tmp_path):
+        """Test that purge removes all projects and returns count."""
+        ws = WorkspaceConfig(projects={
+            "a": ProjectConfig(name="a", directory=tmp_path / "a"),
+            "b": ProjectConfig(name="b", directory=tmp_path / "b"),
+            "c": ProjectConfig(name="c", directory=tmp_path / "c"),
+        })
+        removed = purge_projects(ws)
+        assert removed == 3
+        assert len(ws.projects) == 0
+
+    def test_purge_empty(self):
+        """Test purge on empty workspace returns 0."""
+        ws = WorkspaceConfig()
+        removed = purge_projects(ws)
+        assert removed == 0
