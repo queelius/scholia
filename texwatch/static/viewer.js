@@ -5,6 +5,10 @@
 // PDF.js configuration
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
+function _dbg(...args) {
+    if (window.TEXWATCH_DEBUG) console.log('[texwatch]', ...args);
+}
+
 class TexWatchViewer {
     constructor() {
         this.pdfDoc = null;
@@ -14,11 +18,21 @@ class TexWatchViewer {
         this.ws = null;
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 10;
+        this._wheelCooldown = false;
+        this.pdfHighlight = document.getElementById('pdf-highlight');
+        this._pdfHighlightTimer = null;
+        this._textHighlightTimer = null;
 
         // DOM elements
         this.canvas = document.getElementById('pdf-canvas');
         this.ctx = this.canvas.getContext('2d');
         this.container = document.getElementById('pdf-container');
+        this.textLayer = document.getElementById('text-layer');
+        this.markdownPreview = document.getElementById('markdown-preview');
+
+        // Viewer mode: 'pdf' or 'markdown'
+        this.viewerMode = 'pdf';
+        this._markdownDebounceTimer = null;
         this.filename = document.getElementById('filename');
         this.statusIndicator = document.getElementById('status-indicator');
         this.pageInfo = document.getElementById('page-info');
@@ -48,11 +62,14 @@ class TexWatchViewer {
             this.errorPanel.classList.toggle('collapsed');
         });
 
-        // PDF click for SyncTeX reverse
-        this.canvas.addEventListener('click', (e) => {
+        // PDF double-click for SyncTeX reverse (target container, not canvas,
+        // because the text layer sits on top of the canvas)
+        this.container.addEventListener('dblclick', (e) => {
             const rect = this.canvas.getBoundingClientRect();
             const x = e.clientX - rect.left;
             const y = e.clientY - rect.top;
+
+            _dbg(`dblclick: pixel(${x.toFixed(1)}, ${y.toFixed(1)}) -> pdf(${(x / this.scale).toFixed(1)}, ${(y / this.scale).toFixed(1)}) page=${this.currentPage}`);
 
             // Send click to server for reverse sync
             if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -65,8 +82,9 @@ class TexWatchViewer {
             }
         });
 
-        // Keyboard navigation
+        // Keyboard navigation (guard against editor focus)
         document.addEventListener('keydown', (e) => {
+            if (e.target.closest('.cm-editor')) return;
             if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
                 this.prevPage();
             } else if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') {
@@ -78,22 +96,64 @@ class TexWatchViewer {
             }
         });
 
-        // Scroll-based page navigation
+        // Forward SyncTeX: editor double-click → PDF navigates
+        window.addEventListener('texwatch:goto-line', (e) => {
+            this.gotoLine(e.detail.line);
+        });
+
+        // File loaded: switch viewer mode based on extension
+        window.addEventListener('texwatch:file-loaded', (e) => {
+            const file = e.detail.file;
+            if (file && (file.endsWith('.md') || file.endsWith('.markdown') || file.endsWith('.txt'))) {
+                this.setViewerMode('markdown');
+                if (window.texwatchEditor && window.texwatchEditor.view) {
+                    this.renderMarkdown(window.texwatchEditor.view.state.doc.toString());
+                }
+            } else {
+                this.setViewerMode('pdf');
+            }
+        });
+
+        // Content changed: live-update markdown preview (debounced 300ms)
+        window.addEventListener('texwatch:content-changed', (e) => {
+            if (this.viewerMode !== 'markdown') return;
+            if (this._markdownDebounceTimer) clearTimeout(this._markdownDebounceTimer);
+            this._markdownDebounceTimer = setTimeout(() => {
+                this.renderMarkdown(e.detail.content);
+                this._markdownDebounceTimer = null;
+            }, 300);
+        });
+
+        // Editor state: forward to server via WebSocket
+        window.addEventListener('texwatch:editor-state', (e) => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({
+                    type: 'editor_state',
+                    state: { file: e.detail.file, line: e.detail.line }
+                }));
+            }
+        });
+
+        // Scroll-based page navigation (with cooldown to prevent trackpad rapid-fire)
         this.container.addEventListener('wheel', (e) => {
-            // Only if at top/bottom of container
+            if (this._wheelCooldown) return;
+
             const atTop = this.container.scrollTop === 0;
             const atBottom = this.container.scrollTop + this.container.clientHeight >= this.container.scrollHeight;
 
             if (e.deltaY < 0 && atTop) {
                 this.prevPage();
+                this._startWheelCooldown();
             } else if (e.deltaY > 0 && atBottom) {
                 this.nextPage();
+                this._startWheelCooldown();
             }
         });
     }
 
     connectWebSocket() {
-        const wsUrl = `ws://${window.location.host}/ws`;
+        const base = window.TEXWATCH_BASE || '';
+        const wsUrl = `ws://${window.location.host}${base}/ws`;
         this.ws = new WebSocket(wsUrl);
 
         this.ws.onopen = () => {
@@ -136,6 +196,9 @@ class TexWatchViewer {
     }
 
     handleMessage(data) {
+        if (data.type === 'goto' || data.type === 'source_position') {
+            _dbg('handleMessage:', data.type, JSON.stringify(data));
+        }
         switch (data.type) {
             case 'state':
                 this.handleState(data);
@@ -151,10 +214,17 @@ class TexWatchViewer {
                 this.handleCompiled(data.result);
                 break;
             case 'goto':
-                this.goToPage(data.page, data.y);
+                if (data.page != null) {
+                    this.goToPage(data.page, data.y, data.x, data.width, data.height);
+                }
                 break;
             case 'source_position':
                 this.showSourcePosition(data);
+                break;
+            case 'source_updated':
+                window.dispatchEvent(new CustomEvent('texwatch:source-updated', {
+                    detail: { file: data.file, mtime_ns: data.mtime_ns }
+                }));
                 break;
         }
     }
@@ -259,13 +329,14 @@ class TexWatchViewer {
 
     async loadPDF() {
         try {
+            const base = window.TEXWATCH_BASE || '';
             // Add cache-busting parameter
-            const url = `/pdf?t=${Date.now()}`;
+            const url = `${base}/pdf?t=${Date.now()}`;
             this.pdfDoc = await pdfjsLib.getDocument(url).promise;
             this.totalPages = this.pdfDoc.numPages;
 
             // Get filename from status
-            const response = await fetch('/status');
+            const response = await fetch(`${base}/status`);
             const status = await response.json();
             this.filename.textContent = status.file;
 
@@ -300,6 +371,25 @@ class TexWatchViewer {
             viewport: viewport
         }).promise;
 
+        // Render text layer for selection/copy support
+        if (this.textLayer) {
+            this.textLayer.innerHTML = '';
+            this.textLayer.style.width = viewport.width + 'px';
+            this.textLayer.style.height = viewport.height + 'px';
+            this.textLayer.style.setProperty('--scale-factor', viewport.scale);
+
+            const textContent = await page.getTextContent();
+            try {
+                await pdfjsLib.renderTextLayer({
+                    textContentSource: textContent,
+                    container: this.textLayer,
+                    viewport: viewport,
+                }).promise;
+            } catch (err) {
+                console.error('Failed to render text layer:', err);
+            }
+        }
+
         this.updatePageInfo();
         this.sendViewerState();
     }
@@ -321,12 +411,185 @@ class TexWatchViewer {
     }
 
     showSourcePosition(data) {
+        _dbg(`showSourcePosition: ${data.file}:${data.line} col=${data.column || 0}`);
         this.lineInfo.textContent = `${data.file}:${data.line}`;
+        window.dispatchEvent(new CustomEvent('texwatch:source-position', {
+            detail: { file: data.file, line: data.line, column: data.column || 0 }
+        }));
     }
 
-    goToPage(pageNum, y = null) {
-        this.renderPage(pageNum);
-        // TODO: scroll to y position if provided
+    _startWheelCooldown() {
+        this._wheelCooldown = true;
+        setTimeout(() => { this._wheelCooldown = false; }, 300);
+    }
+
+    goToPage(pageNum, y = null, x = null, width = null, height = null) {
+        _dbg(`goToPage: page=${pageNum} y=${y} x=${x} w=${width} h=${height}`);
+        this.renderPage(pageNum).then(() => {
+            if (y !== null) {
+                const textHighlighted = this._highlightTextAtPosition(x, y, width, height);
+                _dbg(`goToPage: textHighlighted=${textHighlighted}`);
+                // Always call for scroll-into-view; skip the overlay visual when text spans matched
+                this._showPdfHighlight(x, y, width, height, textHighlighted);
+            }
+        });
+    }
+
+    _showPdfHighlight(x, y, width, height, skipVisual = false) {
+        if (!this.pdfHighlight) return;
+
+        const s = this.scale;
+        const hasPreciseBox = (width && width > 0 && height && height > 0);
+        _dbg(`showPdfHighlight: hasPreciseBox=${hasPreciseBox}, skipVisual=${skipVisual}`);
+
+        if (hasPreciseBox) {
+            // SyncTeX y = baseline, box top = y - height
+            this.pdfHighlight.style.top = ((y - height) * s) + 'px';
+            this.pdfHighlight.style.left = (x * s) + 'px';
+            this.pdfHighlight.style.width = (width * s) + 'px';
+            this.pdfHighlight.style.height = (height * s * 1.3) + 'px'; // pad for descenders
+        } else {
+            // Fallback: full-width bar
+            this.pdfHighlight.style.top = (y * s - 10) + 'px';
+            this.pdfHighlight.style.left = '0';
+            this.pdfHighlight.style.width = '100%';
+            this.pdfHighlight.style.height = '20px';
+        }
+
+        // Only show the overlay rectangle when text-span highlighting didn't match
+        if (!skipVisual) {
+            this.pdfHighlight.classList.remove('active');
+            void this.pdfHighlight.offsetWidth;  // force reflow
+            this.pdfHighlight.classList.add('active');
+
+            if (this._pdfHighlightTimer) clearTimeout(this._pdfHighlightTimer);
+            this._pdfHighlightTimer = setTimeout(() => {
+                this.pdfHighlight.classList.remove('active');
+                this._pdfHighlightTimer = null;
+            }, 2000);
+        }
+
+        // Scroll viewer pane to show the highlight (always, regardless of skipVisual)
+        const viewerPane = document.getElementById('viewer-pane');
+        if (viewerPane) {
+            const containerTop = this.container.offsetTop;
+            const scrollTarget = parseFloat(this.pdfHighlight.style.top);
+            viewerPane.scrollTo({
+                top: containerTop + scrollTarget - viewerPane.clientHeight / 2,
+                behavior: 'smooth'
+            });
+        }
+    }
+
+    _highlightTextAtPosition(x, y, width, height) {
+        if (!this.textLayer) {
+            _dbg('highlight: textLayer not available');
+            return false;
+        }
+
+        // Clear any previous text highlights
+        this.textLayer.querySelectorAll('.synctex-text-highlight')
+            .forEach(el => el.classList.remove('synctex-text-highlight'));
+
+        if (this._textHighlightTimer) {
+            clearTimeout(this._textHighlightTimer);
+            this._textHighlightTimer = null;
+        }
+
+        const s = this.scale;
+        const spans = this.textLayer.querySelectorAll(
+            'span:not(.markedContent):not(.endOfContent)');
+        if (spans.length === 0) {
+            _dbg('highlight: 0 text spans');
+            return false;
+        }
+
+        const hasPreciseBox = (width && width > 0 && height && height > 0);
+        _dbg(`highlight: ${spans.length} spans, hasPreciseBox=${hasPreciseBox} (w=${width}, h=${height}), scale=${s.toFixed(2)}`);
+        let matched = 0;
+
+        if (hasPreciseBox) {
+            // PATH A: Precise bounding box — use box overlap
+            const boxTop = (y - height) * s;
+            const boxLeft = x * s;
+            const boxRight = boxLeft + width * s;
+            const boxBottom = boxTop + height * s * 1.3;  // pad for descenders
+
+            _dbg(`highlight: PATH A — box: top=${boxTop.toFixed(1)} left=${boxLeft.toFixed(1)} right=${boxRight.toFixed(1)} bottom=${boxBottom.toFixed(1)}`);
+
+            for (const span of spans) {
+                const top = parseFloat(span.style.top) || 0;
+                const left = parseFloat(span.style.left) || 0;
+                const spanHeight = span.offsetHeight;
+                const scaleX = parseFloat(
+                    span.style.transform?.match(/scaleX\(([^)]+)\)/)?.[1]) || 1;
+                const spanWidth = span.offsetWidth * scaleX;
+
+                if (top < boxBottom && (top + spanHeight) > boxTop &&
+                    left < boxRight && (left + spanWidth) > boxLeft) {
+                    span.classList.add('synctex-text-highlight');
+                    matched++;
+                }
+            }
+
+            _dbg(`highlight: PATH A matched ${matched}/${spans.length} spans`);
+        } else {
+            // PATH B: Only y (and maybe x) — line-based matching
+            const targetY = y * s;
+
+            // Compute tolerance from actual span heights
+            let avgHeight = 0;
+            let count = 0;
+            for (const span of spans) {
+                const h = span.offsetHeight;
+                if (h > 0) { avgHeight += h; count++; }
+            }
+            const tolerance = count > 0 ? (avgHeight / count) * 0.6 : 15;
+
+            const targetX = (x && x > 0) ? x * s : 0;
+
+            _dbg(`highlight: PATH B — targetY=${targetY.toFixed(1)}, tolerance=${tolerance.toFixed(1)}, targetX=${targetX.toFixed(1)}`);
+
+            for (const span of spans) {
+                const top = parseFloat(span.style.top) || 0;
+                const spanHeight = span.offsetHeight;
+                const spanMidY = top + spanHeight / 2;
+
+                if (Math.abs(spanMidY - targetY) > tolerance) continue;
+
+                // If x is specified, only highlight from that point onward
+                if (targetX > 0) {
+                    const left = parseFloat(span.style.left) || 0;
+                    if (left + span.offsetWidth < targetX) continue;
+                }
+
+                span.classList.add('synctex-text-highlight');
+                matched++;
+            }
+
+            _dbg(`highlight: PATH B matched ${matched}/${spans.length} spans`);
+        }
+
+        // Log sample span positions when nothing matched
+        if (matched === 0) {
+            const sample = Math.min(5, spans.length);
+            const positions = [];
+            for (let i = 0; i < sample; i++) {
+                const sp = spans[i];
+                positions.push(`top=${parseFloat(sp.style.top) || 0} left=${parseFloat(sp.style.left) || 0} h=${sp.offsetHeight}`);
+            }
+            _dbg(`highlight: 0 matches — first ${sample} span positions:`, positions.join('; '));
+        }
+
+        if (matched > 0) {
+            this._textHighlightTimer = setTimeout(() => {
+                this.textLayer.querySelectorAll('.synctex-text-highlight')
+                    .forEach(el => el.classList.remove('synctex-text-highlight'));
+                this._textHighlightTimer = null;
+            }, 2000);
+        }
+
+        return matched > 0;
     }
 
     prevPage() {
@@ -342,18 +605,51 @@ class TexWatchViewer {
     }
 
     gotoLine(line) {
-        fetch('/goto', {
+        _dbg(`gotoLine: requesting forward sync for line=${line}`);
+        const base = window.TEXWATCH_BASE || '';
+        fetch(`${base}/goto`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ line: line })
+        }).then(resp => {
+            if (!resp.ok) {
+                resp.json().then(data => {
+                    console.warn('Forward SyncTeX failed:', data.error || resp.statusText);
+                }).catch(() => {
+                    console.warn('Forward SyncTeX failed:', resp.statusText);
+                });
+            }
+        }).catch(err => {
+            console.error('Forward SyncTeX request failed:', err);
         });
     }
 
     async forceCompile() {
         try {
-            await fetch('/compile', { method: 'POST' });
+            const base = window.TEXWATCH_BASE || '';
+            await fetch(`${base}/compile`, { method: 'POST' });
         } catch (err) {
             console.error('Failed to trigger compile:', err);
+        }
+    }
+
+    setViewerMode(mode) {
+        this.viewerMode = mode;
+        if (mode === 'markdown') {
+            this.container.style.display = 'none';
+            if (this.markdownPreview) this.markdownPreview.classList.remove('hidden');
+        } else {
+            this.container.style.display = '';
+            if (this.markdownPreview) this.markdownPreview.classList.add('hidden');
+        }
+    }
+
+    renderMarkdown(content) {
+        if (!this.markdownPreview || typeof marked === 'undefined') return;
+        try {
+            this.markdownPreview.innerHTML = marked.parse(content);
+        } catch (err) {
+            console.error('Markdown rendering failed:', err);
         }
     }
 
@@ -369,5 +665,11 @@ class TexWatchViewer {
 
 // Initialize when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
+    // Show back-link when in multi-project mode
+    if (window.TEXWATCH_BASE) {
+        const backLink = document.getElementById('back-link');
+        if (backLink) backLink.style.display = '';
+    }
+
     window.viewer = new TexWatchViewer();
 });

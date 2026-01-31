@@ -5,8 +5,10 @@ import pytest
 from texwatch.compiler import (
     CompileMessage,
     CompileResult,
+    _detect_compiler,
     _get_compiler_command,
     _parse_errors,
+    _parse_pandoc_errors,
     _parse_warnings,
     check_compiler_available,
 )
@@ -157,3 +159,86 @@ class TestCompileResult:
         assert len(result.warnings) == 1
         assert result.errors[0].line == 10
         assert result.warnings[0].line == 20
+
+
+class TestDetectCompiler:
+    """Tests for _detect_compiler function."""
+
+    def test_auto_detect_tex(self, tmp_path):
+        """Test .tex files resolve to latexmk."""
+        assert _detect_compiler(tmp_path / "doc.tex") == "latexmk"
+
+    def test_auto_detect_md(self, tmp_path):
+        """Test .md files resolve to pandoc."""
+        assert _detect_compiler(tmp_path / "doc.md") == "pandoc"
+
+    def test_auto_detect_markdown(self, tmp_path):
+        """Test .markdown files resolve to pandoc."""
+        assert _detect_compiler(tmp_path / "doc.markdown") == "pandoc"
+
+    def test_auto_detect_txt(self, tmp_path):
+        """Test .txt files resolve to pandoc."""
+        assert _detect_compiler(tmp_path / "notes.txt") == "pandoc"
+
+
+class TestPandocCommand:
+    """Tests for pandoc command generation."""
+
+    def test_pandoc_command(self, tmp_path):
+        """Test pandoc command is correct."""
+        main_file = tmp_path / "doc.md"
+        cmd = _get_compiler_command("pandoc", main_file, tmp_path)
+        assert cmd == ["pandoc", "doc.md", "-o", "doc.pdf"]
+
+    def test_auto_command_md(self, tmp_path):
+        """Test auto resolves to pandoc for .md files."""
+        main_file = tmp_path / "doc.md"
+        cmd = _get_compiler_command("auto", main_file, tmp_path)
+        assert cmd[0] == "pandoc"
+        assert "doc.md" in cmd
+        assert "doc.pdf" in cmd
+
+    def test_auto_command_tex(self, tmp_path):
+        """Test auto resolves to latexmk for .tex files."""
+        main_file = tmp_path / "main.tex"
+        cmd = _get_compiler_command("auto", main_file, tmp_path)
+        assert cmd[0] == "latexmk"
+
+
+class TestParsePandocErrors:
+    """Tests for _parse_pandoc_errors function."""
+
+    def test_empty_stderr(self):
+        """Test empty stderr returns no errors."""
+        assert _parse_pandoc_errors("") == []
+        assert _parse_pandoc_errors("  \n  ") == []
+
+    def test_stderr_with_error(self):
+        """Test stderr content is captured as error."""
+        errors = _parse_pandoc_errors("Error: Could not find file 'input.md'")
+        assert len(errors) == 1
+        assert errors[0].type == "error"
+        assert "Could not find file" in errors[0].message
+
+    def test_long_stderr_truncated(self):
+        """Test long stderr is truncated to 200 chars."""
+        long_msg = "x" * 300
+        errors = _parse_pandoc_errors(long_msg)
+        assert len(errors[0].message) == 200
+
+
+class TestCheckCompilerWithAuto:
+    """Tests for check_compiler_available with auto detection."""
+
+    def test_auto_with_tex_file(self, tmp_path):
+        """Test auto resolves to latexmk for .tex."""
+        main_file = tmp_path / "doc.tex"
+        # This tests that the function doesn't crash;
+        # actual availability depends on the system
+        result = check_compiler_available("auto", main_file=main_file)
+        assert isinstance(result, bool)
+
+    def test_auto_without_main_file(self):
+        """Test auto without main_file defaults to latexmk."""
+        result = check_compiler_available("auto")
+        assert isinstance(result, bool)

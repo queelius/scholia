@@ -32,10 +32,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+capture = ["pymupdf>=1.23.0"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
+    "pymupdf>=1.23.0",
 ]
 
 [project.scripts]

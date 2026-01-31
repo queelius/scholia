@@ -1,6 +1,8 @@
 """Tests for server module."""
 
 import json
+import logging
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,7 +27,7 @@ def config(tmp_path):
         ignore=[],
         compiler="latexmk",
         port=0,  # Use any available port
-        config_path=tmp_path / "texwatch.yaml",
+        config_path=tmp_path / ".texwatch.yaml",
     )
 
 
@@ -97,12 +99,16 @@ class TestGotoEndpoint:
 
     @pytest.mark.asyncio
     async def test_goto_line_no_synctex(self, client, server):
-        """Test goto line without SyncTeX data."""
+        """Test goto line without SyncTeX data - fallback returns success."""
+        # With no synctex and no total_pages, the last-resort fallback kicks in
         resp = await client.post(
             "/goto",
             json={"line": 42},
         )
-        assert resp.status == 404
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data.get("estimated") is True
 
     @pytest.mark.asyncio
     async def test_goto_page(self, client, server):
@@ -144,6 +150,155 @@ class TestGotoEndpoint:
             json={"section": "Introduction"},
         )
         assert resp.status == 501
+        data = await resp.json()
+        assert "not yet implemented" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_goto_line_fallback_with_pages(self, client, server):
+        """Test goto line fallback estimates page from line count."""
+        # Set viewer state with total_pages known
+        server._viewer_state["total_pages"] = 10
+
+        # The main.tex has 4 lines, requesting line 2
+        # estimated_page = round(2/4 * 10) = round(5.0) = 5
+        resp = await client.post(
+            "/goto",
+            json={"line": 2},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["estimated"] is True
+        assert data["page"] == 5
+
+    @pytest.mark.asyncio
+    async def test_goto_line_fallback_no_pages(self, client, server):
+        """Test goto line fallback when total_pages=0 - last resort."""
+        server._viewer_state["total_pages"] = 0
+
+        resp = await client.post(
+            "/goto",
+            json={"line": 1},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["estimated"] is True
+
+    @pytest.mark.asyncio
+    async def test_goto_line_last_resort_broadcasts_page(self, client, server):
+        """Test last-resort goto broadcasts page=1 (not line)."""
+        server._viewer_state["total_pages"] = 0
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+            resp = await client.post("/goto", json={"line": 42})
+            assert resp.status == 200
+            msg = await ws.receive_json()
+            assert msg["type"] == "goto"
+            assert msg["page"] == 1
+            assert "line" not in msg
+
+    @pytest.mark.asyncio
+    async def test_goto_line_estimation_clamped(self, client, server):
+        """Test that estimated page is clamped to total_pages."""
+        server._viewer_state["total_pages"] = 5
+
+        # Request line 9999 (way beyond the 4-line file)
+        # estimated = round(9999/4 * 5) which is huge, but clamped to 5
+        resp = await client.post(
+            "/goto",
+            json={"line": 9999},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["page"] <= 5
+
+
+    @pytest.mark.asyncio
+    async def test_goto_line_synctex_full_position(self, client, server, config):
+        """Test goto line with SyncTeX broadcasts full bounding box."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+
+        synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("main.tex", 10): [
+                    PDFPosition(page=1, x=72.0, y=600.0, width=200.0, height=12.0)
+                ],
+            },
+            input_files={},
+        )
+        server._synctex_data = synctex_data
+
+        async with client.ws_connect("/ws") as ws:
+            # Receive initial state
+            await ws.receive_json()
+
+            # Trigger goto
+            resp = await client.post("/goto", json={"line": 10})
+            assert resp.status == 200
+
+            # Should receive goto broadcast with full position
+            msg = await ws.receive_json()
+            assert msg["type"] == "goto"
+            assert msg["page"] == 1
+            assert msg["x"] == 72.0
+            assert msg["y"] == 600.0
+            assert msg["width"] == 200.0
+            assert msg["height"] == 12.0
+
+    @pytest.mark.asyncio
+    async def test_goto_line_synctex_zero_dimensions(self, client, server, config):
+        """Test goto with zero-dimension SyncTeX still sends fields."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+
+        synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("main.tex", 5): [
+                    PDFPosition(page=1, x=72.0, y=400.0, width=0.0, height=0.0)
+                ],
+            },
+            input_files={},
+        )
+        server._synctex_data = synctex_data
+
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()
+
+            resp = await client.post("/goto", json={"line": 5})
+            assert resp.status == 200
+
+            msg = await ws.receive_json()
+            assert msg["type"] == "goto"
+            assert msg["x"] == 72.0
+            assert msg["y"] == 400.0
+            assert msg["width"] == 0.0
+            assert msg["height"] == 0.0
+
+
+class TestCountSourceLines:
+    """Tests for _count_source_lines helper."""
+
+    def test_count_source_lines(self, server, config):
+        """Test counting lines in the main tex file."""
+        main_file = config.config_path.parent / "main.tex"
+        count = server._count_source_lines(main_file)
+        assert count == 4  # The fixture creates a 4-line file
+
+    def test_count_source_lines_missing(self, server):
+        """Test counting lines in a non-existent file."""
+        count = server._count_source_lines(Path("/nonexistent/file.tex"))
+        assert count == 0
+
+    def test_count_source_lines_empty(self, server, tmp_path):
+        """Test counting lines in an empty file."""
+        empty = tmp_path / "empty.tex"
+        empty.write_text("")
+        count = server._count_source_lines(empty)
+        # An empty file has 0 lines when split
+        assert count == 0
 
 
 class TestCompileEndpoint:
@@ -174,7 +329,130 @@ class TestCaptureEndpoint:
     async def test_capture_no_pdf(self, client, server):
         """Test capture when no PDF exists."""
         resp = await client.get("/capture")
-        assert resp.status in (404, 501)
+        assert resp.status == 404
+        data = await resp.json()
+        assert "PDF not found" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_capture_success(self, client, server, config):
+        """Test capture produces PNG from a real PDF."""
+        import pymupdf
+
+        # Create a test PDF using pymupdf
+        pdf_path = config.config_path.parent / "main.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "Hello, test!")
+        doc.save(str(pdf_path))
+        doc.close()
+
+        resp = await client.get("/capture")
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type") == "image/png"
+        data = await resp.read()
+        # Verify PNG signature
+        assert data[:8] == b"\x89PNG\r\n\x1a\n"
+
+    @pytest.mark.asyncio
+    async def test_capture_specific_page(self, client, server, config):
+        """Test capture with ?page=2."""
+        import pymupdf
+
+        pdf_path = config.config_path.parent / "main.pdf"
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.new_page()
+        doc.save(str(pdf_path))
+        doc.close()
+
+        resp = await client.get("/capture?page=2")
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type") == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_capture_invalid_page(self, client, server, config):
+        """Test capture with ?page=abc returns 400."""
+        import pymupdf
+
+        pdf_path = config.config_path.parent / "main.pdf"
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.save(str(pdf_path))
+        doc.close()
+
+        resp = await client.get("/capture?page=abc")
+        assert resp.status == 400
+        data = await resp.json()
+        assert "Invalid page" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_capture_out_of_range(self, client, server, config):
+        """Test capture with ?page=999 returns 400."""
+        import pymupdf
+
+        pdf_path = config.config_path.parent / "main.pdf"
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.save(str(pdf_path))
+        doc.close()
+
+        resp = await client.get("/capture?page=999")
+        assert resp.status == 400
+        data = await resp.json()
+        assert "out of range" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_capture_custom_dpi(self, client, server, config):
+        """Test capture with ?dpi=72 produces smaller image."""
+        import pymupdf
+
+        pdf_path = config.config_path.parent / "main.pdf"
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.save(str(pdf_path))
+        doc.close()
+
+        resp_low = await client.get("/capture?dpi=72")
+        assert resp_low.status == 200
+        data_low = await resp_low.read()
+
+        resp_high = await client.get("/capture?dpi=300")
+        assert resp_high.status == 200
+        data_high = await resp_high.read()
+
+        # Higher DPI should produce more bytes
+        assert len(data_high) > len(data_low)
+
+    @pytest.mark.asyncio
+    async def test_capture_invalid_dpi(self, client, server, config):
+        """Test capture with ?dpi=abc returns 400."""
+        import pymupdf
+
+        pdf_path = config.config_path.parent / "main.pdf"
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.save(str(pdf_path))
+        doc.close()
+
+        resp = await client.get("/capture?dpi=abc")
+        assert resp.status == 400
+        data = await resp.json()
+        assert "Invalid dpi" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_capture_no_pymupdf(self, client, server, config):
+        """Test capture when pymupdf is not installed returns 501."""
+        # Create a PDF so we get past the "not found" check
+        pdf_path = config.config_path.parent / "main.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+        # Simulate pymupdf not being available
+        with patch.dict(sys.modules, {"pymupdf": None}):
+            resp = await client.get("/capture")
+            assert resp.status == 501
+            data = await resp.json()
+            assert "pymupdf not installed" in data["error"]
+            assert "pip install" in data["error"]
 
 
 class TestPdfEndpoint:
@@ -253,6 +531,58 @@ class TestWebSocket:
             assert server._viewer_state["total_pages"] == 10
 
 
+class TestEditorState:
+    """Tests for editor state tracking."""
+
+    def test_initial_editor_state_is_null(self, server):
+        """Test editor state defaults to null values."""
+        assert server._editor_state["file"] is None
+        assert server._editor_state["line"] is None
+
+    @pytest.mark.asyncio
+    async def test_editor_state_update_via_websocket(self, client, server):
+        """Test editor state updates when receiving editor_state WebSocket message."""
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            await ws.send_json({
+                "type": "editor_state",
+                "state": {
+                    "file": "chapters/intro.tex",
+                    "line": 42,
+                }
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+            assert server._editor_state["file"] == "chapters/intro.tex"
+            assert server._editor_state["line"] == 42
+
+    @pytest.mark.asyncio
+    async def test_status_includes_editor_state(self, client, server):
+        """Test /status response includes editor state."""
+        server._editor_state = {"file": "main.tex", "line": 10}
+
+        resp = await client.get("/status")
+        data = await resp.json()
+        assert "editor" in data
+        assert data["editor"]["file"] == "main.tex"
+        assert data["editor"]["line"] == 10
+
+    @pytest.mark.asyncio
+    async def test_initial_ws_state_includes_editor(self, client, server):
+        """Test initial WebSocket state message includes editor state."""
+        server._editor_state = {"file": "test.tex", "line": 5}
+
+        async with client.ws_connect("/ws") as ws:
+            msg = await ws.receive_json()
+            assert msg["type"] == "state"
+            assert "editor" in msg
+            assert msg["editor"]["file"] == "test.tex"
+            assert msg["editor"]["line"] == 5
+
+
 class TestServerHelpers:
     """Tests for server helper methods."""
 
@@ -280,3 +610,602 @@ class TestServerHelpers:
         assert d["line"] == 42
         assert d["message"] == "Test error"
         assert d["type"] == "error"
+
+
+class TestGetSourceEndpoint:
+    """Tests for GET /source endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_get_source_success(self, client, config):
+        """Test GET /source returns content and mtime_ns as string."""
+        resp = await client.get("/source?file=main.tex")
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert data["file"] == "main.tex"
+        assert "\\documentclass{article}" in data["content"]
+        assert "mtime_ns" in data
+        # mtime_ns must be a string (to preserve precision for JS)
+        assert isinstance(data["mtime_ns"], str)
+        assert len(data["mtime_ns"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_get_source_default_file(self, client, config):
+        """Test GET /source without ?file= returns main file."""
+        resp = await client.get("/source")
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert data["file"] == "main.tex"
+        assert "\\documentclass{article}" in data["content"]
+
+    @pytest.mark.asyncio
+    async def test_get_source_not_found(self, client):
+        """Test GET /source for nonexistent file returns 404."""
+        resp = await client.get("/source?file=nonexistent.tex")
+        assert resp.status == 404
+
+        data = await resp.json()
+        assert "not found" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_get_source_path_traversal(self, client):
+        """Test GET /source rejects path traversal attempts."""
+        resp = await client.get("/source?file=../../etc/passwd")
+        assert resp.status == 403
+
+        data = await resp.json()
+        assert "denied" in data["error"].lower()
+
+
+class TestPostSourceEndpoint:
+    """Tests for POST /source endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_save_source_success(self, client, config):
+        """Test saving with valid base_mtime_ns succeeds."""
+        # First, get the current mtime
+        get_resp = await client.get("/source?file=main.tex")
+        get_data = await get_resp.json()
+        mtime_ns = get_data["mtime_ns"]
+
+        # Save with matching base_mtime_ns
+        new_content = "\\documentclass{article}\n\\begin{document}\nUpdated!\n\\end{document}\n"
+        resp = await client.post("/source", json={
+            "file": "main.tex",
+            "content": new_content,
+            "base_mtime_ns": mtime_ns,
+        })
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert data["success"] is True
+        assert "mtime_ns" in data
+        assert isinstance(data["mtime_ns"], str)
+        # New mtime should differ from old
+        assert data["mtime_ns"] != mtime_ns
+
+        # Verify the file was actually written
+        file_path = config.config_path.parent / "main.tex"
+        assert "Updated!" in file_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_save_source_conflict(self, client, config):
+        """Test saving with stale base_mtime_ns returns 409."""
+        resp = await client.post("/source", json={
+            "file": "main.tex",
+            "content": "new content",
+            "base_mtime_ns": "0",  # stale mtime
+        })
+        assert resp.status == 409
+
+        data = await resp.json()
+        assert "modified externally" in data["error"].lower()
+        assert "current_mtime_ns" in data
+
+    @pytest.mark.asyncio
+    async def test_save_source_no_mtime_check(self, client, config):
+        """Test saving without base_mtime_ns succeeds (force save)."""
+        new_content = "\\documentclass{article}\n\\begin{document}\nForced!\n\\end{document}\n"
+        resp = await client.post("/source", json={
+            "file": "main.tex",
+            "content": new_content,
+        })
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert data["success"] is True
+
+        file_path = config.config_path.parent / "main.tex"
+        assert "Forced!" in file_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_save_source_path_traversal(self, client):
+        """Test POST /source rejects path traversal."""
+        resp = await client.post("/source", json={
+            "file": "../../etc/passwd",
+            "content": "malicious",
+        })
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_save_source_missing_fields(self, client):
+        """Test POST /source with missing fields returns 400."""
+        resp = await client.post("/source", json={
+            "file": "main.tex",
+            # missing "content"
+        })
+        assert resp.status == 400
+
+        data = await resp.json()
+        assert "missing" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_save_source_not_found(self, client):
+        """Test POST /source for nonexistent file returns 404."""
+        resp = await client.post("/source", json={
+            "file": "nonexistent.tex",
+            "content": "content",
+        })
+        assert resp.status == 404
+
+
+class TestFilesEndpoint:
+    """Tests for GET /files endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_files_basic(self, client, config):
+        """Test /files returns tree with main.tex."""
+        resp = await client.get("/files")
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert "root" in data
+        assert "children" in data
+        names = [c["name"] for c in data["children"]]
+        assert "main.tex" in names
+
+    @pytest.mark.asyncio
+    async def test_files_includes_bib(self, client, config):
+        """Test /files includes .bib files."""
+        bib_path = config.config_path.parent / "refs.bib"
+        bib_path.write_text("@article{test, title={Test}}")
+
+        resp = await client.get("/files")
+        data = await resp.json()
+        names = [c["name"] for c in data["children"]]
+        assert "refs.bib" in names
+
+    @pytest.mark.asyncio
+    async def test_files_excludes_non_relevant(self, client, config):
+        """Test /files excludes non-relevant files like .jpg."""
+        jpg_path = config.config_path.parent / "image.jpg"
+        jpg_path.write_bytes(b"\xff\xd8\xff")
+
+        resp = await client.get("/files")
+        data = await resp.json()
+        names = [c["name"] for c in data["children"]]
+        assert "image.jpg" not in names
+
+    @pytest.mark.asyncio
+    async def test_files_nested_directory(self, client, config):
+        """Test /files includes nested directories with .tex files."""
+        chapters = config.config_path.parent / "chapters"
+        chapters.mkdir()
+        (chapters / "intro.tex").write_text("\\chapter{Intro}")
+
+        resp = await client.get("/files")
+        data = await resp.json()
+        dir_names = [c["name"] for c in data["children"] if c["type"] == "directory"]
+        assert "chapters" in dir_names
+
+        # Find chapters dir and check children
+        chapters_node = next(c for c in data["children"] if c["name"] == "chapters")
+        child_names = [c["name"] for c in chapters_node["children"]]
+        assert "intro.tex" in child_names
+
+    @pytest.mark.asyncio
+    async def test_files_excludes_hidden(self, client, config):
+        """Test /files excludes hidden directories."""
+        hidden = config.config_path.parent / ".hidden"
+        hidden.mkdir()
+        (hidden / "secret.tex").write_text("secret")
+
+        resp = await client.get("/files")
+        data = await resp.json()
+        names = [c["name"] for c in data["children"]]
+        assert ".hidden" not in names
+
+    @pytest.mark.asyncio
+    async def test_files_empty_dirs_excluded(self, client, config):
+        """Test /files excludes dirs with only irrelevant files."""
+        images = config.config_path.parent / "images"
+        images.mkdir()
+        (images / "photo.png").write_bytes(b"\x89PNG")
+
+        resp = await client.get("/files")
+        data = await resp.json()
+        dir_names = [c["name"] for c in data["children"] if c["type"] == "directory"]
+        assert "images" not in dir_names
+
+    @pytest.mark.asyncio
+    async def test_files_paths_relative(self, client, config):
+        """Test /files returns relative paths."""
+        chapters = config.config_path.parent / "chapters"
+        chapters.mkdir()
+        (chapters / "intro.tex").write_text("\\chapter{Intro}")
+
+        resp = await client.get("/files")
+        data = await resp.json()
+        chapters_node = next(c for c in data["children"] if c["name"] == "chapters")
+        intro = chapters_node["children"][0]
+        # Path should be relative: "chapters/intro.tex"
+        assert intro["path"] == "chapters/intro.tex"
+        assert "/" in intro["path"]
+        assert not intro["path"].startswith("/")
+
+
+class TestSourceUpdatedBroadcast:
+    """Tests for source_updated WebSocket broadcast."""
+
+    @pytest.mark.asyncio
+    async def test_file_change_broadcasts_source_updated(self, client, server, config):
+        """Test that _on_file_change broadcasts source_updated message."""
+        import asyncio
+
+        async with client.ws_connect("/ws") as ws:
+            # Receive initial state
+            await ws.receive_json()
+
+            # Trigger file change with the main.tex path
+            main_path = str(config.config_path.parent / "main.tex")
+            # Mock _do_compile to avoid actual compilation
+            with patch.object(server, "_do_compile", new_callable=AsyncMock):
+                await server._on_file_change(main_path)
+
+            # Should receive source_updated broadcast
+            msg = await ws.receive_json()
+            assert msg["type"] == "source_updated"
+            assert msg["file"] == "main.tex"
+            assert "mtime_ns" in msg
+            assert isinstance(msg["mtime_ns"], str)
+
+
+class TestServerLogging:
+    """Tests for debug logging in server handlers."""
+
+    @pytest.mark.asyncio
+    async def test_goto_line_synctex_hit_logs(self, client, server, caplog):
+        """Test that goto with synctex hit logs correctly."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("main.tex", 10): [
+                    PDFPosition(page=1, x=72.0, y=600.0, width=200.0, height=12.0)
+                ],
+            },
+            input_files={},
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="texwatch.server"):
+            resp = await client.post("/goto", json={"line": 10})
+            assert resp.status == 200
+
+        assert "synctex hit" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_goto_line_fallback_logs(self, client, server, caplog):
+        """Test that goto without synctex logs fallback."""
+        server._synctex_data = None
+
+        with caplog.at_level(logging.DEBUG, logger="texwatch.server"):
+            resp = await client.post("/goto", json={"line": 10})
+            assert resp.status == 200
+
+        assert "synctex miss" in caplog.text or "synctex_data=None" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_reverse_sync_click_logs(self, client, server, caplog):
+        """Test that reverse sync click logs the chain."""
+        from texwatch.synctex import PDFPosition, SourcePosition, SyncTeXData
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={
+                1: [(600.0, SourcePosition(file="main.tex", line=10))],
+            },
+            source_to_pdf={},
+            input_files={},
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="texwatch.server"):
+            async with client.ws_connect("/ws") as ws:
+                await ws.receive_json()  # initial state
+                await ws.send_json({
+                    "type": "click",
+                    "page": 1,
+                    "x": 100.0,
+                    "y": 600.0,
+                })
+                msg = await ws.receive_json()
+                assert msg["type"] == "source_position"
+
+        assert "reverse-sync:" in caplog.text
+
+
+class TestPortConflict:
+    """Tests for port-already-in-use handling."""
+
+    def test_run_raises_system_exit_on_port_conflict(self, config):
+        """Test that run() raises SystemExit(1) when the port is already bound."""
+        import errno as _errno
+
+        err = OSError(f"[Errno {_errno.EADDRINUSE}] Address already in use")
+        err.errno = _errno.EADDRINUSE
+
+        server = TexWatchServer(config)
+        with patch("asyncio.run", side_effect=err):
+            with pytest.raises(SystemExit) as exc_info:
+                server.run(port=9999)
+            assert exc_info.value.code == 1
+
+    def test_run_prints_friendly_message_on_port_conflict(self, config, capsys):
+        """Test that run() prints a helpful message when the port is in use."""
+        import errno as _errno
+
+        err = OSError(f"[Errno {_errno.EADDRINUSE}] Address already in use")
+        err.errno = _errno.EADDRINUSE
+
+        server = TexWatchServer(config)
+        with patch("asyncio.run", side_effect=err):
+            with pytest.raises(SystemExit):
+                server.run(port=9999)
+
+        captured = capsys.readouterr()
+        assert "already in use" in captured.out
+        assert "another texwatch instance" in captured.out.lower()
+        assert "9999" in captured.out
+
+    def test_run_reraises_other_oserror(self, config):
+        """Test that run() re-raises OSErrors that are not EADDRINUSE."""
+        err = OSError("Permission denied")
+        err.errno = 13  # EACCES
+
+        server = TexWatchServer(config)
+        with patch("asyncio.run", side_effect=err):
+            with pytest.raises(OSError, match="Permission denied"):
+                server.run(port=9999)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Multi-project tests
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestProjectInstance:
+    """Tests for ProjectInstance class."""
+
+    def test_project_instance_initial_state(self, config):
+        """Test ProjectInstance initial state."""
+        from texwatch.server import ProjectInstance
+        proj = ProjectInstance(config, name="test")
+        assert proj.name == "test"
+        assert proj.compiling is False
+        assert proj.last_result is None
+        assert proj.synctex_data is None
+        assert proj.viewer_state["page"] == 1
+        assert proj.editor_state["file"] is None
+        assert len(proj.websockets) == 0
+
+    def test_project_instance_status_summary(self, config):
+        """Test ProjectInstance status_summary."""
+        from texwatch.server import ProjectInstance
+        proj = ProjectInstance(config, name="thesis")
+        summary = proj.status_summary()
+        assert summary["name"] == "thesis"
+        assert summary["main"] == "main.tex"
+        assert summary["compiling"] is False
+        assert summary["success"] is None  # not compiled yet
+
+    def test_project_instance_status_after_compile(self, config):
+        """Test status_summary after setting a compile result."""
+        from texwatch.server import ProjectInstance
+        proj = ProjectInstance(config, name="thesis")
+        proj.last_result = CompileResult(
+            success=True,
+            errors=[],
+            warnings=[],
+        )
+        summary = proj.status_summary()
+        assert summary["success"] is True
+        assert summary["error_count"] == 0
+
+
+class TestMultiProjectServer:
+    """Tests for multi-project server mode."""
+
+    @pytest.fixture
+    def multi_config(self, tmp_path):
+        """Create configs for two projects."""
+        # Project A
+        dir_a = tmp_path / "project_a"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nA\n\\end{document}\n"
+        )
+        config_a = Config(
+            main="main.tex",
+            watch=["*.tex"],
+            ignore=[],
+            compiler="latexmk",
+            port=0,
+            config_path=dir_a / ".texwatch.yaml",
+        )
+
+        # Project B
+        dir_b = tmp_path / "project_b"
+        dir_b.mkdir()
+        (dir_b / "paper.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nB\n\\end{document}\n"
+        )
+        config_b = Config(
+            main="paper.tex",
+            watch=["*.tex"],
+            ignore=[],
+            compiler="latexmk",
+            port=0,
+            config_path=dir_b / ".texwatch.yaml",
+        )
+        return [("alpha", config_a), ("beta", config_b)]
+
+    @pytest.fixture
+    def multi_server(self, multi_config):
+        """Create a multi-project server."""
+        return TexWatchServer(projects=multi_config)
+
+    @pytest.fixture
+    async def multi_client(self, multi_server):
+        """Create an aiohttp test client for multi-project server."""
+        async with TestClient(TestServer(multi_server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_projects_endpoint(self, multi_client):
+        """Test GET /projects returns all projects."""
+        resp = await multi_client.get("/projects")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "projects" in data
+        names = {p["name"] for p in data["projects"]}
+        assert "alpha" in names
+        assert "beta" in names
+
+    @pytest.mark.asyncio
+    async def test_root_serves_dashboard(self, multi_client):
+        """Test GET / serves dashboard in multi-project mode."""
+        resp = await multi_client.get("/")
+        assert resp.status == 200
+        content = await resp.text()
+        assert "dashboard" in content.lower() or "texwatch" in content.lower()
+
+    @pytest.mark.asyncio
+    async def test_project_index(self, multi_client):
+        """Test GET /p/{name}/ serves project viewer."""
+        resp = await multi_client.get("/p/alpha/")
+        assert resp.status == 200
+        content = await resp.text()
+        assert "TEXWATCH_BASE" in content
+        assert "/p/alpha" in content
+
+    @pytest.mark.asyncio
+    async def test_project_status(self, multi_client, multi_server):
+        """Test GET /p/{name}/status returns project status."""
+        resp = await multi_client.get("/p/alpha/status")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["file"] == "main.tex"
+        assert "compiling" in data
+
+    @pytest.mark.asyncio
+    async def test_project_not_found(self, multi_client):
+        """Test /p/{name}/ with unknown name returns 404."""
+        resp = await multi_client.get("/p/nonexistent/status")
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_project_config(self, multi_client):
+        """Test GET /p/{name}/config returns project config."""
+        resp = await multi_client.get("/p/beta/config")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["main"] == "paper.tex"
+
+    @pytest.mark.asyncio
+    async def test_project_files(self, multi_client):
+        """Test GET /p/{name}/files returns file tree."""
+        resp = await multi_client.get("/p/alpha/files")
+        assert resp.status == 200
+        data = await resp.json()
+        names = [c["name"] for c in data["children"]]
+        assert "main.tex" in names
+
+    @pytest.mark.asyncio
+    async def test_project_get_source(self, multi_client):
+        """Test GET /p/{name}/source returns source."""
+        resp = await multi_client.get("/p/alpha/source")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["file"] == "main.tex"
+        assert "\\documentclass" in data["content"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_routes_on_multi_project(self, multi_client):
+        """Test legacy /status on multi-project returns /projects data."""
+        resp = await multi_client.get("/status")
+        assert resp.status == 200
+        data = await resp.json()
+        # In multi-project, legacy /status returns the /projects response
+        assert "projects" in data
+
+    @pytest.mark.asyncio
+    async def test_legacy_ws_on_multi_project(self, multi_client):
+        """Test legacy /ws on multi-project returns 400."""
+        with pytest.raises(Exception):
+            # WebSocket connect should fail since legacy WS is rejected
+            async with multi_client.ws_connect("/ws") as ws:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_project_websocket(self, multi_client, multi_server):
+        """Test WebSocket at /p/{name}/ws."""
+        async with multi_client.ws_connect("/p/alpha/ws") as ws:
+            msg = await ws.receive_json()
+            assert msg["type"] == "state"
+            assert "compiling" in msg
+
+    @pytest.mark.asyncio
+    async def test_project_isolation(self, multi_client, multi_server):
+        """Test that project state is isolated."""
+        # Set state on alpha
+        multi_server._projects["alpha"].last_result = CompileResult(
+            success=True, errors=[], warnings=[],
+        )
+
+        # Alpha should show success
+        resp_a = await multi_client.get("/p/alpha/status")
+        data_a = await resp_a.json()
+        assert data_a["success"] is True
+
+        # Beta should not
+        resp_b = await multi_client.get("/p/beta/status")
+        data_b = await resp_b.json()
+        assert data_b["success"] is None
+
+
+class TestSingleProjectMode:
+    """Tests for single-project mode (legacy compatibility)."""
+
+    @pytest.mark.asyncio
+    async def test_single_project_root_serves_index(self, client):
+        """Test GET / in single-project mode serves index.html."""
+        resp = await client.get("/")
+        assert resp.status == 200
+        content = await resp.text()
+        assert "texwatch" in content
+
+    def test_single_project_legacy_proxies(self, server):
+        """Test legacy property proxies work for single-project."""
+        assert server._compiling is False
+        server._compiling = True
+        assert server._compiling is True
+        server._compiling = False  # reset
+
+        assert server._viewer_state["page"] == 1
+        server._viewer_state["page"] = 5
+        assert server._viewer_state["page"] == 5
+
+    def test_single_project_has_single(self, server):
+        """Test single-project server has _single reference."""
+        assert server._single is not None
+        assert len(server._projects) == 1

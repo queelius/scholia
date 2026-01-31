@@ -6,10 +6,24 @@
     <title>texwatch</title>
     <link rel="stylesheet" href="/static/style.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "@codemirror/state": "https://esm.sh/@codemirror/state",
+            "@codemirror/view": "https://esm.sh/@codemirror/view?external=@codemirror/state",
+            "@codemirror/language": "https://esm.sh/@codemirror/language?external=@codemirror/state,@codemirror/view",
+            "codemirror": "https://esm.sh/codemirror?external=@codemirror/state,@codemirror/view,@codemirror/language",
+            "@codemirror/legacy-modes/mode/stex": "https://esm.sh/@codemirror/legacy-modes/mode/stex?external=@codemirror/language",
+            "@codemirror/theme-one-dark": "https://esm.sh/@codemirror/theme-one-dark?external=@codemirror/state,@codemirror/view,@codemirror/language"
+        }
+    }
+    </script>
 </head>
 <body>
     <header>
         <div class="header-left">
+            <a id="back-link" href="/" class="back-link" style="display:none" title="Back to dashboard">&#x2190;</a>
             <h1>texwatch: <span id="filename">loading...</span></h1>
         </div>
         <div class="header-right">
@@ -20,8 +34,34 @@
     </header>
 
     <main>
-        <div id="pdf-container">
-            <canvas id="pdf-canvas"></canvas>
+        <div id="file-tree-pane">
+            <div id="tree-header">
+                <span>Files</span>
+                <button id="btn-toggle-tree" title="Toggle file tree">&#x25c0;</button>
+            </div>
+            <div id="tree-container"></div>
+        </div>
+        <div id="tree-handle"></div>
+        <div id="editor-pane">
+            <div id="editor-header">
+                <span id="editor-filename">loading...</span>
+                <span id="editor-status"></span>
+            </div>
+            <div id="conflict-bar" class="hidden">
+                <span>File changed on disk.</span>
+                <button id="btn-reload">Reload</button>
+                <button id="btn-keep">Keep mine</button>
+            </div>
+            <div id="editor-container"></div>
+        </div>
+        <div id="split-handle"></div>
+        <div id="viewer-pane">
+            <div id="pdf-container">
+                <canvas id="pdf-canvas"></canvas>
+                <div id="text-layer" class="textLayer"></div>
+                <div id="pdf-highlight"></div>
+            </div>
+            <div id="markdown-preview" class="hidden"></div>
         </div>
     </main>
 
@@ -40,6 +80,8 @@
         </div>
     </footer>
 
+    <script src="/static/filetree.js"></script>
     <script src="/static/viewer.js"></script>
+    <script type="module" src="/static/editor.js"></script>
 </body>
 </html>

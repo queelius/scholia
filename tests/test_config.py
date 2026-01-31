@@ -23,9 +23,9 @@ class TestConfig:
         """Test Config.from_dict with minimal data."""
         config = Config.from_dict({"main": "test.tex"})
         assert config.main == "test.tex"
-        assert config.watch == ["*.tex"]
+        assert config.watch == ["*.tex", "*.md", "*.txt"]
         assert config.ignore == []
-        assert config.compiler == "latexmk"
+        assert config.compiler == "auto"
         assert config.port == 8765
 
     def test_from_dict_full(self):
@@ -57,13 +57,25 @@ class TestConfig:
         result = config.to_dict()
         assert result == original
 
+    def test_default_compiler_is_auto(self):
+        """Test that default compiler is 'auto'."""
+        config = Config(main="test.tex")
+        assert config.compiler == "auto"
+
+    def test_default_watch_includes_md(self):
+        """Test that default watch patterns include markdown."""
+        config = Config(main="test.tex")
+        assert "*.md" in config.watch
+        assert "*.txt" in config.watch
+        assert "*.tex" in config.watch
+
 
 class TestFindConfig:
     """Tests for find_config function."""
 
     def test_find_in_current_dir(self, tmp_path):
         """Test finding config in current directory."""
-        config_path = tmp_path / "texwatch.yaml"
+        config_path = tmp_path / ".texwatch.yaml"
         config_path.write_text("main: test.tex\n")
 
         result = find_config(tmp_path)
@@ -71,7 +83,7 @@ class TestFindConfig:
 
     def test_find_in_parent_dir(self, tmp_path):
         """Test finding config in parent directory."""
-        config_path = tmp_path / "texwatch.yaml"
+        config_path = tmp_path / ".texwatch.yaml"
         config_path.write_text("main: test.tex\n")
 
         subdir = tmp_path / "subdir"
@@ -91,7 +103,7 @@ class TestLoadConfig:
 
     def test_load_existing_config(self, tmp_path):
         """Test loading existing config file."""
-        config_path = tmp_path / "texwatch.yaml"
+        config_path = tmp_path / ".texwatch.yaml"
         config_path.write_text(
             yaml.dump(
                 {
@@ -110,7 +122,7 @@ class TestLoadConfig:
 
     def test_load_with_cli_override(self, tmp_path):
         """Test CLI argument overrides config file."""
-        config_path = tmp_path / "texwatch.yaml"
+        config_path = tmp_path / ".texwatch.yaml"
         config_path.write_text(yaml.dump({"main": "config.tex"}))
 
         config = load_config(config_path, main_file="cli.tex")
@@ -129,7 +141,7 @@ class TestCreateConfig:
 
     def test_create_default(self, tmp_path):
         """Test creating config with defaults."""
-        output_path = tmp_path / "texwatch.yaml"
+        output_path = tmp_path / ".texwatch.yaml"
         result = create_config(output_path=output_path)
 
         assert result == output_path
@@ -140,12 +152,14 @@ class TestCreateConfig:
 
         assert data["main"] == "main.tex"
         assert "*.tex" in data["watch"]
-        assert data["compiler"] == "latexmk"
+        assert "*.md" in data["watch"]
+        assert "*.txt" in data["watch"]
+        assert data["compiler"] == "auto"
         assert data["port"] == 8765
 
     def test_create_custom(self, tmp_path):
         """Test creating config with custom values."""
-        output_path = tmp_path / "texwatch.yaml"
+        output_path = tmp_path / ".texwatch.yaml"
         create_config(
             main="thesis.tex",
             watch=["*.tex", "chapters/**/*.tex"],
@@ -170,7 +184,7 @@ class TestHelperFunctions:
 
     def test_get_watch_dir_with_config_path(self, tmp_path):
         """Test get_watch_dir with config_path set."""
-        config = Config(main="test.tex", config_path=tmp_path / "texwatch.yaml")
+        config = Config(main="test.tex", config_path=tmp_path / ".texwatch.yaml")
         assert get_watch_dir(config) == tmp_path
 
     def test_get_watch_dir_without_config_path(self):
@@ -180,6 +194,6 @@ class TestHelperFunctions:
 
     def test_get_main_file(self, tmp_path):
         """Test get_main_file returns absolute path."""
-        config = Config(main="document.tex", config_path=tmp_path / "texwatch.yaml")
+        config = Config(main="document.tex", config_path=tmp_path / ".texwatch.yaml")
         result = get_main_file(config)
         assert result == tmp_path / "document.tex"

@@ -79,7 +79,7 @@ curl -X POST localhost:8765/compile
 ### Starting a Session
 
 1. Navigate to your TeX project directory
-2. Run `texwatch main.tex` (or just `texwatch` if texwatch.yaml exists)
+2. Run `texwatch main.tex` (or just `texwatch` if .texwatch.yaml exists)
 3. Open http://localhost:8765 in a browser
 4. Edit .tex files - PDF auto-reloads on save
 
@@ -98,7 +98,7 @@ When editing TeX files:
 
 ## Configuration
 
-texwatch uses `texwatch.yaml` in the project root:
+texwatch uses `.texwatch.yaml` in the project root:
 
 ```yaml
 main: main.tex
@@ -130,7 +130,7 @@ Create with: `texwatch --init`
 
 **"Compiler not found"**
 - Install latexmk: `sudo apt install latexmk` or `brew install latexmk`
-- Or use a different compiler in texwatch.yaml
+- Or use a different compiler in .texwatch.yaml
 
 **PDF not updating**
 - Check for compile errors: `texwatch --status`

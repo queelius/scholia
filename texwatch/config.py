@@ -12,9 +12,9 @@ class Config:
     """texwatch configuration."""
 
     main: str
-    watch: list[str] = field(default_factory=lambda: ["*.tex"])
+    watch: list[str] = field(default_factory=lambda: ["*.tex", "*.md", "*.txt"])
     ignore: list[str] = field(default_factory=list)
-    compiler: str = "latexmk"
+    compiler: str = "auto"
     port: int = 8765
     config_path: Path | None = None
 
@@ -23,9 +23,9 @@ class Config:
         """Create Config from dictionary."""
         return cls(
             main=data.get("main", "main.tex"),
-            watch=data.get("watch", ["*.tex"]),
+            watch=data.get("watch", ["*.tex", "*.md", "*.txt"]),
             ignore=data.get("ignore", []),
-            compiler=data.get("compiler", "latexmk"),
+            compiler=data.get("compiler", "auto"),
             port=data.get("port", 8765),
             config_path=config_path,
         )
@@ -41,11 +41,11 @@ class Config:
         }
 
 
-DEFAULT_CONFIG_NAME = "texwatch.yaml"
+DEFAULT_CONFIG_NAME = ".texwatch.yaml"
 
 
 def find_config(start_dir: Path | None = None) -> Path | None:
-    """Find texwatch.yaml in current or parent directories."""
+    """Find .texwatch.yaml in current or parent directories."""
     if start_dir is None:
         start_dir = Path.cwd()
 
@@ -63,7 +63,7 @@ def load_config(path: Path | None = None, main_file: str | None = None) -> Confi
     """Load configuration from file or create default.
 
     Args:
-        path: Explicit path to config file. If None, searches for texwatch.yaml.
+        path: Explicit path to config file. If None, searches for .texwatch.yaml.
         main_file: Override main file from CLI argument.
 
     Returns:
@@ -94,11 +94,11 @@ def create_config(
     main: str = "main.tex",
     watch: list[str] | None = None,
     ignore: list[str] | None = None,
-    compiler: str = "latexmk",
+    compiler: str = "auto",
     port: int = 8765,
     output_path: Path | None = None,
 ) -> Path:
-    """Create a new texwatch.yaml configuration file.
+    """Create a new .texwatch.yaml configuration file.
 
     Args:
         main: Main TeX file.
@@ -106,7 +106,7 @@ def create_config(
         ignore: List of glob patterns to ignore.
         compiler: Compiler to use.
         port: Server port.
-        output_path: Where to write config. Defaults to ./texwatch.yaml.
+        output_path: Where to write config. Defaults to ./.texwatch.yaml.
 
     Returns:
         Path to created config file.
@@ -116,7 +116,7 @@ def create_config(
 
     config_data = {
         "main": main,
-        "watch": watch or ["*.tex", "**/*.tex"],
+        "watch": watch or ["*.tex", "*.md", "*.txt", "**/*.tex"],
         "ignore": ignore or ["*_backup.tex"],
         "compiler": compiler,
         "port": port,

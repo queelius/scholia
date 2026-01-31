@@ -1,4 +1,4 @@
-"""Tests for workspace module — discovery, YAML I/O, merge, papers: parsing."""
+"""Tests for workspace module — discovery, YAML parsing, papers: key."""
 
 from pathlib import Path
 
@@ -7,16 +7,10 @@ import yaml
 
 from texwatch.workspace import (
     ProjectConfig,
-    WorkspaceConfig,
+    _configs_from_autodetect,
     _is_paper_root,
     discover_projects,
-    load_workspace,
-    merge_discovered,
     project_config_from_dir,
-    purge_projects,
-    reset_directory,
-    save_workspace,
-    workspace_path,
 )
 
 
@@ -48,7 +42,7 @@ class TestProjectConfig:
         assert cfg.main == "paper.tex"
         assert cfg.compiler == "xelatex"
         assert cfg.port == 9999
-        assert cfg.config_path == Path("/home/user/thesis/texwatch.yaml")
+        assert cfg.config_path == Path("/home/user/thesis/.texwatch.yaml")
 
     def test_to_legacy_config_default_port(self):
         """Test to_legacy_config with default port."""
@@ -58,233 +52,16 @@ class TestProjectConfig:
 
 
 # ---------------------------------------------------------------------------
-# WorkspaceConfig dataclass
-# ---------------------------------------------------------------------------
-
-
-class TestWorkspaceConfig:
-    """Tests for WorkspaceConfig dataclass."""
-
-    def test_defaults(self):
-        """Test WorkspaceConfig defaults."""
-        ws = WorkspaceConfig()
-        assert ws.port == 8800
-        assert ws.defaults == {}
-        assert ws.projects == {}
-
-
-# ---------------------------------------------------------------------------
-# workspace_path()
-# ---------------------------------------------------------------------------
-
-
-class TestWorkspacePath:
-    """Tests for workspace_path."""
-
-    def test_returns_home_based_path(self):
-        """Test workspace_path returns ~/.texwatch/workspace.yaml."""
-        result = workspace_path()
-        assert result.name == "workspace.yaml"
-        assert result.parent.name == ".texwatch"
-
-
-# ---------------------------------------------------------------------------
-# YAML I/O
-# ---------------------------------------------------------------------------
-
-
-class TestYamlIO:
-    """Tests for load_workspace and save_workspace."""
-
-    def test_load_nonexistent(self, tmp_path):
-        """Test load_workspace returns None for nonexistent file."""
-        result = load_workspace(tmp_path / "missing.yaml")
-        assert result is None
-
-    def test_save_and_load_roundtrip(self, tmp_path):
-        """Test saving and loading preserves data."""
-        ws = WorkspaceConfig(
-            port=9000,
-            defaults={"compiler": "xelatex"},
-            projects={
-                "thesis": ProjectConfig(
-                    name="thesis",
-                    directory=tmp_path / "thesis",
-                    main="paper.tex",
-                    compiler="xelatex",
-                ),
-                "notes": ProjectConfig(
-                    name="notes",
-                    directory=tmp_path / "notes",
-                    main="main.tex",
-                ),
-            },
-        )
-
-        ws_path = tmp_path / "ws.yaml"
-        save_workspace(ws, ws_path)
-        assert ws_path.exists()
-
-        loaded = load_workspace(ws_path)
-        assert loaded is not None
-        assert loaded.port == 9000
-        assert "thesis" in loaded.projects
-        assert "notes" in loaded.projects
-        assert loaded.projects["thesis"].main == "paper.tex"
-        assert loaded.projects["thesis"].compiler == "xelatex"
-
-    def test_save_creates_parent_dirs(self, tmp_path):
-        """Test save_workspace creates parent directories."""
-        ws = WorkspaceConfig()
-        ws_path = tmp_path / "deep" / "nested" / "workspace.yaml"
-        save_workspace(ws, ws_path)
-        assert ws_path.exists()
-
-    def test_load_minimal_yaml(self, tmp_path):
-        """Test loading a minimal workspace yaml."""
-        ws_path = tmp_path / "ws.yaml"
-        ws_path.write_text(yaml.dump({
-            "port": 7777,
-            "projects": {
-                "demo": {"path": str(tmp_path)},
-            },
-        }))
-        ws = load_workspace(ws_path)
-        assert ws is not None
-        assert ws.port == 7777
-        assert "demo" in ws.projects
-        assert ws.projects["demo"].main == "main.tex"  # default
-
-    def test_load_with_defaults_section(self, tmp_path):
-        """Test that workspace defaults are applied to projects."""
-        ws_path = tmp_path / "ws.yaml"
-        ws_path.write_text(yaml.dump({
-            "defaults": {"compiler": "lualatex"},
-            "projects": {
-                "paper": {"path": str(tmp_path)},
-            },
-        }))
-        ws = load_workspace(ws_path)
-        assert ws.projects["paper"].compiler == "lualatex"
-
-    def test_load_project_overrides_defaults(self, tmp_path):
-        """Test that project-level fields override workspace defaults."""
-        ws_path = tmp_path / "ws.yaml"
-        ws_path.write_text(yaml.dump({
-            "defaults": {"compiler": "lualatex"},
-            "projects": {
-                "paper": {"path": str(tmp_path), "compiler": "xelatex"},
-            },
-        }))
-        ws = load_workspace(ws_path)
-        assert ws.projects["paper"].compiler == "xelatex"
-
-    def test_save_omits_default_values(self, tmp_path):
-        """Test that save omits fields matching defaults."""
-        ws = WorkspaceConfig(
-            projects={
-                "test": ProjectConfig(
-                    name="test",
-                    directory=tmp_path,
-                    main="main.tex",  # default
-                    compiler="auto",  # default
-                ),
-            },
-        )
-        ws_path = tmp_path / "ws.yaml"
-        save_workspace(ws, ws_path)
-
-        with open(ws_path) as f:
-            raw = yaml.safe_load(f)
-
-        # main=main.tex should be omitted (it's the default)
-        assert "main" not in raw["projects"]["test"]
-
-    def test_load_empty_yaml(self, tmp_path):
-        """Test loading an empty yaml file."""
-        ws_path = tmp_path / "ws.yaml"
-        ws_path.write_text("")
-        ws = load_workspace(ws_path)
-        assert ws is not None
-        assert ws.port == 8800
-        assert ws.projects == {}
-
-    def test_load_skips_non_dict_entries(self, tmp_path):
-        """Test that non-dict project entries are skipped."""
-        ws_path = tmp_path / "ws.yaml"
-        ws_path.write_text(yaml.dump({
-            "projects": {
-                "good": {"path": str(tmp_path)},
-                "bad": "not a dict",
-            },
-        }))
-        ws = load_workspace(ws_path)
-        assert "good" in ws.projects
-        assert "bad" not in ws.projects
-
-
-# ---------------------------------------------------------------------------
-# Discovery
+# Discovery — requires .texwatch.yaml
 # ---------------------------------------------------------------------------
 
 
 class TestDiscovery:
     """Tests for discover_projects and project_config_from_dir."""
 
-    def test_single_main_tex(self, tmp_path):
-        """Test auto-detect with main.tex."""
-        (tmp_path / "main.tex").write_text(
-            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n"
-        )
-        configs = project_config_from_dir(tmp_path)
-        assert len(configs) == 1
-        assert configs[0].main == "main.tex"
-
-    def test_single_documentclass_file(self, tmp_path):
-        """Test auto-detect with one .tex file containing documentclass."""
-        (tmp_path / "paper.tex").write_text(
-            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n"
-        )
-        configs = project_config_from_dir(tmp_path)
-        assert len(configs) == 1
-        assert configs[0].main == "paper.tex"
-
-    def test_multiple_documentclass_files(self, tmp_path):
-        """Test auto-detect with multiple .tex files containing documentclass."""
-        (tmp_path / "paper.tex").write_text("\\documentclass{article}\n")
-        (tmp_path / "supplement.tex").write_text("\\documentclass{article}\n")
-        (tmp_path / "helper.tex").write_text("% No documentclass here\n")
-
-        configs = project_config_from_dir(tmp_path)
-        assert len(configs) == 2
-        names = {c.main for c in configs}
-        assert "paper.tex" in names
-        assert "supplement.tex" in names
-
-    def test_no_documentclass(self, tmp_path):
-        """Test auto-detect with .tex files but no documentclass."""
-        (tmp_path / "section.tex").write_text("\\section{Hello}\n")
-        configs = project_config_from_dir(tmp_path)
-        assert len(configs) == 0
-
-    def test_no_tex_files(self, tmp_path):
-        """Test auto-detect with no .tex files."""
-        (tmp_path / "readme.md").write_text("# Hello\n")
-        configs = project_config_from_dir(tmp_path)
-        assert len(configs) == 0
-
-    def test_main_tex_priority(self, tmp_path):
-        """Test that main.tex takes priority over other documentclass files."""
-        (tmp_path / "main.tex").write_text("\\documentclass{article}\n")
-        (tmp_path / "paper.tex").write_text("\\documentclass{article}\n")
-
-        configs = project_config_from_dir(tmp_path)
-        assert len(configs) == 1
-        assert configs[0].main == "main.tex"
-
-    def test_texwatch_yaml_main(self, tmp_path):
-        """Test detection from texwatch.yaml with main: key."""
-        (tmp_path / "texwatch.yaml").write_text("main: thesis.tex\ncompiler: xelatex\n")
+    def test_yaml_with_main(self, tmp_path):
+        """Test detection from .texwatch.yaml with main: key."""
+        (tmp_path / ".texwatch.yaml").write_text("main: thesis.tex\ncompiler: xelatex\n")
         (tmp_path / "thesis.tex").write_text("\\documentclass{article}\n")
 
         configs = project_config_from_dir(tmp_path)
@@ -292,8 +69,8 @@ class TestDiscovery:
         assert configs[0].main == "thesis.tex"
         assert configs[0].compiler == "xelatex"
 
-    def test_texwatch_yaml_papers_key(self, tmp_path):
-        """Test detection from texwatch.yaml with papers: key."""
+    def test_yaml_papers_key(self, tmp_path):
+        """Test detection from .texwatch.yaml with papers: key."""
         yaml_content = {
             "papers": [
                 {"name": "paper", "main": "paper.tex"},
@@ -301,7 +78,7 @@ class TestDiscovery:
             ],
             "watch": ["*.tex", "*.bib"],
         }
-        (tmp_path / "texwatch.yaml").write_text(yaml.dump(yaml_content))
+        (tmp_path / ".texwatch.yaml").write_text(yaml.dump(yaml_content))
 
         configs = project_config_from_dir(tmp_path)
         assert len(configs) == 2
@@ -313,7 +90,7 @@ class TestDiscovery:
         # Shared watch patterns
         assert by_main["paper.tex"].watch == ["*.tex", "*.bib"]
 
-    def test_texwatch_yaml_papers_names_include_dirname(self, tmp_path):
+    def test_yaml_papers_names_include_dirname(self, tmp_path):
         """Test that papers: names are prefixed with directory name."""
         subdir = tmp_path / "neurips"
         subdir.mkdir()
@@ -323,25 +100,38 @@ class TestDiscovery:
                 {"name": "supplement", "main": "supplement.tex"},
             ],
         }
-        (subdir / "texwatch.yaml").write_text(yaml.dump(yaml_content))
+        (subdir / ".texwatch.yaml").write_text(yaml.dump(yaml_content))
 
         configs = project_config_from_dir(subdir, root=tmp_path)
         names = {c.name for c in configs}
         assert "neurips/paper" in names
         assert "neurips/supplement" in names
 
+    def test_no_yaml_returns_empty(self, tmp_path):
+        """Test that directory without .texwatch.yaml returns empty list."""
+        (tmp_path / "main.tex").write_text("\\documentclass{article}\n")
+        configs = project_config_from_dir(tmp_path)
+        assert len(configs) == 0
+
+    def test_yaml_no_main_no_papers_returns_empty(self, tmp_path):
+        """Test .texwatch.yaml with neither main: nor papers: returns empty."""
+        (tmp_path / ".texwatch.yaml").write_text("compiler: xelatex\n")
+        (tmp_path / "paper.tex").write_text("\\documentclass{article}\n")
+
+        configs = project_config_from_dir(tmp_path)
+        assert len(configs) == 0
+
     def test_discover_walks_tree(self, tmp_path):
         """Test discover_projects walks directory tree."""
-        # Create structure:
-        # tmp_path/
-        #   thesis/main.tex
-        #   paper/paper.tex
+        # Create structure with .texwatch.yaml in subdirs
         thesis = tmp_path / "thesis"
         thesis.mkdir()
+        (thesis / ".texwatch.yaml").write_text("main: main.tex\n")
         (thesis / "main.tex").write_text("\\documentclass{article}\n")
 
         paper = tmp_path / "paper"
         paper.mkdir()
+        (paper / ".texwatch.yaml").write_text("main: paper.tex\n")
         (paper / "paper.tex").write_text("\\documentclass{article}\n")
 
         configs = discover_projects(tmp_path)
@@ -349,10 +139,29 @@ class TestDiscovery:
         assert "thesis" in names
         assert "paper" in names
 
+    def test_discover_ignores_dirs_without_yaml(self, tmp_path):
+        """Test discover_projects ignores dirs that only have .tex files."""
+        # Dir with .tex but no yaml
+        bare = tmp_path / "bare_project"
+        bare.mkdir()
+        (bare / "main.tex").write_text("\\documentclass{article}\n")
+
+        # Dir with yaml
+        configured = tmp_path / "configured"
+        configured.mkdir()
+        (configured / ".texwatch.yaml").write_text("main: main.tex\n")
+        (configured / "main.tex").write_text("\\documentclass{article}\n")
+
+        configs = discover_projects(tmp_path)
+        names = {c.name for c in configs}
+        assert "configured" in names
+        assert "bare_project" not in names
+
     def test_discover_skips_hidden_dirs(self, tmp_path):
         """Test discover_projects skips hidden directories."""
         hidden = tmp_path / ".hidden"
         hidden.mkdir()
+        (hidden / ".texwatch.yaml").write_text("main: main.tex\n")
         (hidden / "main.tex").write_text("\\documentclass{article}\n")
 
         configs = discover_projects(tmp_path)
@@ -362,6 +171,7 @@ class TestDiscovery:
         """Test discover_projects skips build output directories."""
         build = tmp_path / "build"
         build.mkdir()
+        (build / ".texwatch.yaml").write_text("main: main.tex\n")
         (build / "main.tex").write_text("\\documentclass{article}\n")
 
         configs = discover_projects(tmp_path)
@@ -369,86 +179,14 @@ class TestDiscovery:
 
     def test_discover_nested_dirs(self, tmp_path):
         """Test discovery with nested directory structure."""
-        # papers/
-        #   2024/
-        #     icml/main.tex
         nested = tmp_path / "2024" / "icml"
         nested.mkdir(parents=True)
+        (nested / ".texwatch.yaml").write_text("main: main.tex\n")
         (nested / "main.tex").write_text("\\documentclass{article}\n")
 
         configs = discover_projects(tmp_path)
         assert len(configs) == 1
         assert "icml" in configs[0].name or "2024/icml" in configs[0].name
-
-    def test_texwatch_yaml_no_main_no_papers_falls_through(self, tmp_path):
-        """Test texwatch.yaml with neither main: nor papers: falls to auto-detect."""
-        (tmp_path / "texwatch.yaml").write_text("compiler: xelatex\n")
-        (tmp_path / "paper.tex").write_text("\\documentclass{article}\n")
-
-        configs = project_config_from_dir(tmp_path)
-        assert len(configs) == 1
-        assert configs[0].main == "paper.tex"
-
-
-# ---------------------------------------------------------------------------
-# Merge
-# ---------------------------------------------------------------------------
-
-
-class TestMerge:
-    """Tests for merge_discovered."""
-
-    def test_merge_adds_new(self):
-        """Test merge adds new projects."""
-        ws = WorkspaceConfig(projects={
-            "existing": ProjectConfig(name="existing", directory=Path("/tmp/a")),
-        })
-        found = [
-            ProjectConfig(name="new1", directory=Path("/tmp/b")),
-            ProjectConfig(name="new2", directory=Path("/tmp/c")),
-        ]
-        result = merge_discovered(ws, found)
-        assert "existing" in result.projects
-        assert "new1" in result.projects
-        assert "new2" in result.projects
-
-    def test_merge_does_not_overwrite(self):
-        """Test merge preserves existing projects."""
-        ws = WorkspaceConfig(projects={
-            "keep": ProjectConfig(
-                name="keep",
-                directory=Path("/tmp/keep"),
-                main="custom.tex",
-                compiler="xelatex",
-            ),
-        })
-        found = [
-            ProjectConfig(
-                name="keep",
-                directory=Path("/tmp/keep"),
-                main="detected.tex",  # different main
-            ),
-        ]
-        result = merge_discovered(ws, found)
-        assert result.projects["keep"].main == "custom.tex"  # preserved
-        assert result.projects["keep"].compiler == "xelatex"  # preserved
-
-    def test_merge_empty_workspace(self):
-        """Test merge into empty workspace."""
-        ws = WorkspaceConfig()
-        found = [
-            ProjectConfig(name="project", directory=Path("/tmp/p")),
-        ]
-        result = merge_discovered(ws, found)
-        assert "project" in result.projects
-
-    def test_merge_empty_found(self):
-        """Test merge with no discovered projects."""
-        ws = WorkspaceConfig(projects={
-            "existing": ProjectConfig(name="existing", directory=Path("/tmp/a")),
-        })
-        result = merge_discovered(ws, [])
-        assert len(result.projects) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +262,7 @@ class TestSkipDirs:
         """Test that default skip_dirs skips archive/ directories."""
         archive = tmp_path / "archive"
         archive.mkdir()
+        (archive / ".texwatch.yaml").write_text("main: main.tex\n")
         (archive / "main.tex").write_text("\\documentclass{article}\n")
 
         configs = discover_projects(tmp_path)
@@ -533,6 +272,7 @@ class TestSkipDirs:
         """Test that default skip_dirs skips old/ directories."""
         old = tmp_path / "old"
         old.mkdir()
+        (old / ".texwatch.yaml").write_text("main: main.tex\n")
         (old / "main.tex").write_text("\\documentclass{article}\n")
 
         configs = discover_projects(tmp_path)
@@ -542,6 +282,7 @@ class TestSkipDirs:
         """Test that default skip_dirs skips deprecated/ directories."""
         dep = tmp_path / "deprecated"
         dep.mkdir()
+        (dep / ".texwatch.yaml").write_text("main: main.tex\n")
         (dep / "main.tex").write_text("\\documentclass{article}\n")
 
         configs = discover_projects(tmp_path)
@@ -552,11 +293,13 @@ class TestSkipDirs:
         # Create a directory that would normally be kept
         drafts = tmp_path / "drafts"
         drafts.mkdir()
+        (drafts / ".texwatch.yaml").write_text("main: main.tex\n")
         (drafts / "main.tex").write_text("\\documentclass{article}\n")
 
         # Also create a directory that default would skip
         archive = tmp_path / "archive"
         archive.mkdir()
+        (archive / ".texwatch.yaml").write_text("main: main.tex\n")
         (archive / "main.tex").write_text("\\documentclass{article}\n")
 
         # Custom skip_dirs: skip "drafts" but NOT "archive"
@@ -569,6 +312,7 @@ class TestSkipDirs:
         """Test that empty skip_dirs list skips no directories."""
         build = tmp_path / "build"
         build.mkdir()
+        (build / ".texwatch.yaml").write_text("main: main.tex\n")
         (build / "main.tex").write_text("\\documentclass{article}\n")
 
         configs = discover_projects(tmp_path, skip_dirs=[])
@@ -578,136 +322,94 @@ class TestSkipDirs:
         """Test that skip_dirs uses glob matching (e.g., '.*' matches hidden dirs)."""
         hidden = tmp_path / ".secret"
         hidden.mkdir()
+        (hidden / ".texwatch.yaml").write_text("main: main.tex\n")
         (hidden / "main.tex").write_text("\\documentclass{article}\n")
 
         configs = discover_projects(tmp_path, skip_dirs=[".*"])
         assert not any(".secret" in c.name for c in configs)
 
-    def test_autodetect_skips_standalone(self, tmp_path):
+
+# ---------------------------------------------------------------------------
+# Auto-detect (used by cmd_init, tested directly)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoDetect:
+    """Tests for _configs_from_autodetect — used by init, not by discovery."""
+
+    def test_single_main_tex(self, tmp_path):
+        """Test auto-detect with main.tex."""
+        (tmp_path / "main.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n"
+        )
+        configs = _configs_from_autodetect(tmp_path, tmp_path.parent)
+        assert len(configs) == 1
+        assert configs[0].main == "main.tex"
+
+    def test_single_documentclass_file(self, tmp_path):
+        """Test auto-detect with one .tex file containing documentclass."""
+        (tmp_path / "paper.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n"
+        )
+        configs = _configs_from_autodetect(tmp_path, tmp_path.parent)
+        assert len(configs) == 1
+        assert configs[0].main == "paper.tex"
+
+    def test_multiple_documentclass_files(self, tmp_path):
+        """Test auto-detect with multiple .tex files containing documentclass."""
+        (tmp_path / "paper.tex").write_text("\\documentclass{article}\n")
+        (tmp_path / "supplement.tex").write_text("\\documentclass{article}\n")
+        (tmp_path / "helper.tex").write_text("% No documentclass here\n")
+
+        configs = _configs_from_autodetect(tmp_path, tmp_path.parent)
+        assert len(configs) == 2
+        names = {c.main for c in configs}
+        assert "paper.tex" in names
+        assert "supplement.tex" in names
+
+    def test_no_documentclass(self, tmp_path):
+        """Test auto-detect with .tex files but no documentclass."""
+        (tmp_path / "section.tex").write_text("\\section{Hello}\n")
+        configs = _configs_from_autodetect(tmp_path, tmp_path.parent)
+        assert len(configs) == 0
+
+    def test_no_tex_files(self, tmp_path):
+        """Test auto-detect with no .tex files."""
+        (tmp_path / "readme.md").write_text("# Hello\n")
+        configs = _configs_from_autodetect(tmp_path, tmp_path.parent)
+        assert len(configs) == 0
+
+    def test_main_tex_priority(self, tmp_path):
+        """Test that main.tex takes priority over other documentclass files."""
+        (tmp_path / "main.tex").write_text("\\documentclass{article}\n")
+        (tmp_path / "paper.tex").write_text("\\documentclass{article}\n")
+
+        configs = _configs_from_autodetect(tmp_path, tmp_path.parent)
+        assert len(configs) == 1
+        assert configs[0].main == "main.tex"
+
+    def test_skips_standalone(self, tmp_path):
         """Test auto-detection skips standalone .tex files."""
         (tmp_path / "paper.tex").write_text("\\documentclass{article}\n")
         (tmp_path / "figure.tex").write_text("\\documentclass{standalone}\n")
 
-        configs = project_config_from_dir(tmp_path)
+        configs = _configs_from_autodetect(tmp_path, tmp_path.parent)
         assert len(configs) == 1
         assert configs[0].main == "paper.tex"
 
-    def test_autodetect_skips_subfiles(self, tmp_path):
+    def test_skips_subfiles(self, tmp_path):
         """Test auto-detection skips subfiles .tex files."""
         (tmp_path / "main.tex").write_text("\\documentclass{article}\n")
         (tmp_path / "chapter1.tex").write_text("\\documentclass[main.tex]{subfiles}\n")
 
-        configs = project_config_from_dir(tmp_path)
+        configs = _configs_from_autodetect(tmp_path, tmp_path.parent)
         assert len(configs) == 1
         assert configs[0].main == "main.tex"
 
-    def test_autodetect_only_standalone_returns_empty(self, tmp_path):
+    def test_only_standalone_returns_empty(self, tmp_path):
         """Test directory with only standalone files returns no projects."""
         (tmp_path / "fig1.tex").write_text("\\documentclass{standalone}\n")
         (tmp_path / "fig2.tex").write_text("\\documentclass{standalone}\n")
 
-        configs = project_config_from_dir(tmp_path)
+        configs = _configs_from_autodetect(tmp_path, tmp_path.parent)
         assert len(configs) == 0
-
-    def test_skip_dirs_from_workspace_defaults(self, tmp_path):
-        """Test that skip_dirs loaded from workspace defaults works."""
-        # Create workspace yaml with custom skip_dirs
-        ws_path = tmp_path / "ws.yaml"
-        ws_path.write_text(yaml.dump({
-            "defaults": {"skip_dirs": ["wip"]},
-            "projects": {},
-        }))
-        ws = load_workspace(ws_path)
-        assert ws.defaults["skip_dirs"] == ["wip"]
-
-        # Create scan directory
-        scan_root = tmp_path / "papers"
-        scan_root.mkdir()
-        wip = scan_root / "wip"
-        wip.mkdir()
-        (wip / "main.tex").write_text("\\documentclass{article}\n")
-        real = scan_root / "real"
-        real.mkdir()
-        (real / "main.tex").write_text("\\documentclass{article}\n")
-
-        # Use workspace skip_dirs
-        configs = discover_projects(scan_root, skip_dirs=ws.defaults["skip_dirs"])
-        names = {c.name for c in configs}
-        assert "real" in names
-        assert "wip" not in names
-
-
-# ---------------------------------------------------------------------------
-# reset_directory
-# ---------------------------------------------------------------------------
-
-
-class TestResetDirectory:
-    """Tests for reset_directory."""
-
-    def test_reset_removes_scoped(self, tmp_path):
-        """Test that projects under root are removed, others preserved."""
-        root = tmp_path / "papers"
-        other = tmp_path / "other"
-        ws = WorkspaceConfig(projects={
-            "papers/thesis": ProjectConfig(name="papers/thesis", directory=root / "thesis"),
-            "papers/icml": ProjectConfig(name="papers/icml", directory=root / "icml"),
-            "other/notes": ProjectConfig(name="other/notes", directory=other / "notes"),
-        })
-        removed = reset_directory(ws, root)
-        assert removed == 2
-        assert "other/notes" in ws.projects
-        assert "papers/thesis" not in ws.projects
-        assert "papers/icml" not in ws.projects
-
-    def test_reset_root_itself(self, tmp_path):
-        """Test that a project at the exact root directory is removed."""
-        root = tmp_path / "project"
-        ws = WorkspaceConfig(projects={
-            "project": ProjectConfig(name="project", directory=root),
-        })
-        removed = reset_directory(ws, root)
-        assert removed == 1
-        assert len(ws.projects) == 0
-
-    def test_reset_no_match(self, tmp_path):
-        """Test that reset returns 0 when no projects match."""
-        ws = WorkspaceConfig(projects={
-            "elsewhere": ProjectConfig(name="elsewhere", directory=tmp_path / "elsewhere"),
-        })
-        removed = reset_directory(ws, tmp_path / "nonexistent")
-        assert removed == 0
-        assert len(ws.projects) == 1
-
-    def test_reset_empty_workspace(self, tmp_path):
-        """Test reset on empty workspace does not error."""
-        ws = WorkspaceConfig()
-        removed = reset_directory(ws, tmp_path)
-        assert removed == 0
-        assert len(ws.projects) == 0
-
-
-# ---------------------------------------------------------------------------
-# purge_projects
-# ---------------------------------------------------------------------------
-
-
-class TestPurgeProjects:
-    """Tests for purge_projects."""
-
-    def test_purge_all(self, tmp_path):
-        """Test that purge removes all projects and returns count."""
-        ws = WorkspaceConfig(projects={
-            "a": ProjectConfig(name="a", directory=tmp_path / "a"),
-            "b": ProjectConfig(name="b", directory=tmp_path / "b"),
-            "c": ProjectConfig(name="c", directory=tmp_path / "c"),
-        })
-        removed = purge_projects(ws)
-        assert removed == 3
-        assert len(ws.projects) == 0
-
-    def test_purge_empty(self):
-        """Test purge on empty workspace returns 0."""
-        ws = WorkspaceConfig()
-        removed = purge_projects(ws)
-        assert removed == 0

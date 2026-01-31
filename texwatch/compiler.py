@@ -51,11 +51,29 @@ UNDERFULL_OVERFULL_PATTERN = re.compile(
 )
 
 
+def _detect_compiler(main_file: Path) -> str:
+    """Detect the appropriate compiler based on file extension."""
+    ext = main_file.suffix.lower()
+    if ext in (".md", ".markdown", ".txt"):
+        return "pandoc"
+    return "latexmk"
+
+
 def _get_compiler_command(compiler: str, main_file: Path, work_dir: Path) -> list[str]:
     """Build the compiler command."""
+    if compiler == "auto":
+        compiler = _detect_compiler(main_file)
+
     main_file_relative = main_file.relative_to(work_dir) if main_file.is_absolute() else main_file
 
-    if compiler == "latexmk":
+    if compiler == "pandoc":
+        return [
+            "pandoc",
+            str(main_file_relative),
+            "-o",
+            main_file.stem + ".pdf",
+        ]
+    elif compiler == "latexmk":
         return [
             "latexmk",
             "-pdf",
@@ -135,16 +153,23 @@ def _parse_warnings(log_output: str, main_file: str) -> list[CompileMessage]:
     return warnings
 
 
+def _parse_pandoc_errors(stderr: str) -> list[CompileMessage]:
+    """Parse errors from pandoc stderr output."""
+    if not stderr.strip():
+        return []
+    return [CompileMessage(file="", line=None, message=stderr.strip()[:200], type="error")]
+
+
 async def compile_tex(
     main_file: Path,
     compiler: str = "latexmk",
     work_dir: Path | None = None,
 ) -> CompileResult:
-    """Compile a TeX file asynchronously.
+    """Compile a TeX or markdown file asynchronously.
 
     Args:
-        main_file: Path to main .tex file.
-        compiler: Compiler to use (latexmk, pdflatex, xelatex, lualatex).
+        main_file: Path to main .tex/.md/.txt file.
+        compiler: Compiler to use (auto, latexmk, pdflatex, xelatex, lualatex, pandoc).
         work_dir: Working directory for compilation. Defaults to main_file's parent.
 
     Returns:
@@ -153,15 +178,21 @@ async def compile_tex(
     if work_dir is None:
         work_dir = main_file.parent
 
+    # Resolve "auto" to actual compiler
+    resolved_compiler = compiler
+    if compiler == "auto":
+        resolved_compiler = _detect_compiler(main_file)
+
     # Check if compiler exists
-    if shutil.which(compiler.split()[0] if " " in compiler else compiler) is None:
+    cmd_name = resolved_compiler.split()[0] if " " in resolved_compiler else resolved_compiler
+    if shutil.which(cmd_name) is None:
         return CompileResult(
             success=False,
             errors=[
                 CompileMessage(
                     file=str(main_file),
                     line=None,
-                    message=f"Compiler '{compiler}' not found in PATH",
+                    message=f"Compiler '{resolved_compiler}' not found in PATH",
                     type="error",
                 )
             ],
@@ -169,17 +200,30 @@ async def compile_tex(
 
     cmd = _get_compiler_command(compiler, main_file, work_dir)
     start_time = datetime.now(timezone.utc)
+    is_pandoc = resolved_compiler == "pandoc"
 
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=work_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        if is_pandoc:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=work_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            log_output = stdout.decode("utf-8", errors="replace")
+            stderr_text = stderr.decode("utf-8", errors="replace")
+        else:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=work_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await process.communicate()
+            log_output = stdout.decode("utf-8", errors="replace")
+            stderr_text = ""
 
-        stdout, _ = await process.communicate()
-        log_output = stdout.decode("utf-8", errors="replace")
         end_time = datetime.now(timezone.utc)
 
         # Determine output PDF path
@@ -188,8 +232,12 @@ async def compile_tex(
 
         success = process.returncode == 0 and pdf_path.exists()
 
-        errors = _parse_errors(log_output, str(main_file.name))
-        warnings = _parse_warnings(log_output, str(main_file.name))
+        if is_pandoc:
+            errors = _parse_pandoc_errors(stderr_text) if not success else []
+            warnings = []
+        else:
+            errors = _parse_errors(log_output, str(main_file.name))
+            warnings = _parse_warnings(log_output, str(main_file.name))
 
         return CompileResult(
             success=success,
@@ -215,7 +263,18 @@ async def compile_tex(
         )
 
 
-def check_compiler_available(compiler: str) -> bool:
-    """Check if a compiler is available in PATH."""
+def check_compiler_available(compiler: str, main_file: Path | None = None) -> bool:
+    """Check if a compiler is available in PATH.
+
+    Args:
+        compiler: Compiler name or "auto".
+        main_file: Main file path (needed to resolve "auto").
+    """
+    if compiler == "auto":
+        if main_file is None:
+            # Can't resolve auto without main_file; assume latexmk
+            compiler = "latexmk"
+        else:
+            compiler = _detect_compiler(main_file)
     cmd = compiler.split()[0] if " " in compiler else compiler
     return shutil.which(cmd) is not None

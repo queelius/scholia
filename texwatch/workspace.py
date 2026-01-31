@@ -1,4 +1,4 @@
-"""Workspace registry and project discovery for multi-project texwatch."""
+"""Project discovery for multi-project texwatch."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class ProjectConfig:
     def to_legacy_config(self, port: int = 8765) -> Config:
         """Convert to legacy Config for existing server/compiler code."""
         # Create a synthetic config_path so get_watch_dir() resolves correctly
-        config_path = self.directory / "texwatch.yaml"
+        config_path = self.directory / ".texwatch.yaml"
         return Config(
             main=self.main,
             watch=list(self.watch),
@@ -43,23 +43,11 @@ class ProjectConfig:
         )
 
 
-@dataclass
-class WorkspaceConfig:
-    """Collection of projects from ~/.texwatch/workspace.yaml."""
-
-    port: int = 8800
-    defaults: dict[str, Any] = field(default_factory=dict)
-    projects: dict[str, ProjectConfig] = field(default_factory=dict)
-
-
 # ---------------------------------------------------------------------------
 # Built-in defaults
 # ---------------------------------------------------------------------------
 
 _BUILTIN_DEFAULTS: dict[str, Any] = {
-    "compiler": "auto",
-    "watch": ["*.tex", "*.md", "*.txt"],
-    "ignore": [],
     "skip_dirs": [
         ".*",                                                       # hidden dirs
         "build", "_build", "out", "dist",                           # build outputs
@@ -69,80 +57,12 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
     ],
 }
 
-
-# ---------------------------------------------------------------------------
-# Path helpers
-# ---------------------------------------------------------------------------
-
-
-def workspace_path() -> Path:
-    """Return the global workspace file path: ~/.texwatch/workspace.yaml."""
-    return Path.home() / ".texwatch" / "workspace.yaml"
-
-
-# ---------------------------------------------------------------------------
-# YAML I/O
-# ---------------------------------------------------------------------------
-
-
-def load_workspace(path: Path | None = None) -> WorkspaceConfig | None:
-    """Load workspace config from YAML file.
-
-    Returns None if the file does not exist.
-    """
-    ws_path = path or workspace_path()
-    if not ws_path.exists():
-        return None
-
-    with open(ws_path) as f:
-        raw = yaml.safe_load(f) or {}
-
-    port = raw.get("port", 8800)
-    defaults = raw.get("defaults", {})
-    projects: dict[str, ProjectConfig] = {}
-
-    for name, entry in raw.get("projects", {}).items():
-        if not isinstance(entry, dict):
-            continue
-        directory = Path(entry.get("path", ".")).expanduser().resolve()
-        pc = _project_from_entry(name, directory, entry, defaults)
-        projects[name] = pc
-
-    return WorkspaceConfig(port=port, defaults=defaults, projects=projects)
-
-
-def save_workspace(ws: WorkspaceConfig, path: Path | None = None) -> Path:
-    """Save workspace config to YAML file.
-
-    Creates parent directories if needed. Returns the path written to.
-    """
-    ws_path = path or workspace_path()
-    ws_path.parent.mkdir(parents=True, exist_ok=True)
-
-    data: dict[str, Any] = {"port": ws.port}
-
-    if ws.defaults:
-        data["defaults"] = ws.defaults
-
-    projects_data: dict[str, Any] = {}
-    for name, pc in ws.projects.items():
-        entry: dict[str, Any] = {"path": str(pc.directory)}
-        if pc.main != "main.tex":
-            entry["main"] = pc.main
-        if pc.compiler != _resolve_default("compiler", ws.defaults):
-            entry["compiler"] = pc.compiler
-        if pc.watch != _resolve_default("watch", ws.defaults):
-            entry["watch"] = pc.watch
-        if pc.ignore:
-            entry["ignore"] = pc.ignore
-        projects_data[name] = entry
-
-    data["projects"] = projects_data
-
-    with open(ws_path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-
-    return ws_path
+# Defaults for yaml parsing (used when a field is missing from .texwatch.yaml)
+_YAML_DEFAULTS: dict[str, Any] = {
+    "compiler": "auto",
+    "watch": ["*.tex", "*.md", "*.txt"],
+    "ignore": [],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +74,9 @@ def discover_projects(
     root: Path,
     skip_dirs: list[str] | None = None,
 ) -> list[ProjectConfig]:
-    """Walk a directory tree and discover compilable papers.
+    """Walk a directory tree and discover projects with .texwatch.yaml.
+
+    Only directories containing a .texwatch.yaml file are returned.
 
     Args:
         root: Top-level directory to scan.
@@ -169,8 +91,10 @@ def discover_projects(
     found: list[ProjectConfig] = []
 
     for dirpath in _walk_dirs(root, skip_dirs):
-        configs = project_config_from_dir(dirpath, root)
-        found.extend(configs)
+        yaml_path = dirpath / ".texwatch.yaml"
+        if yaml_path.exists():
+            configs = _configs_from_yaml(dirpath, yaml_path, root)
+            found.extend(configs)
 
     return found
 
@@ -181,91 +105,35 @@ def project_config_from_dir(
 ) -> list[ProjectConfig]:
     """Discover projects in a single directory.
 
+    Requires .texwatch.yaml. Returns empty list if no yaml present.
+
     Resolution order:
-    1. texwatch.yaml with ``papers:`` key -> N ProjectConfigs
-    2. texwatch.yaml with ``main:`` key -> 1 ProjectConfig
-    3. No yaml: auto-detect from .tex files with \\documentclass
+    1. .texwatch.yaml with ``papers:`` key -> N ProjectConfigs
+    2. .texwatch.yaml with ``main:`` key -> 1 ProjectConfig
+    3. No yaml: returns []
 
     Args:
         directory: Absolute path to the directory.
         root: Root of the scan tree (used for naming). If None, uses directory parent.
 
     Returns:
-        List of ProjectConfig (may be empty if nothing detected).
+        List of ProjectConfig (may be empty if no .texwatch.yaml found).
     """
     directory = directory.resolve()
     if root is None:
         root = directory.parent
 
-    yaml_path = directory / "texwatch.yaml"
+    yaml_path = directory / ".texwatch.yaml"
 
     if yaml_path.exists():
         return _configs_from_yaml(directory, yaml_path, root)
 
-    return _configs_from_autodetect(directory, root)
-
-
-def merge_discovered(
-    ws: WorkspaceConfig,
-    found: list[ProjectConfig],
-) -> WorkspaceConfig:
-    """Merge newly discovered projects into workspace.
-
-    - Adds new projects that don't already exist (by name).
-    - Does NOT remove or overwrite existing entries (preserves user edits).
-    """
-    for pc in found:
-        if pc.name not in ws.projects:
-            ws.projects[pc.name] = pc
-    return ws
-
-
-def reset_directory(ws: WorkspaceConfig, root: Path) -> int:
-    """Remove projects whose directory is under *root*. Returns count removed."""
-    root = root.resolve()
-    to_remove = [
-        name for name, pc in ws.projects.items()
-        if pc.directory == root or pc.directory.is_relative_to(root)
-    ]
-    for name in to_remove:
-        del ws.projects[name]
-    return len(to_remove)
-
-
-def purge_projects(ws: WorkspaceConfig) -> int:
-    """Remove all projects. Returns count removed."""
-    count = len(ws.projects)
-    ws.projects.clear()
-    return count
+    return []
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _resolve_default(key: str, workspace_defaults: dict[str, Any]) -> Any:
-    """Resolve a default value: workspace defaults -> built-in defaults."""
-    if key in workspace_defaults:
-        return workspace_defaults[key]
-    return _BUILTIN_DEFAULTS.get(key)
-
-
-def _project_from_entry(
-    name: str,
-    directory: Path,
-    entry: dict[str, Any],
-    workspace_defaults: dict[str, Any],
-) -> ProjectConfig:
-    """Build a ProjectConfig from a workspace.yaml entry."""
-    return ProjectConfig(
-        name=name,
-        directory=directory,
-        main=entry.get("main", "main.tex"),
-        watch=entry.get("watch", _resolve_default("watch", workspace_defaults)),
-        ignore=entry.get("ignore", _resolve_default("ignore", workspace_defaults)),
-        compiler=entry.get("compiler", _resolve_default("compiler", workspace_defaults)),
-    )
 
 
 def _walk_dirs(root: Path, skip_dirs: list[str]) -> list[Path]:
@@ -301,7 +169,7 @@ def _configs_from_yaml(
     yaml_path: Path,
     root: Path,
 ) -> list[ProjectConfig]:
-    """Parse texwatch.yaml for project configs."""
+    """Parse .texwatch.yaml for project configs."""
     with open(yaml_path) as f:
         data = yaml.safe_load(f) or {}
 
@@ -316,13 +184,13 @@ def _configs_from_yaml(
             name=name,
             directory=directory,
             main=data["main"],
-            watch=data.get("watch", list(_BUILTIN_DEFAULTS["watch"])),
-            ignore=data.get("ignore", list(_BUILTIN_DEFAULTS["ignore"])),
-            compiler=data.get("compiler", _BUILTIN_DEFAULTS["compiler"]),
+            watch=data.get("watch", list(_YAML_DEFAULTS["watch"])),
+            ignore=data.get("ignore", list(_YAML_DEFAULTS["ignore"])),
+            compiler=data.get("compiler", _YAML_DEFAULTS["compiler"]),
         )]
 
-    # YAML exists but has neither papers: nor main: — try auto-detect
-    return _configs_from_autodetect(directory, root)
+    # .texwatch.yaml exists but has neither papers: nor main:
+    return []
 
 
 def _parse_papers_key(
@@ -330,11 +198,11 @@ def _parse_papers_key(
     data: dict[str, Any],
     root: Path,
 ) -> list[ProjectConfig]:
-    """Parse the ``papers:`` list from texwatch.yaml."""
+    """Parse the ``papers:`` list from .texwatch.yaml."""
     dirname = _make_name(directory, root)
-    shared_watch = data.get("watch", list(_BUILTIN_DEFAULTS["watch"]))
-    shared_ignore = data.get("ignore", list(_BUILTIN_DEFAULTS["ignore"]))
-    shared_compiler = data.get("compiler", _BUILTIN_DEFAULTS["compiler"])
+    shared_watch = data.get("watch", list(_YAML_DEFAULTS["watch"]))
+    shared_ignore = data.get("ignore", list(_YAML_DEFAULTS["ignore"]))
+    shared_compiler = data.get("compiler", _YAML_DEFAULTS["compiler"])
 
     results: list[ProjectConfig] = []
     for entry in data["papers"]:
@@ -359,7 +227,10 @@ def _configs_from_autodetect(
     directory: Path,
     root: Path,
 ) -> list[ProjectConfig]:
-    """Auto-detect projects by scanning .tex files for \\documentclass."""
+    """Auto-detect projects by scanning .tex files for \\documentclass.
+
+    Used by ``cmd_init`` to infer project structure, not by discovery.
+    """
     tex_files = sorted(directory.glob("*.tex"))
     if not tex_files:
         return []

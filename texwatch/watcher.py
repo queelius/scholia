@@ -19,7 +19,7 @@ class TexFileHandler(FileSystemEventHandler):
         self,
         watch_patterns: list[str],
         ignore_patterns: list[str],
-        callback: Callable[[], Coroutine],
+        callback: Callable[[str], Coroutine],
         loop: asyncio.AbstractEventLoop,
         debounce_seconds: float = 0.5,
     ):
@@ -40,6 +40,7 @@ class TexFileHandler(FileSystemEventHandler):
         self.debounce_seconds = debounce_seconds
         self._last_event_time: float = 0
         self._pending_task: asyncio.Task | None = None
+        self._pending_path: str | None = None
 
     def _matches_patterns(self, path: str, patterns: list[str]) -> bool:
         """Check if path matches any of the patterns."""
@@ -92,11 +93,12 @@ class TexFileHandler(FileSystemEventHandler):
 
         return False
 
-    def _schedule_callback(self):
+    def _schedule_callback(self, src_path: str):
         """Schedule the callback with debouncing."""
         import time
 
         current_time = time.time()
+        self._pending_path = src_path
 
         # Cancel any pending callback
         if self._pending_task and not self._pending_task.done():
@@ -105,7 +107,7 @@ class TexFileHandler(FileSystemEventHandler):
         async def delayed_callback():
             await asyncio.sleep(self.debounce_seconds)
             try:
-                await self.callback()
+                await self.callback(self._pending_path)
             except Exception as e:
                 logger.error(f"Callback error: {e}")
 
@@ -119,7 +121,7 @@ class TexFileHandler(FileSystemEventHandler):
             return
         if self._should_process(event.src_path):
             logger.info(f"File modified: {event.src_path}")
-            self._schedule_callback()
+            self._schedule_callback(event.src_path)
 
     def on_created(self, event: FileSystemEvent) -> None:
         """Handle file creation."""
@@ -127,7 +129,7 @@ class TexFileHandler(FileSystemEventHandler):
             return
         if self._should_process(event.src_path):
             logger.info(f"File created: {event.src_path}")
-            self._schedule_callback()
+            self._schedule_callback(event.src_path)
 
 
 class TexWatcher:
@@ -138,7 +140,7 @@ class TexWatcher:
         watch_dir: Path,
         watch_patterns: list[str],
         ignore_patterns: list[str],
-        on_change: Callable[[], Coroutine],
+        on_change: Callable[[str], Coroutine],
         debounce_seconds: float = 0.5,
     ):
         """Initialize watcher.

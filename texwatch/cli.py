@@ -9,7 +9,7 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
 from . import __version__
-from .config import Config, create_config, find_config, load_config, get_main_file
+from .config import Config, create_config, find_config, get_main_file
 from .compiler import check_compiler_available
 from .server import TexWatchServer
 
@@ -156,7 +156,7 @@ _ALL_FIELDS = _SCALAR_FIELDS | _LIST_FIELDS
 
 def cmd_init(args: argparse.Namespace) -> int:
     """Handle init command."""
-    config_path = Path.cwd() / "texwatch.yaml"
+    config_path = Path.cwd() / ".texwatch.yaml"
 
     if config_path.exists() and not getattr(args, "force", False):
         print(f"Config already exists: {config_path}")
@@ -506,7 +506,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         if config_path:
             print(str(config_path))
         else:
-            print("No texwatch.yaml found")
+            print("No .texwatch.yaml found")
             return EXIT_FAIL
         return EXIT_OK
 
@@ -515,7 +515,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             if getattr(args, "json", False):
                 print(json.dumps({"error": "no config file found"}))
             else:
-                print("No texwatch.yaml found")
+                print("No .texwatch.yaml found")
                 print("Run 'texwatch init' to create one")
             return EXIT_FAIL
 
@@ -567,7 +567,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     # Load, modify, write
     if config_path is None:
-        print("No texwatch.yaml found")
+        print("No .texwatch.yaml found")
         print("Run 'texwatch init' to create one")
         return EXIT_FAIL
 
@@ -653,352 +653,101 @@ def cmd_files(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    """Run the texwatch server."""
-    import logging as _logging
-
-    level = _logging.DEBUG if getattr(args, "debug", False) else _logging.INFO
-    _logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    # Load config
-    main_file = getattr(args, "main_file", None) or None
-    config = load_config(main_file=main_file)
-
-    # Override port if specified
-    if args.port:
-        config.port = args.port
-
-    # Check main file exists
-    main_path = get_main_file(config)
-    if not main_path.exists():
-        print(f"Error: Main file not found: {main_path}")
-        print("Run 'texwatch init' to create a config file")
-        return EXIT_FAIL
-
-    # Check compiler is available (resolve "auto" first)
-    if not check_compiler_available(config.compiler, main_file=main_path):
-        from .compiler import _detect_compiler
-        resolved = _detect_compiler(main_path) if config.compiler == "auto" else config.compiler
-        print(f"Error: Compiler not found: {resolved}")
-        if resolved == "pandoc":
-            print("Install pandoc: https://pandoc.org/installing.html")
-        else:
-            print("Install latexmk or specify a different compiler in texwatch.yaml")
-        return EXIT_FAIL
-
-    # Resolve compiler name for display
-    if config.compiler == "auto":
-        from .compiler import _detect_compiler
-        display_compiler = f"auto ({_detect_compiler(main_path)})"
-    else:
-        display_compiler = config.compiler
-
-    print(f"texwatch v{__version__}")
-    print(f"Main file: {main_path}")
-    print(f"Compiler: {display_compiler}")
-
-    # Run server
-    server = TexWatchServer(config)
-    try:
-        server.run(port=config.port)
-    except SystemExit as e:
-        return e.code if isinstance(e.code, int) else 1
-
-    return EXIT_OK
-
-
-# ---------------------------------------------------------------------------
-# New workspace commands: scan, add, remove, projects, serve
-# ---------------------------------------------------------------------------
-
-
 def cmd_scan(args: argparse.Namespace) -> int:
-    """Handle scan command — discover projects in a directory."""
-    from .workspace import discover_projects, load_workspace, save_workspace, merge_discovered, reset_directory, WorkspaceConfig, _resolve_default
+    """List directories containing .texwatch.yaml."""
+    from .workspace import discover_projects
 
     scan_dir = Path(args.directory).resolve()
     if not scan_dir.is_dir():
         print(f"Error: Not a directory: {scan_dir}")
         return EXIT_FAIL
 
-    # Resolve skip_dirs: CLI flag > workspace defaults > built-in defaults
     cli_skip = getattr(args, "skip_dirs", None)
-    if cli_skip:
-        skip_dirs = [s.strip() for s in cli_skip.split(",")]
-    else:
-        ws_existing = load_workspace()
-        ws_defaults = ws_existing.defaults if ws_existing else {}
-        skip_dirs = _resolve_default("skip_dirs", ws_defaults)
-
+    skip_dirs = [s.strip() for s in cli_skip.split(",")] if cli_skip else None
     found = discover_projects(scan_dir, skip_dirs=skip_dirs)
 
     if not found:
-        print(f"No papers found in {scan_dir}")
+        print(f"No projects found in {scan_dir}")
         return EXIT_OK
 
     if getattr(args, "json", False):
         data = [{"name": p.name, "path": str(p.directory), "main": p.main} for p in found]
         print(json.dumps(data))
-        if getattr(args, "dry_run", False):
-            return EXIT_OK
-    else:
-        print(f"Scanning {scan_dir}...")
-        # Group by directory
-        dirs_seen: dict[Path, list] = {}
-        for p in found:
-            dirs_seen.setdefault(p.directory, []).append(p)
-
-        for directory, papers in dirs_seen.items():
-            try:
-                rel = directory.relative_to(scan_dir)
-            except ValueError:
-                rel = directory
-            has_yaml = (directory / "texwatch.yaml").exists()
-            suffix = "(has texwatch.yaml)" if has_yaml else "(auto-detected)"
-            if len(papers) > 1:
-                suffix += f", {len(papers)} papers"
-
-            for i, paper in enumerate(papers):
-                if i == 0:
-                    print(f"  {str(rel) + '/':<20s}{paper.main:<20s}{suffix}")
-                else:
-                    print(f"  {'':<20s}{paper.main}")
-
-        print(f"\nFound {len(found)} papers in {len(dirs_seen)} directories.")
-
-    if getattr(args, "dry_run", False):
-        print("Use without --dry-run to write to workspace.")
         return EXIT_OK
 
-    # Load or create workspace, merge, save
-    ws = load_workspace() or WorkspaceConfig()
-    if getattr(args, "reset", False):
-        removed = reset_directory(ws, scan_dir)
-        if removed and not getattr(args, "json", False):
-            print(f"Reset {removed} existing project(s) under {scan_dir}")
-    ws = merge_discovered(ws, found)
-    ws_path = save_workspace(ws)
-    print(f"Updated {ws_path}")
-    return EXIT_OK
-
-
-def cmd_workspace(args: argparse.Namespace) -> int:
-    """Handle workspace subcommand."""
-    ws_cmd = getattr(args, "ws_command", None)
-    dispatch = {
-        "purge": _cmd_workspace_purge,
-        "show": _cmd_workspace_show,
-        "path": _cmd_workspace_path,
-        "edit": _cmd_workspace_edit,
-    }
-    handler = dispatch.get(ws_cmd)
-    if handler:
-        return handler(args)
-    print("Usage: texwatch workspace {purge,show,path,edit}")
-    return EXIT_FAIL
-
-
-def _cmd_workspace_purge(args: argparse.Namespace) -> int:
-    from .workspace import load_workspace, save_workspace, purge_projects
-    ws = load_workspace()
-    if ws is None:
-        print("No workspace found.")
-        return EXIT_OK
-    removed = purge_projects(ws)
-    if removed == 0:
-        print("Workspace already empty.")
-        return EXIT_OK
-    save_workspace(ws)
-    print(f"Removed {removed} project(s) from workspace.")
-    return EXIT_OK
-
-
-def _cmd_workspace_show(args: argparse.Namespace) -> int:
-    from .workspace import load_workspace, workspace_path
-    ws_path = workspace_path()
-    ws = load_workspace()
-    if ws is None:
-        print(f"No workspace found at {ws_path}")
-        return EXIT_FAIL
-    print(f"Workspace: {ws_path}")
-    print(f"Port:      {ws.port}")
-    if ws.defaults:
-        print(f"Defaults:  {ws.defaults}")
-    print(f"Projects:  {len(ws.projects)}")
-    return EXIT_OK
-
-
-def _cmd_workspace_path(args: argparse.Namespace) -> int:
-    from .workspace import workspace_path
-    print(workspace_path())
-    return EXIT_OK
-
-
-def _cmd_workspace_edit(args: argparse.Namespace) -> int:
-    import os
-    import subprocess
-    from .workspace import workspace_path
-    ws_path = workspace_path()
-    if not ws_path.exists():
-        print(f"No workspace found at {ws_path}")
-        return EXIT_FAIL
-    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR", "vi")
-    return subprocess.call([editor, str(ws_path)])
-
-
-def cmd_add(args: argparse.Namespace) -> int:
-    """Handle add command — register one project/directory."""
-    from .workspace import (
-        load_workspace, save_workspace, project_config_from_dir,
-        WorkspaceConfig, ProjectConfig,
-    )
-
-    target = Path(args.path).resolve()
-    if not target.is_dir():
-        print(f"Error: Not a directory: {target}")
-        return EXIT_FAIL
-
-    name = getattr(args, "name", None)
-    main_file = getattr(args, "main_file", None)
-
-    if name and main_file:
-        # Explicit name and main
-        pc = ProjectConfig(name=name, directory=target, main=main_file)
-        projects = [pc]
-    elif name:
-        # Explicit name, auto-detect main
-        detected = project_config_from_dir(target)
-        if detected:
-            projects = [ProjectConfig(name=name, directory=detected[0].directory, main=detected[0].main)]
-        else:
-            if main_file:
-                projects = [ProjectConfig(name=name, directory=target, main=main_file)]
+    dirs_seen: dict[Path, list] = {}
+    for p in found:
+        dirs_seen.setdefault(p.directory, []).append(p)
+    for directory, papers in dirs_seen.items():
+        try:
+            rel = directory.relative_to(scan_dir)
+        except ValueError:
+            rel = directory
+        for i, paper in enumerate(papers):
+            if i == 0:
+                suffix = f" ({len(papers)} papers)" if len(papers) > 1 else ""
+                print(f"  {str(rel) + '/':<30s}{paper.main}{suffix}")
             else:
-                print(f"Could not auto-detect a main file in {target}")
-                return EXIT_FAIL
-    else:
-        # Auto-detect everything
-        detected = project_config_from_dir(target)
-        if not detected:
-            print(f"Could not auto-detect papers in {target}")
-            return EXIT_FAIL
-        projects = detected
+                print(f"  {'':<30s}{paper.main}")
 
-    ws = load_workspace() or WorkspaceConfig()
-    for pc in projects:
-        ws.projects[pc.name] = pc
-        print(f"Added: {pc.name} ({pc.directory / pc.main})")
-
-    ws_path = save_workspace(ws)
-    print(f"Updated {ws_path}")
-    return EXIT_OK
-
-
-def cmd_remove(args: argparse.Namespace) -> int:
-    """Handle remove command — unregister a project."""
-    from .workspace import load_workspace, save_workspace
-
-    ws = load_workspace()
-    if ws is None:
-        print("No workspace found (~/.texwatch/workspace.yaml)")
-        return EXIT_FAIL
-
-    name = args.name
-    if name not in ws.projects:
-        print(f"Project not found: {name}")
-        print(f"Known projects: {', '.join(sorted(ws.projects.keys())) or '(none)'}")
-        return EXIT_FAIL
-
-    del ws.projects[name]
-    ws_path = save_workspace(ws)
-    print(f"Removed: {name}")
-    print(f"Updated {ws_path}")
-    return EXIT_OK
-
-
-def cmd_projects(args: argparse.Namespace) -> int:
-    """Handle projects command — list registered projects."""
-    from .workspace import load_workspace
-
-    ws = load_workspace()
-    if ws is None:
-        print("No workspace found (~/.texwatch/workspace.yaml)")
-        print("Run 'texwatch scan DIR' to discover projects")
-        return EXIT_FAIL
-
-    if not ws.projects:
-        print("No projects registered")
-        return EXIT_OK
-
-    if getattr(args, "json", False):
-        data = []
-        for name, pc in ws.projects.items():
-            data.append({
-                "name": name,
-                "path": str(pc.directory),
-                "main": pc.main,
-                "compiler": pc.compiler,
-            })
-        print(json.dumps(data))
-        return EXIT_OK
-
-    print(f"{len(ws.projects)} projects in {ws.defaults.get('_path', '~/.texwatch/workspace.yaml')}\n")
-    for name, pc in ws.projects.items():
-        path_str = str(pc.directory)
-        if len(path_str) > 35:
-            path_str = "..." + path_str[-32:]
-        print(f"  {name:<24s}{path_str:<38s}{pc.main:<18s}{pc.compiler}")
-
+    print(f"\nFound {len(found)} projects in {len(dirs_seen)} directories.")
     return EXIT_OK
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """Handle serve command — serve all workspace projects."""
+    """Serve projects from .texwatch.yaml files."""
     import logging as _logging
-    from .workspace import load_workspace
+    from .workspace import discover_projects, project_config_from_dir
 
     level = _logging.DEBUG if getattr(args, "debug", False) else _logging.INFO
-    _logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    _logging.basicConfig(level=level, format="%(asctime)s %(name)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
-    ws_path = getattr(args, "workspace", None)
-    ws = load_workspace(Path(ws_path) if ws_path else None)
+    serve_dir = Path(getattr(args, "dir", None) or ".").resolve()
+    recursive = getattr(args, "recursive", False)
+    port = getattr(args, "port", None) or 8765
 
-    if ws is None:
-        print("No workspace found (~/.texwatch/workspace.yaml)")
-        print("Run 'texwatch scan DIR' to discover projects")
+    if not serve_dir.is_dir():
+        print(f"Error: Not a directory: {serve_dir}")
         return EXIT_FAIL
 
-    if not ws.projects:
-        print("No projects in workspace")
+    if recursive:
+        skip_str = getattr(args, "skip_dirs", None)
+        skip_dirs = [s.strip() for s in skip_str.split(",")] if skip_str else None
+        found = discover_projects(serve_dir, skip_dirs=skip_dirs)
+    else:
+        found = project_config_from_dir(serve_dir)
+
+    if not found:
+        yaml_path = serve_dir / ".texwatch.yaml"
+        if not yaml_path.exists():
+            print(f"No .texwatch.yaml found in {serve_dir}")
+            print("Run 'texwatch init' to create one")
+        else:
+            print(f"No projects found in {serve_dir}")
         return EXIT_FAIL
 
-    port = getattr(args, "port", None) or ws.port
-
-    # Build project list
-    project_list: list[tuple[str, Config]] = []
-    for name, pc in ws.projects.items():
-        cfg = pc.to_legacy_config(port=port)
-        project_list.append((name, cfg))
+    project_list = [(pc.name, pc.to_legacy_config(port=port)) for pc in found]
 
     print(f"texwatch v{__version__}")
-    print(f"Serving {len(project_list)} projects")
-    for name, cfg in project_list:
-        print(f"  {name}: {get_main_file(cfg)}")
+    if len(project_list) == 1:
+        name, cfg = project_list[0]
+        main_path = get_main_file(cfg)
+        if not check_compiler_available(cfg.compiler, main_file=main_path):
+            from .compiler import _detect_compiler
+            resolved = _detect_compiler(main_path) if cfg.compiler == "auto" else cfg.compiler
+            print(f"Error: Compiler not found: {resolved}")
+            return EXIT_FAIL
+        print(f"Main file: {main_path}")
+    else:
+        print(f"Serving {len(project_list)} projects")
+        for name, cfg in project_list:
+            print(f"  {name}: {get_main_file(cfg)}")
 
     server = TexWatchServer(projects=project_list)
     try:
         server.run(port=port)
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else 1
-
     return EXIT_OK
 
 
@@ -1035,7 +784,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     # --- init ---
-    p_init = subparsers.add_parser("init", help="Create texwatch.yaml in current directory")
+    p_init = subparsers.add_parser("init", help="Create .texwatch.yaml in current directory")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing config")
     p_init.add_argument("--compiler", type=str, default=None, help="Set compiler (default: auto)")
 
@@ -1064,7 +813,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_server_options(p_capture)
 
     # --- config ---
-    p_config = subparsers.add_parser("config", help="View or modify texwatch.yaml")
+    p_config = subparsers.add_parser("config", help="View or modify .texwatch.yaml")
     p_config.add_argument("action", nargs="?", default="show",
                           choices=["show", "set", "add", "remove", "path"],
                           help="Action to perform (default: show)")
@@ -1077,52 +826,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_server_options(p_files)
 
     # --- scan ---
-    p_scan = subparsers.add_parser("scan", help="Discover projects in a directory")
+    p_scan = subparsers.add_parser("scan", help="List projects (directories with .texwatch.yaml)")
     p_scan.add_argument("directory", help="Directory to scan")
-    p_scan.add_argument("--dry-run", action="store_true", help="Show what would be registered")
-    p_scan.add_argument("--skip-dirs", type=str, default=None,
-                        help="Comma-separated glob patterns of directories to skip")
+    p_scan.add_argument("--skip-dirs", type=str, default=None, help="Comma-separated skip patterns")
     p_scan.add_argument("--json", action="store_true", help="Output as JSON")
-    p_scan.add_argument("--reset", action="store_true",
-                        help="Remove existing projects under scanned directory before re-discovering")
-
-    # --- add ---
-    p_add = subparsers.add_parser("add", help="Register a project directory")
-    p_add.add_argument("path", help="Path to project directory")
-    p_add.add_argument("--name", type=str, default=None, help="Project name (default: auto)")
-    p_add.add_argument("--main", dest="main_file", type=str, default=None, help="Main file (default: auto-detect)")
-
-    # --- remove ---
-    p_remove = subparsers.add_parser("remove", help="Unregister a project")
-    p_remove.add_argument("name", help="Project name to remove")
-
-    # --- workspace ---
-    p_workspace = subparsers.add_parser("workspace", help="Manage workspace")
-    ws_sub = p_workspace.add_subparsers(dest="ws_command")
-    ws_sub.add_parser("purge", help="Remove all projects from workspace")
-    ws_sub.add_parser("show", help="Show workspace info")
-    ws_sub.add_parser("path", help="Print workspace file path")
-    ws_sub.add_parser("edit", help="Open workspace in $EDITOR")
-
-    # --- projects ---
-    p_projects = subparsers.add_parser("projects", help="List registered projects")
-    p_projects.add_argument("--json", action="store_true", help="Output as JSON")
 
     # --- serve ---
-    p_serve = subparsers.add_parser("serve", help="Serve all workspace projects")
-    p_serve.add_argument("-p", "--port", type=int, default=None, help="Server port (default: from workspace)")
-    p_serve.add_argument("--workspace", type=str, default=None, help="Path to workspace.yaml")
+    p_serve = subparsers.add_parser("serve", help="Serve projects from .texwatch.yaml")
+    p_serve.add_argument("--dir", type=str, default=".", help="Root directory (default: .)")
+    p_serve.add_argument("--recursive", action="store_true", help="Walk tree for .texwatch.yaml files")
+    p_serve.add_argument("--skip-dirs", type=str, default=None, help="Comma-separated skip patterns (recursive)")
+    p_serve.add_argument("-p", "--port", type=int, default=None, help="Server port (default: 8765)")
     p_serve.add_argument("--debug", action="store_true", help="Enable debug logging")
 
-    return parser
-
-
-def _build_run_parser() -> argparse.ArgumentParser:
-    """Build a secondary parser for the default run mode (no subcommand)."""
-    parser = argparse.ArgumentParser(prog="texwatch", add_help=False)
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("-p", "--port", type=int, default=8765)
-    parser.add_argument("main_file", nargs="?", default=None)
     return parser
 
 
@@ -1131,7 +847,7 @@ def _build_run_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 _DISPATCH = {
-    None: cmd_run,
+    None: cmd_serve,
     "init": cmd_init,
     "status": cmd_status,
     "view": cmd_view,
@@ -1141,11 +857,7 @@ _DISPATCH = {
     "config": cmd_config,
     "files": cmd_files,
     "scan": cmd_scan,
-    "add": cmd_add,
-    "remove": cmd_remove,
-    "projects": cmd_projects,
     "serve": cmd_serve,
-    "workspace": cmd_workspace,
 }
 
 
@@ -1157,7 +869,6 @@ def main(argv: list[str] | None = None) -> int:
     args_list = argv if argv is not None else sys.argv[1:]
 
     # Check if the first non-flag token is a known subcommand.
-    # If not, route to the run-mode parser which accepts --port and main_file.
     first_positional = None
     for token in args_list:
         if token == "--":
@@ -1172,15 +883,14 @@ def main(argv: list[str] | None = None) -> int:
         handler = _DISPATCH[args.command]
         return handler(args)
 
-    # No subcommand — default to run mode
+    # No subcommand — default to serve --dir .
     if "--help" in args_list or "-h" in args_list \
        or "--version" in args_list or "-V" in args_list:
-        build_parser().parse_args(args_list)  # will print and exit
+        build_parser().parse_args(args_list)  # prints and exits
 
-    run_parser = _build_run_parser()
-    args = run_parser.parse_args(args_list)
-    args.command = None
-    return cmd_run(args)
+    parser = build_parser()
+    args = parser.parse_args(["serve"] + args_list)
+    return cmd_serve(args)
 
 
 if __name__ == "__main__":

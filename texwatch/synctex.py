@@ -6,9 +6,12 @@ SyncTeX enables bidirectional mapping between:
 """
 
 import gzip
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -73,6 +76,7 @@ def parse_synctex(synctex_path: Path) -> SyncTeXData | None:
             with open(synctex_path, encoding="utf-8", errors="replace") as f:
                 content = f.read()
     except (OSError, gzip.BadGzipFile):
+        logger.debug("synctex: failed to read %s", synctex_path)
         return None
 
     input_files: dict[int, str] = {}
@@ -151,11 +155,23 @@ def parse_synctex(synctex_path: Path) -> SyncTeXData | None:
                 source_to_pdf[key] = []
             source_to_pdf[key].append(pdf_pos)
 
-    return SyncTeXData(
+    data = SyncTeXData(
         pdf_to_source=pdf_to_source,
         source_to_pdf=source_to_pdf,
         input_files=input_files,
     )
+
+    logger.debug(
+        "synctex: parsed %s — %d input files, %d pages, %d source->pdf entries",
+        synctex_path.name,
+        len(input_files),
+        len(pdf_to_source),
+        len(source_to_pdf),
+    )
+    for fid, fname in sorted(input_files.items()):
+        logger.debug("synctex:   input file %d = %s", fid, fname)
+
+    return data
 
 
 def find_synctex_file(pdf_path: Path) -> Path | None:
@@ -194,7 +210,12 @@ def source_to_page(data: SyncTeXData, file: str, line: int) -> PDFPosition | Non
     if key in data.source_to_pdf:
         positions = data.source_to_pdf[key]
         if positions:
-            return positions[0]
+            pos = positions[0]
+            logger.debug(
+                "synctex: source_to_page(%s:%d) -> EXACT match: page=%d x=%.1f y=%.1f w=%.1f h=%.1f",
+                file, line, pos.page, pos.x, pos.y, pos.width, pos.height,
+            )
+            return pos
 
     # Try finding nearest line in same file
     matching_keys = [(f, l) for f, l in data.source_to_pdf.keys() if f == file]
@@ -203,8 +224,18 @@ def source_to_page(data: SyncTeXData, file: str, line: int) -> PDFPosition | Non
         closest = min(matching_keys, key=lambda k: abs(k[1] - line))
         positions = data.source_to_pdf[closest]
         if positions:
-            return positions[0]
+            pos = positions[0]
+            logger.debug(
+                "synctex: source_to_page(%s:%d) -> NEAREST match: line %d (delta=%d), page=%d x=%.1f y=%.1f w=%.1f h=%.1f",
+                file, line, closest[1], abs(closest[1] - line),
+                pos.page, pos.x, pos.y, pos.width, pos.height,
+            )
+            return pos
 
+    logger.debug(
+        "synctex: source_to_page(%s:%d) -> NO MATCH (%d known lines for file)",
+        file, line, len(matching_keys),
+    )
     return None
 
 
@@ -220,19 +251,34 @@ def page_to_source(data: SyncTeXData, page: int, y: float | None = None) -> Sour
         Source position or None if not found.
     """
     if page not in data.pdf_to_source:
+        logger.debug(
+            "synctex: page_to_source(page=%d, y=%s) -> page NOT in data (known pages: %s)",
+            page, y, sorted(data.pdf_to_source.keys()),
+        )
         return None
 
     positions = data.pdf_to_source[page]
     if not positions:
+        logger.debug("synctex: page_to_source(page=%d, y=%s) -> page has 0 entries", page, y)
         return None
 
     if y is None:
         # Return first position on page
-        return positions[0][1]
+        pos = positions[0][1]
+        logger.debug(
+            "synctex: page_to_source(page=%d, y=None) -> first entry: %s:%d (%d entries on page)",
+            page, pos.file, pos.line, len(positions),
+        )
+        return pos
 
     # Find closest y position
     closest = min(positions, key=lambda p: abs(p[0] - y))
-    return closest[1]
+    pos = closest[1]
+    logger.debug(
+        "synctex: page_to_source(page=%d, y=%.1f) -> closest y=%.1f (delta=%.1f) -> %s:%d (%d entries on page)",
+        page, y, closest[0], abs(closest[0] - y), pos.file, pos.line, len(positions),
+    )
+    return pos
 
 
 def get_visible_lines(data: SyncTeXData, page: int) -> tuple[int, int] | None:

@@ -161,8 +161,7 @@ class TestSubcommandParsing:
         """Test that dispatch table covers all subcommands."""
         expected = {
             None, "init", "status", "view", "goto", "compile", "capture",
-            "config", "files", "scan", "add", "remove", "projects", "serve",
-            "workspace",
+            "config", "files", "scan", "serve",
         }
         assert set(_DISPATCH.keys()) == expected
 
@@ -241,18 +240,18 @@ class TestCmdInit:
     """Tests for the init subcommand."""
 
     def test_init_creates_config(self, tmp_path, monkeypatch):
-        """Test init creates texwatch.yaml."""
+        """Test init creates .texwatch.yaml."""
         monkeypatch.chdir(tmp_path)
         (tmp_path / "document.tex").touch()
 
         result = main(["init"])
         assert result == EXIT_OK
-        assert (tmp_path / "texwatch.yaml").exists()
+        assert (tmp_path / ".texwatch.yaml").exists()
 
     def test_init_with_existing_config(self, tmp_path, monkeypatch, capsys):
         """Test init with existing config fails."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: test.tex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: test.tex\n")
 
         result = main(["init"])
         assert result == EXIT_FAIL
@@ -262,7 +261,7 @@ class TestCmdInit:
     def test_init_force_overwrites(self, tmp_path, monkeypatch):
         """Test init --force overwrites existing config."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: old.tex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: old.tex\n")
         (tmp_path / "new.tex").touch()
 
         result = main(["init", "--force"])
@@ -275,7 +274,7 @@ class TestCmdInit:
 
         result = main(["init", "--compiler", "xelatex"])
         assert result == EXIT_OK
-        with open(tmp_path / "texwatch.yaml") as f:
+        with open(tmp_path / ".texwatch.yaml") as f:
             data = yaml.safe_load(f)
         assert data["compiler"] == "xelatex"
 
@@ -469,15 +468,15 @@ class TestCmdConfig:
     """Tests for the config subcommand."""
 
     def test_config_show_no_file(self, tmp_path, monkeypatch, capsys):
-        """Test config show when no texwatch.yaml exists."""
+        """Test config show when no .texwatch.yaml exists."""
         monkeypatch.chdir(tmp_path)
         result = main(["config"])
         assert result == EXIT_FAIL
         captured = capsys.readouterr()
-        assert "No texwatch.yaml found" in captured.out
+        assert "No .texwatch.yaml found" in captured.out
 
     def test_config_show_no_file_json(self, tmp_path, monkeypatch, capsys):
-        """Test config show --json when no texwatch.yaml."""
+        """Test config show --json when no .texwatch.yaml."""
         monkeypatch.chdir(tmp_path)
         result = main(["config", "show", "--json"])
         assert result == EXIT_FAIL
@@ -488,7 +487,7 @@ class TestCmdConfig:
     def test_config_show(self, tmp_path, monkeypatch, capsys):
         """Test config show displays config contents."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\ncompiler: xelatex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\ncompiler: xelatex\n")
 
         result = main(["config"])
         assert result == EXIT_OK
@@ -498,7 +497,7 @@ class TestCmdConfig:
     def test_config_show_json(self, tmp_path, monkeypatch, capsys):
         """Test config show --json outputs valid JSON."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\ncompiler: xelatex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\ncompiler: xelatex\n")
 
         result = main(["config", "show", "--json"])
         assert result == EXIT_OK
@@ -511,12 +510,12 @@ class TestCmdConfig:
     def test_config_path(self, tmp_path, monkeypatch, capsys):
         """Test config path prints config file path."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\n")
 
         result = main(["config", "path"])
         assert result == EXIT_OK
         captured = capsys.readouterr()
-        assert "texwatch.yaml" in captured.out
+        assert ".texwatch.yaml" in captured.out
 
     def test_config_path_no_file(self, tmp_path, monkeypatch, capsys):
         """Test config path when no config exists."""
@@ -527,31 +526,31 @@ class TestCmdConfig:
     def test_config_set_scalar(self, tmp_path, monkeypatch, capsys):
         """Test config set on a scalar field."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\ncompiler: auto\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\ncompiler: auto\n")
 
         result = main(["config", "set", "compiler", "xelatex"])
         assert result == EXIT_OK
 
-        with open(tmp_path / "texwatch.yaml") as f:
+        with open(tmp_path / ".texwatch.yaml") as f:
             data = yaml.safe_load(f)
         assert data["compiler"] == "xelatex"
 
     def test_config_set_port(self, tmp_path, monkeypatch, capsys):
         """Test config set port coerces to int."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\nport: 8765\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\nport: 8765\n")
 
         result = main(["config", "set", "port", "9999"])
         assert result == EXIT_OK
 
-        with open(tmp_path / "texwatch.yaml") as f:
+        with open(tmp_path / ".texwatch.yaml") as f:
             data = yaml.safe_load(f)
         assert data["port"] == 9999
 
     def test_config_set_port_invalid(self, tmp_path, monkeypatch, capsys):
         """Test config set port with non-numeric value."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\n")
 
         result = main(["config", "set", "port", "abc"])
         assert result == EXIT_FAIL
@@ -561,7 +560,7 @@ class TestCmdConfig:
     def test_config_set_list_field_rejects(self, tmp_path, monkeypatch, capsys):
         """Test config set on a list field is rejected."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\n")
 
         result = main(["config", "set", "watch", "*.bib"])
         assert result == EXIT_FAIL
@@ -571,12 +570,12 @@ class TestCmdConfig:
     def test_config_add_to_list(self, tmp_path, monkeypatch, capsys):
         """Test config add appends to list field."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\nwatch:\n- '*.tex'\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\nwatch:\n- '*.tex'\n")
 
         result = main(["config", "add", "watch", "*.bib"])
         assert result == EXIT_OK
 
-        with open(tmp_path / "texwatch.yaml") as f:
+        with open(tmp_path / ".texwatch.yaml") as f:
             data = yaml.safe_load(f)
         assert "*.bib" in data["watch"]
         assert "*.tex" in data["watch"]
@@ -584,19 +583,19 @@ class TestCmdConfig:
     def test_config_add_no_duplicates(self, tmp_path, monkeypatch, capsys):
         """Test config add doesn't add duplicates."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\nwatch:\n- '*.tex'\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\nwatch:\n- '*.tex'\n")
 
         result = main(["config", "add", "watch", "*.tex"])
         assert result == EXIT_OK
 
-        with open(tmp_path / "texwatch.yaml") as f:
+        with open(tmp_path / ".texwatch.yaml") as f:
             data = yaml.safe_load(f)
         assert data["watch"].count("*.tex") == 1
 
     def test_config_add_scalar_field_rejects(self, tmp_path, monkeypatch, capsys):
         """Test config add on a scalar field is rejected."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\n")
 
         result = main(["config", "add", "compiler", "xelatex"])
         assert result == EXIT_FAIL
@@ -606,14 +605,14 @@ class TestCmdConfig:
     def test_config_remove_from_list(self, tmp_path, monkeypatch, capsys):
         """Test config remove removes from list field."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text(
+        (tmp_path / ".texwatch.yaml").write_text(
             "main: doc.tex\nwatch:\n- '*.tex'\n- '*.bib'\n"
         )
 
         result = main(["config", "remove", "watch", "*.bib"])
         assert result == EXIT_OK
 
-        with open(tmp_path / "texwatch.yaml") as f:
+        with open(tmp_path / ".texwatch.yaml") as f:
             data = yaml.safe_load(f)
         assert "*.bib" not in data["watch"]
         assert "*.tex" in data["watch"]
@@ -621,7 +620,7 @@ class TestCmdConfig:
     def test_config_remove_missing_value(self, tmp_path, monkeypatch, capsys):
         """Test config remove fails if value not present."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\nwatch:\n- '*.tex'\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\nwatch:\n- '*.tex'\n")
 
         result = main(["config", "remove", "watch", "*.bib"])
         assert result == EXIT_FAIL
@@ -631,7 +630,7 @@ class TestCmdConfig:
     def test_config_unknown_field(self, tmp_path, monkeypatch, capsys):
         """Test config set with unknown field."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\n")
 
         result = main(["config", "set", "nonexistent", "val"])
         assert result == EXIT_FAIL
@@ -641,7 +640,7 @@ class TestCmdConfig:
     def test_config_set_missing_value(self, tmp_path, monkeypatch, capsys):
         """Test config set without value argument."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\n")
 
         result = main(["config", "set", "compiler"])
         assert result == EXIT_FAIL
@@ -651,7 +650,7 @@ class TestCmdConfig:
     def test_config_set_missing_key(self, tmp_path, monkeypatch, capsys):
         """Test config set without key argument."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: doc.tex\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: doc.tex\n")
 
         result = main(["config", "set"])
         assert result == EXIT_FAIL
@@ -664,24 +663,22 @@ class TestCmdConfig:
 # ---------------------------------------------------------------------------
 
 
-class TestCmdRun:
-    """Tests for the default run command."""
+class TestCmdServeDefault:
+    """Tests for the default serve behavior (no subcommand)."""
 
-    def test_run_missing_main_file(self, tmp_path, monkeypatch, capsys):
-        """Test run with missing main file."""
+    def test_serve_no_yaml_default(self, tmp_path, monkeypatch, capsys):
+        """Test default serve with no .texwatch.yaml."""
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "texwatch.yaml").write_text("main: nonexistent.tex\n")
-
         result = main([])
         assert result == EXIT_FAIL
         captured = capsys.readouterr()
-        assert "not found" in captured.out
+        assert "No .texwatch.yaml found" in captured.out
 
-    def test_run_missing_compiler(self, tmp_path, monkeypatch, capsys):
-        """Test run with missing compiler."""
+    def test_serve_missing_compiler(self, tmp_path, monkeypatch, capsys):
+        """Test default serve with missing compiler."""
         monkeypatch.chdir(tmp_path)
         (tmp_path / "main.tex").write_text("\\documentclass{article}\n")
-        (tmp_path / "texwatch.yaml").write_text(
+        (tmp_path / ".texwatch.yaml").write_text(
             "main: main.tex\ncompiler: nonexistent_compiler_xyz\n"
         )
 
@@ -717,7 +714,7 @@ class TestPortConflict:
         (tmp_path / "main.tex").write_text(
             "\\documentclass{article}\n\\begin{document}\nHi\n\\end{document}\n"
         )
-        (tmp_path / "texwatch.yaml").write_text("main: main.tex\ncompiler: latexmk\n")
+        (tmp_path / ".texwatch.yaml").write_text("main: main.tex\ncompiler: latexmk\n")
 
         with patch("texwatch.cli.TexWatchServer") as MockServer:
             instance = MockServer.return_value
@@ -1114,7 +1111,7 @@ class TestWithMockErrorServer:
 
 
 class TestNewSubcommandParsing:
-    """Tests for the new workspace subcommand parsers."""
+    """Tests for scan and serve subcommand parsers."""
 
     def test_scan_subcommand(self):
         """Test scan subcommand parses directory."""
@@ -1123,55 +1120,17 @@ class TestNewSubcommandParsing:
         assert args.command == "scan"
         assert args.directory == "/tmp/papers"
 
-    def test_scan_dry_run(self):
-        """Test scan --dry-run flag."""
-        parser = build_parser()
-        args = parser.parse_args(["scan", "/tmp", "--dry-run"])
-        assert args.dry_run is True
-
     def test_scan_json(self):
         """Test scan --json flag."""
         parser = build_parser()
         args = parser.parse_args(["scan", "/tmp", "--json"])
         assert args.json is True
 
-    def test_add_subcommand(self):
-        """Test add subcommand parses path."""
+    def test_scan_skip_dirs(self):
+        """Test scan --skip-dirs flag."""
         parser = build_parser()
-        args = parser.parse_args(["add", "/tmp/paper"])
-        assert args.command == "add"
-        assert args.path == "/tmp/paper"
-
-    def test_add_with_name(self):
-        """Test add --name flag."""
-        parser = build_parser()
-        args = parser.parse_args(["add", "/tmp/paper", "--name", "my-paper"])
-        assert args.name == "my-paper"
-
-    def test_add_with_main(self):
-        """Test add --main flag."""
-        parser = build_parser()
-        args = parser.parse_args(["add", "/tmp/paper", "--main", "thesis.tex"])
-        assert args.main_file == "thesis.tex"
-
-    def test_remove_subcommand(self):
-        """Test remove subcommand parses name."""
-        parser = build_parser()
-        args = parser.parse_args(["remove", "my-paper"])
-        assert args.command == "remove"
-        assert args.name == "my-paper"
-
-    def test_projects_subcommand(self):
-        """Test projects subcommand."""
-        parser = build_parser()
-        args = parser.parse_args(["projects"])
-        assert args.command == "projects"
-
-    def test_projects_json(self):
-        """Test projects --json flag."""
-        parser = build_parser()
-        args = parser.parse_args(["projects", "--json"])
-        assert args.json is True
+        args = parser.parse_args(["scan", "/tmp", "--skip-dirs", "build,dist"])
+        assert args.skip_dirs == "build,dist"
 
     def test_serve_subcommand(self):
         """Test serve subcommand."""
@@ -1185,11 +1144,23 @@ class TestNewSubcommandParsing:
         args = parser.parse_args(["serve", "--port", "9000"])
         assert args.port == 9000
 
-    def test_serve_workspace(self):
-        """Test serve --workspace flag."""
+    def test_serve_dir(self):
+        """Test serve --dir flag."""
         parser = build_parser()
-        args = parser.parse_args(["serve", "--workspace", "/tmp/ws.yaml"])
-        assert args.workspace == "/tmp/ws.yaml"
+        args = parser.parse_args(["serve", "--dir", "/tmp/papers"])
+        assert args.dir == "/tmp/papers"
+
+    def test_serve_recursive(self):
+        """Test serve --recursive flag."""
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--recursive"])
+        assert args.recursive is True
+
+    def test_serve_skip_dirs(self):
+        """Test serve --skip-dirs flag."""
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--skip-dirs", "build,dist"])
+        assert args.skip_dirs == "build,dist"
 
     def test_project_flag_on_status(self):
         """Test --project flag on status subcommand."""
@@ -1220,272 +1191,50 @@ class TestCmdScan:
         assert "Not a directory" in captured.out
 
     def test_scan_empty_dir(self, tmp_path, capsys):
-        """Test scan with directory containing no papers."""
+        """Test scan with directory containing no projects."""
         result = main(["scan", str(tmp_path)])
         assert result == EXIT_OK
         captured = capsys.readouterr()
-        assert "No papers found" in captured.out
+        assert "No projects found" in captured.out
 
-    def test_scan_dry_run(self, tmp_path, capsys):
-        """Test scan --dry-run shows but doesn't write."""
+    def test_scan_finds_yaml(self, tmp_path, capsys):
+        """Test scan finds directories with .texwatch.yaml."""
         paper_dir = tmp_path / "thesis"
         paper_dir.mkdir()
+        (paper_dir / ".texwatch.yaml").write_text("main: main.tex\n")
         (paper_dir / "main.tex").write_text("\\documentclass{article}\n")
 
-        result = main(["scan", str(tmp_path), "--dry-run"])
+        result = main(["scan", str(tmp_path)])
         assert result == EXIT_OK
         captured = capsys.readouterr()
         assert "main.tex" in captured.out
-        assert "dry-run" in captured.out.lower() or "without --dry-run" in captured.out
+        assert "1 projects" in captured.out or "1 director" in captured.out
+
+    def test_scan_ignores_dirs_without_yaml(self, tmp_path, capsys):
+        """Test scan ignores directories without .texwatch.yaml."""
+        bare_dir = tmp_path / "bare"
+        bare_dir.mkdir()
+        (bare_dir / "main.tex").write_text("\\documentclass{article}\n")
+
+        result = main(["scan", str(tmp_path)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "No projects found" in captured.out
 
     def test_scan_json(self, tmp_path, capsys):
         """Test scan --json outputs JSON."""
         paper_dir = tmp_path / "paper"
         paper_dir.mkdir()
+        (paper_dir / ".texwatch.yaml").write_text("main: main.tex\n")
         (paper_dir / "main.tex").write_text("\\documentclass{article}\n")
 
-        result = main(["scan", str(tmp_path), "--json", "--dry-run"])
+        result = main(["scan", str(tmp_path), "--json"])
         assert result == EXIT_OK
         captured = capsys.readouterr()
         data = json.loads(captured.out)
         assert isinstance(data, list)
         assert len(data) == 1
         assert data[0]["main"] == "main.tex"
-
-    def test_scan_writes_workspace(self, tmp_path, monkeypatch, capsys):
-        """Test scan writes workspace.yaml."""
-        paper_dir = tmp_path / "paper"
-        paper_dir.mkdir()
-        (paper_dir / "main.tex").write_text("\\documentclass{article}\n")
-
-        # Redirect workspace to tmp
-        ws_file = tmp_path / ".texwatch" / "workspace.yaml"
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["scan", str(tmp_path)])
-        assert result == EXIT_OK
-        assert ws_file.exists()
-
-    def test_scan_reset_replaces(self, tmp_path, monkeypatch, capsys):
-        """Test scan --reset replaces stale entry with fresh discovery."""
-        # Create initial workspace with a stale project under scan_dir
-        ws_file = tmp_path / ".texwatch" / "workspace.yaml"
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        scan_dir = tmp_path / "papers"
-        scan_dir.mkdir()
-        stale_dir = scan_dir / "old_paper"
-        stale_dir.mkdir()
-        # Don't put a .tex file in stale_dir — it's stale
-
-        new_dir = scan_dir / "new_paper"
-        new_dir.mkdir()
-        (new_dir / "main.tex").write_text("\\documentclass{article}\n")
-
-        # Seed workspace with a stale entry
-        ws_file.parent.mkdir(parents=True, exist_ok=True)
-        ws_file.write_text(yaml.dump({
-            "projects": {
-                "old_paper": {"path": str(stale_dir)},
-            },
-        }))
-
-        result = main(["scan", str(scan_dir), "--reset"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "Reset" in captured.out
-
-        # Verify stale entry removed, new entry present
-        with open(ws_file) as f:
-            data = yaml.safe_load(f)
-        assert "old_paper" not in data.get("projects", {})
-        assert any("new_paper" in name for name in data.get("projects", {}).keys())
-
-    def test_scan_reset_preserves_other_dirs(self, tmp_path, monkeypatch, capsys):
-        """Test scan --reset preserves projects outside the scanned directory."""
-        ws_file = tmp_path / ".texwatch" / "workspace.yaml"
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        scan_dir = tmp_path / "papers"
-        scan_dir.mkdir()
-        paper_dir = scan_dir / "thesis"
-        paper_dir.mkdir()
-        (paper_dir / "main.tex").write_text("\\documentclass{article}\n")
-
-        other_dir = tmp_path / "other_project"
-        other_dir.mkdir()
-
-        # Seed workspace with project in other_dir
-        ws_file.parent.mkdir(parents=True, exist_ok=True)
-        ws_file.write_text(yaml.dump({
-            "projects": {
-                "other": {"path": str(other_dir)},
-            },
-        }))
-
-        result = main(["scan", str(scan_dir), "--reset"])
-        assert result == EXIT_OK
-
-        with open(ws_file) as f:
-            data = yaml.safe_load(f)
-        # other project preserved
-        assert "other" in data.get("projects", {})
-
-
-# ---------------------------------------------------------------------------
-# Test: cmd_add
-# ---------------------------------------------------------------------------
-
-
-class TestCmdAdd:
-    """Tests for the add subcommand."""
-
-    def test_add_nonexistent_dir(self, capsys):
-        """Test add with nonexistent directory."""
-        result = main(["add", "/nonexistent/dir/xyz"])
-        assert result == EXIT_FAIL
-        captured = capsys.readouterr()
-        assert "Not a directory" in captured.out
-
-    def test_add_with_name(self, tmp_path, monkeypatch, capsys):
-        """Test add --name with auto-detected main."""
-        (tmp_path / "paper.tex").write_text("\\documentclass{article}\n")
-
-        ws_file = tmp_path / ".texwatch" / "workspace.yaml"
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["add", str(tmp_path), "--name", "my-paper"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "my-paper" in captured.out
-
-    def test_add_empty_dir_no_name(self, tmp_path, capsys):
-        """Test add on empty dir without --name fails."""
-        result = main(["add", str(tmp_path)])
-        assert result == EXIT_FAIL
-        captured = capsys.readouterr()
-        assert "auto-detect" in captured.out.lower()
-
-
-# ---------------------------------------------------------------------------
-# Test: cmd_remove
-# ---------------------------------------------------------------------------
-
-
-class TestCmdRemove:
-    """Tests for the remove subcommand."""
-
-    def test_remove_no_workspace(self, monkeypatch, capsys):
-        """Test remove when no workspace exists."""
-        monkeypatch.setattr(
-            "texwatch.workspace.workspace_path",
-            lambda: Path("/nonexistent/.texwatch/workspace.yaml"),
-        )
-        result = main(["remove", "thesis"])
-        assert result == EXIT_FAIL
-        captured = capsys.readouterr()
-        assert "No workspace" in captured.out
-
-    def test_remove_nonexistent_project(self, tmp_path, monkeypatch, capsys):
-        """Test remove with nonexistent project name."""
-        ws_file = tmp_path / "ws.yaml"
-        ws_file.write_text(yaml.dump({
-            "projects": {"existing": {"path": str(tmp_path)}},
-        }))
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["remove", "nonexistent"])
-        assert result == EXIT_FAIL
-        captured = capsys.readouterr()
-        assert "not found" in captured.out.lower()
-
-    def test_remove_existing_project(self, tmp_path, monkeypatch, capsys):
-        """Test remove removes an existing project."""
-        ws_file = tmp_path / "ws.yaml"
-        ws_file.write_text(yaml.dump({
-            "projects": {
-                "thesis": {"path": str(tmp_path)},
-                "paper": {"path": str(tmp_path)},
-            },
-        }))
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["remove", "thesis"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "Removed: thesis" in captured.out
-
-        # Verify file was updated
-        with open(ws_file) as f:
-            data = yaml.safe_load(f)
-        assert "thesis" not in data.get("projects", {})
-        assert "paper" in data.get("projects", {})
-
-
-# ---------------------------------------------------------------------------
-# Test: cmd_projects
-# ---------------------------------------------------------------------------
-
-
-class TestCmdProjects:
-    """Tests for the projects subcommand."""
-
-    def test_projects_no_workspace(self, monkeypatch, capsys):
-        """Test projects when no workspace exists."""
-        monkeypatch.setattr(
-            "texwatch.workspace.workspace_path",
-            lambda: Path("/nonexistent/.texwatch/workspace.yaml"),
-        )
-        result = main(["projects"])
-        assert result == EXIT_FAIL
-        captured = capsys.readouterr()
-        assert "No workspace" in captured.out
-
-    def test_projects_empty_workspace(self, tmp_path, monkeypatch, capsys):
-        """Test projects with empty workspace."""
-        ws_file = tmp_path / "ws.yaml"
-        ws_file.write_text(yaml.dump({"projects": {}}))
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["projects"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "No projects registered" in captured.out
-
-    def test_projects_lists_entries(self, tmp_path, monkeypatch, capsys):
-        """Test projects lists registered projects."""
-        ws_file = tmp_path / "ws.yaml"
-        ws_file.write_text(yaml.dump({
-            "projects": {
-                "thesis": {"path": str(tmp_path), "main": "thesis.tex"},
-                "paper": {"path": str(tmp_path)},
-            },
-        }))
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["projects"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "thesis" in captured.out
-        assert "paper" in captured.out
-
-    def test_projects_json(self, tmp_path, monkeypatch, capsys):
-        """Test projects --json outputs JSON."""
-        ws_file = tmp_path / "ws.yaml"
-        ws_file.write_text(yaml.dump({
-            "projects": {
-                "test": {"path": str(tmp_path), "main": "test.tex"},
-            },
-        }))
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["projects", "--json"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        data = json.loads(captured.out)
-        assert isinstance(data, list)
-        assert data[0]["name"] == "test"
-        assert data[0]["main"] == "test.tex"
 
 
 # ---------------------------------------------------------------------------
@@ -1496,108 +1245,71 @@ class TestCmdProjects:
 class TestCmdServe:
     """Tests for the serve subcommand."""
 
-    def test_serve_no_workspace(self, monkeypatch, capsys):
-        """Test serve when no workspace exists."""
-        monkeypatch.setattr(
-            "texwatch.workspace.workspace_path",
-            lambda: Path("/nonexistent/.texwatch/workspace.yaml"),
-        )
-        result = main(["serve"])
+    def test_serve_no_yaml(self, tmp_path, monkeypatch, capsys):
+        """Test serve when no .texwatch.yaml exists hints to run init."""
+        monkeypatch.chdir(tmp_path)
+        result = main(["serve", "--dir", str(tmp_path)])
         assert result == EXIT_FAIL
         captured = capsys.readouterr()
-        assert "No workspace" in captured.out
+        assert "No .texwatch.yaml found" in captured.out
+        assert "texwatch init" in captured.out
 
-    def test_serve_empty_workspace(self, tmp_path, monkeypatch, capsys):
-        """Test serve with empty workspace."""
-        ws_file = tmp_path / "ws.yaml"
-        ws_file.write_text(yaml.dump({"projects": {}}))
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
+    def test_serve_single_project(self, tmp_path, monkeypatch, capsys):
+        """Test serve with a single project mocks server and starts."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".texwatch.yaml").write_text("main: main.tex\n")
+        (tmp_path / "main.tex").write_text("\\documentclass{article}\n")
 
-        result = main(["serve", "--workspace", str(ws_file)])
+        with patch("texwatch.cli.TexWatchServer") as MockServer:
+            instance = MockServer.return_value
+            instance.run.return_value = None
+            result = main(["serve", "--dir", str(tmp_path)])
+
+        assert result == EXIT_OK
+        MockServer.assert_called_once()
+
+    def test_serve_recursive(self, tmp_path, monkeypatch, capsys):
+        """Test serve --recursive finds multiple projects."""
+        monkeypatch.chdir(tmp_path)
+        for name in ["thesis", "paper"]:
+            d = tmp_path / name
+            d.mkdir()
+            (d / ".texwatch.yaml").write_text("main: main.tex\n")
+            (d / "main.tex").write_text("\\documentclass{article}\n")
+
+        with patch("texwatch.cli.TexWatchServer") as MockServer:
+            instance = MockServer.return_value
+            instance.run.return_value = None
+            result = main(["serve", "--dir", str(tmp_path), "--recursive"])
+
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "2 projects" in captured.out
+
+    def test_serve_recursive_empty(self, tmp_path, capsys):
+        """Test serve --recursive with no projects fails."""
+        result = main(["serve", "--dir", str(tmp_path), "--recursive"])
+        assert result == EXIT_FAIL
+
+    def test_serve_recursive_empty_with_yaml(self, tmp_path, capsys):
+        """Test serve --recursive with yaml but no valid projects."""
+        # .texwatch.yaml exists but has no main/papers key
+        (tmp_path / ".texwatch.yaml").write_text("compiler: xelatex\n")
+        result = main(["serve", "--dir", str(tmp_path), "--recursive"])
         assert result == EXIT_FAIL
         captured = capsys.readouterr()
-        assert "No projects" in captured.out
+        assert "No projects found" in captured.out
 
+    def test_default_is_serve(self, tmp_path, monkeypatch, capsys):
+        """Test no subcommand defaults to serve --dir ."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".texwatch.yaml").write_text("main: main.tex\n")
+        (tmp_path / "main.tex").write_text("\\documentclass{article}\n")
 
-# ---------------------------------------------------------------------------
-# Test: cmd_workspace
-# ---------------------------------------------------------------------------
+        with patch("texwatch.cli.TexWatchServer") as MockServer:
+            instance = MockServer.return_value
+            instance.run.return_value = None
+            result = main([])
 
-
-class TestCmdWorkspace:
-    """Tests for the workspace subcommand."""
-
-    def test_workspace_purge(self, tmp_path, monkeypatch, capsys):
-        """Test workspace purge removes all projects."""
-        ws_file = tmp_path / "ws.yaml"
-        ws_file.write_text(yaml.dump({
-            "projects": {
-                "a": {"path": str(tmp_path)},
-                "b": {"path": str(tmp_path)},
-            },
-        }))
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["workspace", "purge"])
         assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "Removed 2 project(s)" in captured.out
-
-        # Verify file updated
-        with open(ws_file) as f:
-            data = yaml.safe_load(f)
-        assert len(data.get("projects", {})) == 0
-
-    def test_workspace_purge_empty(self, tmp_path, monkeypatch, capsys):
-        """Test workspace purge when already empty prints message."""
-        ws_file = tmp_path / "ws.yaml"
-        ws_file.write_text(yaml.dump({"projects": {}}))
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["workspace", "purge"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "already empty" in captured.out.lower()
-
-    def test_workspace_purge_no_workspace(self, monkeypatch, capsys):
-        """Test workspace purge when no workspace exists."""
-        monkeypatch.setattr(
-            "texwatch.workspace.workspace_path",
-            lambda: Path("/nonexistent/.texwatch/workspace.yaml"),
-        )
-        result = main(["workspace", "purge"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "No workspace found" in captured.out
-
-    def test_workspace_show(self, tmp_path, monkeypatch, capsys):
-        """Test workspace show displays port and project count."""
-        ws_file = tmp_path / "ws.yaml"
-        ws_file.write_text(yaml.dump({
-            "port": 9000,
-            "projects": {
-                "thesis": {"path": str(tmp_path)},
-                "paper": {"path": str(tmp_path)},
-            },
-        }))
-        monkeypatch.setattr("texwatch.workspace.workspace_path", lambda: ws_file)
-
-        result = main(["workspace", "show"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "9000" in captured.out
-        assert "2" in captured.out
-
-    def test_workspace_path(self, capsys):
-        """Test workspace path prints the workspace file path."""
-        result = main(["workspace", "path"])
-        assert result == EXIT_OK
-        captured = capsys.readouterr()
-        assert "workspace.yaml" in captured.out
-
-    def test_workspace_no_subcommand(self, capsys):
-        """Test workspace with no subcommand prints usage and returns EXIT_FAIL."""
-        result = main(["workspace"])
-        assert result == EXIT_FAIL
-        captured = capsys.readouterr()
-        assert "Usage:" in captured.out or "usage:" in captured.out.lower()
+        MockServer.assert_called_once()

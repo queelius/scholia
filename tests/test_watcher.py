@@ -93,6 +93,69 @@ class TestTexFileHandler:
         loop.close()
 
 
+    def test_schedule_callback_stores_pending_path(self):
+        """Test that _schedule_callback stores the path for the callback."""
+        loop = asyncio.new_event_loop()
+        callback = AsyncMock()
+        handler = TexFileHandler(
+            watch_patterns=["*.tex"],
+            ignore_patterns=[],
+            callback=callback,
+            loop=loop,
+        )
+
+        assert handler._pending_path is None
+
+        # Simulate what on_modified does
+        handler._pending_path = "/tmp/main.tex"
+        assert handler._pending_path == "/tmp/main.tex"
+
+        loop.close()
+
+    def test_on_modified_passes_src_path(self):
+        """Test that on_modified calls _schedule_callback with src_path."""
+        loop = asyncio.new_event_loop()
+        callback = AsyncMock()
+        handler = TexFileHandler(
+            watch_patterns=["*.tex"],
+            ignore_patterns=[],
+            callback=callback,
+            loop=loop,
+        )
+
+        event = MagicMock()
+        event.is_directory = False
+        event.src_path = "/project/main.tex"
+
+        # Mock _schedule_callback to avoid blocking on event loop
+        handler._schedule_callback = MagicMock()
+        handler.on_modified(event)
+
+        handler._schedule_callback.assert_called_once_with("/project/main.tex")
+        loop.close()
+
+    def test_on_created_passes_src_path(self):
+        """Test that on_created calls _schedule_callback with src_path."""
+        loop = asyncio.new_event_loop()
+        callback = AsyncMock()
+        handler = TexFileHandler(
+            watch_patterns=["*.tex"],
+            ignore_patterns=[],
+            callback=callback,
+            loop=loop,
+        )
+
+        event = MagicMock()
+        event.is_directory = False
+        event.src_path = "/project/new_file.tex"
+
+        handler._schedule_callback = MagicMock()
+        handler.on_created(event)
+
+        handler._schedule_callback.assert_called_once_with("/project/new_file.tex")
+        loop.close()
+
+
 class TestTexWatcher:
     """Tests for TexWatcher class."""
 
