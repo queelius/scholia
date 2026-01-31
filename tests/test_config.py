@@ -23,10 +23,11 @@ class TestConfig:
         """Test Config.from_dict with minimal data."""
         config = Config.from_dict({"main": "test.tex"})
         assert config.main == "test.tex"
-        assert config.watch == ["*.tex", "*.md", "*.txt"]
+        assert config.watch == ["*.tex", "*.bib", "*.md", "*.txt"]
         assert config.ignore == []
         assert config.compiler == "auto"
         assert config.port == 8765
+        assert config.page_limit is None
 
     def test_from_dict_full(self):
         """Test Config.from_dict with full data."""
@@ -68,6 +69,54 @@ class TestConfig:
         assert "*.md" in config.watch
         assert "*.txt" in config.watch
         assert "*.tex" in config.watch
+
+    def test_default_watch_includes_bib(self):
+        """Test that default watch patterns include .bib files."""
+        config = Config(main="test.tex")
+        assert "*.bib" in config.watch
+
+    def test_page_limit_default_none(self):
+        """Test that page_limit defaults to None."""
+        config = Config(main="test.tex")
+        assert config.page_limit is None
+
+    def test_page_limit_roundtrip_with_value(self):
+        """Test page_limit serialization round-trip with a value."""
+        data = {"main": "test.tex", "page_limit": 50}
+        config = Config.from_dict(data)
+        assert config.page_limit == 50
+
+        result = config.to_dict()
+        assert result["page_limit"] == 50
+
+        # Round-trip back
+        config2 = Config.from_dict(result)
+        assert config2.page_limit == 50
+
+    def test_page_limit_roundtrip_none(self):
+        """Test page_limit serialization round-trip with None."""
+        data = {"main": "test.tex"}
+        config = Config.from_dict(data)
+        assert config.page_limit is None
+
+        result = config.to_dict()
+        assert "page_limit" not in result
+
+        # Round-trip: from_dict without page_limit should give None
+        config2 = Config.from_dict(result)
+        assert config2.page_limit is None
+
+    def test_page_limit_omitted_from_to_dict_when_none(self):
+        """Test that to_dict omits page_limit when it is None."""
+        config = Config(main="test.tex")
+        d = config.to_dict()
+        assert "page_limit" not in d
+
+    def test_page_limit_included_in_to_dict_when_set(self):
+        """Test that to_dict includes page_limit when it is set."""
+        config = Config(main="test.tex", page_limit=25)
+        d = config.to_dict()
+        assert d["page_limit"] == 25
 
 
 class TestFindConfig:
@@ -152,6 +201,7 @@ class TestCreateConfig:
 
         assert data["main"] == "main.tex"
         assert "*.tex" in data["watch"]
+        assert "*.bib" in data["watch"]
         assert "*.md" in data["watch"]
         assert "*.txt" in data["watch"]
         assert data["compiler"] == "auto"

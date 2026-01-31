@@ -5,7 +5,7 @@
  */
 
 import { EditorView, basicSetup } from "codemirror";
-import { EditorState, StateEffect, StateField } from "@codemirror/state";
+import { EditorState, StateEffect, StateField, Compartment } from "@codemirror/state";
 import { keymap, Decoration } from "@codemirror/view";
 import { StreamLanguage } from "@codemirror/language";
 import { stex } from "@codemirror/legacy-modes/mode/stex";
@@ -36,6 +36,10 @@ const highlightField = StateField.define({
 
 const synctexMark = Decoration.line({ class: "synctex-highlight" });
 
+// ─── Word wrap compartment ───────────────────────────────────────────────────
+
+const wrapCompartment = new Compartment();
+
 // ─── Editor class ────────────────────────────────────────────────────────────
 
 class TexWatchEditor {
@@ -52,6 +56,8 @@ class TexWatchEditor {
         this._highlightTimer = null;
         /** @type {number|null} */
         this._editorStateTimer = null;
+        /** @type {boolean} */
+        this.wordWrap = false;
     }
 
     async init() {
@@ -66,11 +72,26 @@ class TexWatchEditor {
                     StreamLanguage.define(stex),
                     oneDark,
                     highlightField,
+                    wrapCompartment.of([]),
                     keymap.of([
                         {
                             key: "Mod-s",
                             run: () => {
                                 this.saveFile();
+                                return true;
+                            },
+                        },
+                        {
+                            key: "Mod-Enter",
+                            run: () => {
+                                const line = this.view.state.doc.lineAt(
+                                    this.view.state.selection.main.head
+                                ).number;
+                                window.dispatchEvent(
+                                    new CustomEvent("texwatch:goto-line", {
+                                        detail: { line },
+                                    })
+                                );
                                 return true;
                             },
                         },
@@ -221,6 +242,18 @@ class TexWatchEditor {
         }, 2000);
     }
 
+    toggleWordWrap() {
+        if (!this.view) return;
+        this.wordWrap = !this.wordWrap;
+        this.view.dispatch({
+            effects: wrapCompartment.reconfigure(
+                this.wordWrap ? EditorView.lineWrapping : []
+            ),
+        });
+        const btn = document.getElementById("btn-word-wrap");
+        if (btn) btn.classList.toggle("active", this.wordWrap);
+    }
+
     onDocChanged() {
         this.isDirty = true;
         this._updateStatus();
@@ -307,6 +340,11 @@ class TexWatchEditor {
                 this.baseMtimeNs = null;
                 this.hideConflictBar();
             });
+        }
+
+        const btnWrap = document.getElementById("btn-word-wrap");
+        if (btnWrap) {
+            btnWrap.addEventListener("click", () => this.toggleWordWrap());
         }
     }
 

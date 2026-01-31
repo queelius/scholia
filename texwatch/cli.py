@@ -694,6 +694,27 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """Handle mcp command — run the MCP stdio server."""
+    try:
+        from . import mcp_server
+    except ImportError:
+        print(
+            "Error: MCP server requires 'mcp' and 'httpx' packages.\n"
+            "Install them with:\n"
+            "  pip install 'mcp>=1.0' httpx\n"
+            "Or install the optional dependency group:\n"
+            "  pip install texwatch[mcp]",
+            file=sys.stderr,
+        )
+        return EXIT_FAIL
+
+    port = getattr(args, "port", 8765)
+    project = getattr(args, "project", None) or None
+    mcp_server.main(port=port, project=project)
+    return EXIT_OK
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Serve projects from .texwatch.yaml files."""
     import logging as _logging
@@ -831,6 +852,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--skip-dirs", type=str, default=None, help="Comma-separated skip patterns")
     p_scan.add_argument("--json", action="store_true", help="Output as JSON")
 
+    # --- mcp ---
+    p_mcp = subparsers.add_parser("mcp", help="Run MCP (Model Context Protocol) stdio server")
+    p_mcp.add_argument("-p", "--port", type=int, default=8765, help="Server port (default: 8765)")
+    p_mcp.add_argument("--project", type=str, default=None, help="Target project name")
+
     # --- serve ---
     p_serve = subparsers.add_parser("serve", help="Serve projects from .texwatch.yaml")
     p_serve.add_argument("--dir", type=str, default=".", help="Root directory (default: .)")
@@ -858,6 +884,7 @@ _DISPATCH = {
     "files": cmd_files,
     "scan": cmd_scan,
     "serve": cmd_serve,
+    "mcp": cmd_mcp,
 }
 
 

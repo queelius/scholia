@@ -62,6 +62,31 @@ class TestStatusEndpoint:
         assert "viewer" in data
 
     @pytest.mark.asyncio
+    async def test_status_includes_page_limit(self, client, server):
+        """Test /status response includes page_limit field."""
+        resp = await client.get("/status")
+        data = await resp.json()
+        assert "page_limit" in data
+        # Default config has page_limit=None
+        assert data["page_limit"] is None
+
+    @pytest.mark.asyncio
+    async def test_status_includes_total_pages(self, client, server):
+        """Test /status response includes total_pages field."""
+        resp = await client.get("/status")
+        data = await resp.json()
+        assert "total_pages" in data
+        assert data["total_pages"] == 0  # initial value
+
+    @pytest.mark.asyncio
+    async def test_status_page_limit_when_set(self, client, server):
+        """Test /status response includes page_limit when config has a value."""
+        server._single.config.page_limit = 42
+        resp = await client.get("/status")
+        data = await resp.json()
+        assert data["page_limit"] == 42
+
+    @pytest.mark.asyncio
     async def test_status_after_compile(self, client, server):
         """Test status after a compile result is set."""
         server._last_result = CompileResult(
@@ -92,6 +117,26 @@ class TestConfigEndpoint:
         assert data["main"] == "main.tex"
         assert data["compiler"] == "latexmk"
         assert data["port"] == 0
+
+
+    @pytest.mark.asyncio
+    async def test_config_includes_page_limit_when_set(self, client, config):
+        """Test /config includes page_limit when config has a value."""
+        # Modify the config to have a page_limit
+        config.page_limit = 100
+        resp = await client.get("/config")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["page_limit"] == 100
+
+    @pytest.mark.asyncio
+    async def test_config_omits_page_limit_when_none(self, client, config):
+        """Test /config omits page_limit when config has None."""
+        config.page_limit = None
+        resp = await client.get("/config")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "page_limit" not in data
 
 
 class TestGotoEndpoint:
@@ -143,15 +188,15 @@ class TestGotoEndpoint:
         assert resp.status == 400
 
     @pytest.mark.asyncio
-    async def test_goto_section_not_implemented(self, client):
-        """Test goto section returns 501."""
+    async def test_goto_section_no_match(self, client):
+        """Test goto section returns 404 when no section matches."""
         resp = await client.post(
             "/goto",
             json={"section": "Introduction"},
         )
-        assert resp.status == 501
+        assert resp.status == 404
         data = await resp.json()
-        assert "not yet implemented" in data["error"]
+        assert "No section matching" in data["error"]
 
     @pytest.mark.asyncio
     async def test_goto_line_fallback_with_pages(self, client, server):
@@ -320,6 +365,55 @@ class TestCompileEndpoint:
             assert resp.status == 200
             data = await resp.json()
             assert data["success"] is True
+
+
+class TestCompiledBroadcastLogOutput:
+    """Tests for log_output in the compiled WebSocket broadcast."""
+
+    @pytest.mark.asyncio
+    async def test_compiled_broadcast_includes_log_output(self, client, server):
+        """Test that compiled broadcast includes log_output when present."""
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            with patch("texwatch.server.compile_tex") as mock_compile:
+                mock_compile.return_value = CompileResult(
+                    success=True,
+                    log_output="This is a test log\nLine 2\n",
+                )
+                await client.post("/compile")
+
+            # Receive compiling=True, compiling=False, then compiled
+            messages = []
+            for _ in range(3):
+                msg = await ws.receive_json()
+                messages.append(msg)
+
+            compiled_msg = next(m for m in messages if m["type"] == "compiled")
+            assert "log_output" in compiled_msg
+            assert "This is a test log" in compiled_msg["log_output"]
+
+    @pytest.mark.asyncio
+    async def test_compiled_broadcast_omits_log_output_when_empty(self, client, server):
+        """Test that compiled broadcast omits log_output when empty."""
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            with patch("texwatch.server.compile_tex") as mock_compile:
+                mock_compile.return_value = CompileResult(
+                    success=True,
+                    log_output="",  # empty
+                )
+                await client.post("/compile")
+
+            # Receive compiling=True, compiling=False, then compiled
+            messages = []
+            for _ in range(3):
+                msg = await ws.receive_json()
+                messages.append(msg)
+
+            compiled_msg = next(m for m in messages if m["type"] == "compiled")
+            assert "log_output" not in compiled_msg
 
 
 class TestCaptureEndpoint:
@@ -1209,3 +1303,742 @@ class TestSingleProjectMode:
         """Test single-project server has _single reference."""
         assert server._single is not None
         assert len(server._projects) == 1
+
+
+class TestVisibleLinesComputed:
+    """Tests for visible_lines computation on viewer_state update."""
+
+    @pytest.mark.asyncio
+    async def test_visible_lines_computed_on_viewer_state(self, client, server):
+        """Test that visible_lines is computed when viewer_state is updated with synctex data."""
+        from texwatch.synctex import PDFPosition, SourcePosition, SyncTeXData
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={
+                1: [
+                    (400.0, SourcePosition(file="main.tex", line=5)),
+                    (600.0, SourcePosition(file="main.tex", line=15)),
+                    (800.0, SourcePosition(file="main.tex", line=25)),
+                ],
+            },
+            source_to_pdf={},
+            input_files={1: "main.tex"},
+        )
+
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            await ws.send_json({
+                "type": "viewer_state",
+                "state": {"page": 1, "total_pages": 5},
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+            assert server._viewer_state["visible_lines"] == (5, 25)
+
+    @pytest.mark.asyncio
+    async def test_visible_lines_none_without_synctex(self, client, server):
+        """Test that visible_lines stays None when no synctex data."""
+        server._synctex_data = None
+
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()
+
+            await ws.send_json({
+                "type": "viewer_state",
+                "state": {"page": 1, "total_pages": 5},
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+            assert server._viewer_state.get("visible_lines") is None
+
+
+class TestGotoUsesEditorFile:
+    """Tests for multi-file forward sync in goto handler."""
+
+    @pytest.mark.asyncio
+    async def test_goto_uses_editor_file(self, client, server):
+        """Test that goto uses editor_state file when no file in request."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("chapters/intro.tex", 10): [
+                    PDFPosition(page=3, x=72.0, y=500.0, width=200.0, height=12.0)
+                ],
+            },
+            input_files={1: "chapters/intro.tex"},
+        )
+        server._editor_state = {"file": "chapters/intro.tex", "line": 10}
+
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()
+
+            resp = await client.post("/goto", json={"line": 10})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["success"] is True
+            assert data["page"] == 3
+
+            msg = await ws.receive_json()
+            assert msg["type"] == "goto"
+            assert msg["page"] == 3
+
+    @pytest.mark.asyncio
+    async def test_goto_explicit_file_overrides_editor(self, client, server):
+        """Test that explicit file in request takes priority over editor_state."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("appendix.tex", 5): [
+                    PDFPosition(page=7, x=72.0, y=300.0, width=100.0, height=10.0)
+                ],
+            },
+            input_files={1: "appendix.tex"},
+        )
+        server._editor_state = {"file": "main.tex", "line": 1}
+
+        resp = await client.post("/goto", json={"line": 5, "file": "appendix.tex"})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["page"] == 7
+
+    @pytest.mark.asyncio
+    async def test_goto_falls_back_to_main_file(self, client, server):
+        """Test goto falls back to main file when no editor state or explicit file."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("main.tex", 3): [
+                    PDFPosition(page=1, x=72.0, y=200.0, width=100.0, height=10.0)
+                ],
+            },
+            input_files={1: "main.tex"},
+        )
+        server._editor_state = {"file": None, "line": None}
+
+        resp = await client.post("/goto", json={"line": 3})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["page"] == 1
+
+
+class TestErrorsEndpoint:
+    """Tests for GET /errors endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_errors_no_compile_result(self, client, server):
+        """Test GET /errors when no compilation has happened yet."""
+        resp = await client.get("/errors")
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert data["errors"] == []
+        assert data["warnings"] == []
+
+    @pytest.mark.asyncio
+    async def test_errors_with_errors_and_warnings(self, client, server):
+        """Test GET /errors returns errors and warnings from last compile."""
+        server._last_result = CompileResult(
+            success=False,
+            errors=[
+                CompileMessage(
+                    file="main.tex", line=42, message="Undefined control sequence",
+                    type="error",
+                    context=["line 37", "line 38", "line 39", "line 40", "line 41",
+                             ">>> line 42 <<<", "line 43", "line 44", "line 45",
+                             "line 46", "line 47"],
+                ),
+            ],
+            warnings=[
+                CompileMessage(
+                    file="main.tex", line=10, message="Underfull hbox",
+                    type="warning",
+                ),
+            ],
+        )
+
+        resp = await client.get("/errors")
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert len(data["errors"]) == 1
+        assert len(data["warnings"]) == 1
+
+        err = data["errors"][0]
+        assert err["file"] == "main.tex"
+        assert err["line"] == 42
+        assert err["message"] == "Undefined control sequence"
+        assert "context" in err
+        assert len(err["context"]) == 11
+        assert ">>> line 42 <<<" in err["context"]
+
+        warn = data["warnings"][0]
+        assert warn["file"] == "main.tex"
+        assert warn["line"] == 10
+        # Warning without context should not have context key
+        assert "context" not in warn
+
+    @pytest.mark.asyncio
+    async def test_errors_with_successful_compile(self, client, server):
+        """Test GET /errors with successful compile returns empty lists."""
+        server._last_result = CompileResult(
+            success=True,
+            errors=[],
+            warnings=[],
+        )
+
+        resp = await client.get("/errors")
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert data["errors"] == []
+        assert data["warnings"] == []
+
+    @pytest.mark.asyncio
+    async def test_errors_context_not_present_when_none(self, client, server):
+        """Test that context key is omitted when context is None."""
+        server._last_result = CompileResult(
+            success=False,
+            errors=[
+                CompileMessage(
+                    file="main.tex", line=5, message="Missing $",
+                    type="error",
+                    # context is None by default
+                ),
+            ],
+        )
+
+        resp = await client.get("/errors")
+        data = await resp.json()
+        assert "context" not in data["errors"][0]
+
+
+class TestErrorsEndpointMultiProject:
+    """Tests for GET /p/{name}/errors endpoint in multi-project mode."""
+
+    @pytest.fixture
+    def multi_config(self, tmp_path):
+        """Create configs for two projects."""
+        dir_a = tmp_path / "project_a"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nA\n\\end{document}\n"
+        )
+        config_a = Config(
+            main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+            port=0, config_path=dir_a / ".texwatch.yaml",
+        )
+        return [("alpha", config_a)]
+
+    @pytest.fixture
+    def multi_server(self, multi_config):
+        return TexWatchServer(projects=multi_config)
+
+    @pytest.fixture
+    async def multi_client(self, multi_server):
+        async with TestClient(TestServer(multi_server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_project_errors_endpoint(self, multi_client, multi_server):
+        """Test GET /p/{name}/errors returns project errors."""
+        multi_server._projects["alpha"].last_result = CompileResult(
+            success=False,
+            errors=[
+                CompileMessage(
+                    file="main.tex", line=3, message="Bad command",
+                    type="error",
+                    context=["line 1", "line 2", ">>> line 3 <<<"],
+                ),
+            ],
+        )
+
+        resp = await multi_client.get("/p/alpha/errors")
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert len(data["errors"]) == 1
+        assert data["errors"][0]["context"] == ["line 1", "line 2", ">>> line 3 <<<"]
+
+    @pytest.mark.asyncio
+    async def test_project_errors_not_found(self, multi_client):
+        """Test GET /p/{name}/errors with unknown project returns 404."""
+        resp = await multi_client.get("/p/nonexistent/errors")
+        assert resp.status == 404
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Context endpoint tests
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestContextEndpoint:
+    """Tests for GET /context endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_context_no_compile_result(self, client, server):
+        """Test /context returns default context when no compilation has happened."""
+        from texwatch.structure import DocumentStructure
+
+        with patch("texwatch.server.parse_structure", return_value=DocumentStructure()):
+            resp = await client.get("/context")
+            assert resp.status == 200
+
+            data = await resp.json()
+            assert data["compiling"] is False
+            assert data["errors_count"] == 0
+            assert data["warnings_count"] == 0
+            assert data["current_section"] is None
+            assert data["editor"]["file"] is None
+            assert data["editor"]["line"] is None
+            assert data["viewer"]["page"] == 1
+
+    @pytest.mark.asyncio
+    async def test_context_with_compile_result(self, client, server):
+        """Test /context returns full context after compilation."""
+        from texwatch.structure import DocumentStructure
+
+        server._last_result = CompileResult(
+            success=False,
+            errors=[
+                CompileMessage(file="main.tex", line=10, message="err1", type="error"),
+                CompileMessage(file="main.tex", line=20, message="err2", type="error"),
+            ],
+            warnings=[
+                CompileMessage(file="main.tex", line=5, message="warn", type="warning"),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=DocumentStructure()):
+            resp = await client.get("/context")
+            assert resp.status == 200
+
+            data = await resp.json()
+            assert data["compiling"] is False
+            assert data["errors_count"] == 2
+            assert data["warnings_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_context_current_section(self, client, server):
+        """Test current_section is determined from editor state."""
+        from texwatch.structure import DocumentStructure, Section
+
+        server._editor_state = {"file": "main.tex", "line": 42}
+
+        structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Introduction", file="main.tex", line=10),
+                Section(level="section", title="Methods", file="main.tex", line=30),
+                Section(level="section", title="Results", file="main.tex", line=50),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=structure):
+            resp = await client.get("/context")
+            assert resp.status == 200
+
+            data = await resp.json()
+            # Line 42 is after "Methods" (line 30) but before "Results" (line 50)
+            assert data["current_section"] == "Methods"
+
+    @pytest.mark.asyncio
+    async def test_context_includes_page_limit(self, client, server):
+        """Test /context includes page_limit from config."""
+        from texwatch.structure import DocumentStructure
+
+        server._single.config.page_limit = 8
+
+        with patch("texwatch.server.parse_structure", return_value=DocumentStructure()):
+            resp = await client.get("/context")
+            assert resp.status == 200
+
+            data = await resp.json()
+            assert data["page_limit"] == 8
+
+    @pytest.mark.asyncio
+    async def test_context_includes_word_count(self, client, server):
+        """Test /context includes word_count from parse_structure."""
+        from texwatch.structure import DocumentStructure
+
+        structure = DocumentStructure(word_count=4200)
+
+        with patch("texwatch.server.parse_structure", return_value=structure):
+            resp = await client.get("/context")
+            assert resp.status == 200
+
+            data = await resp.json()
+            assert data["word_count"] == 4200
+
+
+class TestContextEndpointMultiProject:
+    """Tests for GET /p/{name}/context endpoint in multi-project mode."""
+
+    @pytest.fixture
+    def multi_config(self, tmp_path):
+        """Create configs for two projects."""
+        dir_a = tmp_path / "project_a"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nA\n\\end{document}\n"
+        )
+        config_a = Config(
+            main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+            port=0, config_path=dir_a / ".texwatch.yaml",
+        )
+        return [("alpha", config_a)]
+
+    @pytest.fixture
+    def multi_server(self, multi_config):
+        return TexWatchServer(projects=multi_config)
+
+    @pytest.fixture
+    async def multi_client(self, multi_server):
+        async with TestClient(TestServer(multi_server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_project_context_endpoint(self, multi_client, multi_server):
+        """Test GET /p/{name}/context returns project context."""
+        from texwatch.structure import DocumentStructure
+
+        with patch("texwatch.server.parse_structure", return_value=DocumentStructure()):
+            resp = await multi_client.get("/p/alpha/context")
+            assert resp.status == 200
+
+            data = await resp.json()
+            assert "editor" in data
+            assert "viewer" in data
+            assert "compiling" in data
+            assert "errors_count" in data
+            assert "warnings_count" in data
+            assert "current_section" in data
+            assert "page_limit" in data
+            assert "word_count" in data
+
+    @pytest.mark.asyncio
+    async def test_project_context_not_found(self, multi_client):
+        """Test GET /p/{name}/context with unknown project returns 404."""
+        resp = await multi_client.get("/p/nonexistent/context")
+        assert resp.status == 404
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Structure endpoint tests
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestStructureEndpoint:
+    """Tests for GET /structure endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_structure_returns_sections_todos_inputs(self, client, server):
+        """Test /structure returns parsed structure with sections, todos, inputs."""
+        from texwatch.structure import (
+            DocumentStructure,
+            InputFile,
+            Section,
+            TodoItem,
+        )
+
+        structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Introduction", file="main.tex", line=15),
+            ],
+            todos=[
+                TodoItem(text="Add more references", file="related.tex", line=12, tag="TODO"),
+            ],
+            inputs=[
+                InputFile(path="chapters/intro.tex", file="main.tex", line=5),
+            ],
+            word_count=4200,
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=structure):
+            resp = await client.get("/structure")
+            assert resp.status == 200
+
+            data = await resp.json()
+            assert len(data["sections"]) == 1
+            assert data["sections"][0]["level"] == "section"
+            assert data["sections"][0]["title"] == "Introduction"
+            assert data["sections"][0]["file"] == "main.tex"
+            assert data["sections"][0]["line"] == 15
+
+            assert len(data["todos"]) == 1
+            assert data["todos"][0]["text"] == "Add more references"
+            assert data["todos"][0]["file"] == "related.tex"
+            assert data["todos"][0]["line"] == 12
+            assert data["todos"][0]["tag"] == "TODO"
+
+            assert len(data["inputs"]) == 1
+            assert data["inputs"][0]["path"] == "chapters/intro.tex"
+            assert data["inputs"][0]["file"] == "main.tex"
+            assert data["inputs"][0]["line"] == 5
+
+            assert data["word_count"] == 4200
+
+    @pytest.mark.asyncio
+    async def test_structure_empty_project(self, client, server):
+        """Test /structure returns empty lists for empty project."""
+        from texwatch.structure import DocumentStructure
+
+        structure = DocumentStructure()
+
+        with patch("texwatch.server.parse_structure", return_value=structure):
+            resp = await client.get("/structure")
+            assert resp.status == 200
+
+            data = await resp.json()
+            assert data["sections"] == []
+            assert data["todos"] == []
+            assert data["inputs"] == []
+            assert data["word_count"] is None
+
+
+class TestStructureEndpointMultiProject:
+    """Tests for GET /p/{name}/structure endpoint in multi-project mode."""
+
+    @pytest.fixture
+    def multi_config(self, tmp_path):
+        """Create configs for two projects."""
+        dir_a = tmp_path / "project_a"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nA\n\\end{document}\n"
+        )
+        config_a = Config(
+            main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+            port=0, config_path=dir_a / ".texwatch.yaml",
+        )
+        return [("alpha", config_a)]
+
+    @pytest.fixture
+    def multi_server(self, multi_config):
+        return TexWatchServer(projects=multi_config)
+
+    @pytest.fixture
+    async def multi_client(self, multi_server):
+        async with TestClient(TestServer(multi_server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_project_structure_endpoint(self, multi_client, multi_server):
+        """Test GET /p/{name}/structure returns project structure."""
+        from texwatch.structure import DocumentStructure, Section
+
+        structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Intro", file="main.tex", line=5),
+            ],
+            word_count=1000,
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=structure):
+            resp = await multi_client.get("/p/alpha/structure")
+            assert resp.status == 200
+
+            data = await resp.json()
+            assert len(data["sections"]) == 1
+            assert data["sections"][0]["title"] == "Intro"
+            assert data["word_count"] == 1000
+
+    @pytest.mark.asyncio
+    async def test_project_structure_not_found(self, multi_client):
+        """Test GET /p/{name}/structure with unknown project returns 404."""
+        resp = await multi_client.get("/p/nonexistent/structure")
+        assert resp.status == 404
+
+
+class TestGotoSection:
+    """Tests for section-based goto navigation."""
+
+    @pytest.mark.asyncio
+    async def test_goto_section_exact_match(self, client, server):
+        """Test goto section with exact title match and SyncTeX hit."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+        from texwatch.structure import Section, DocumentStructure
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("main.tex", 10): [
+                    PDFPosition(page=2, x=72.0, y=500.0, width=200.0, height=14.0)
+                ],
+            },
+            input_files={},
+        )
+
+        mock_structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Introduction", file="main.tex", line=10),
+                Section(level="section", title="Conclusion", file="main.tex", line=50),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=mock_structure):
+            resp = await client.post("/goto", json={"section": "Introduction"})
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["page"] == 2
+        assert data["section"] == "Introduction"
+
+    @pytest.mark.asyncio
+    async def test_goto_section_substring_match(self, client, server):
+        """Test goto section with substring match (e.g. 'intro' matches 'Introduction')."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+        from texwatch.structure import Section, DocumentStructure
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("main.tex", 10): [
+                    PDFPosition(page=2, x=72.0, y=500.0, width=200.0, height=14.0)
+                ],
+            },
+            input_files={},
+        )
+
+        mock_structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Introduction", file="main.tex", line=10),
+                Section(level="section", title="Conclusion", file="main.tex", line=50),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=mock_structure):
+            resp = await client.post("/goto", json={"section": "intro"})
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["section"] == "Introduction"
+
+    @pytest.mark.asyncio
+    async def test_goto_section_case_insensitive(self, client, server):
+        """Test goto section with case-insensitive match."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+        from texwatch.structure import Section, DocumentStructure
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("main.tex", 10): [
+                    PDFPosition(page=2, x=72.0, y=500.0, width=200.0, height=14.0)
+                ],
+            },
+            input_files={},
+        )
+
+        mock_structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Introduction", file="main.tex", line=10),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=mock_structure):
+            resp = await client.post("/goto", json={"section": "INTRODUCTION"})
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["section"] == "Introduction"
+
+    @pytest.mark.asyncio
+    async def test_goto_section_not_found(self, client, server):
+        """Test goto section returns 404 when no section matches."""
+        from texwatch.structure import Section, DocumentStructure
+
+        mock_structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Introduction", file="main.tex", line=10),
+                Section(level="section", title="Conclusion", file="main.tex", line=50),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=mock_structure):
+            resp = await client.post("/goto", json={"section": "Nonexistent"})
+
+        assert resp.status == 404
+        data = await resp.json()
+        assert "No section matching" in data["error"]
+        assert "available_sections" in data
+        assert "Introduction" in data["available_sections"]
+        assert "Conclusion" in data["available_sections"]
+
+    @pytest.mark.asyncio
+    async def test_goto_section_no_synctex(self, client, server):
+        """Test goto section falls back to page estimation when no SyncTeX data."""
+        from texwatch.structure import Section, DocumentStructure
+
+        server._synctex_data = None
+        server._viewer_state["total_pages"] = 10
+
+        mock_structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Introduction", file="main.tex", line=2),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=mock_structure):
+            resp = await client.post("/goto", json={"section": "Introduction"})
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["estimated"] is True
+        assert data["section"] == "Introduction"
+        # main.tex has 4 lines, section at line 2, 10 pages
+        # estimated_page = round(2/4 * 10) = round(5.0) = 5
+        assert data["page"] == 5
+
+    @pytest.mark.asyncio
+    async def test_goto_section_prefers_exact_match(self, client, server):
+        """Test goto section prefers exact match when multiple sections match substring."""
+        from texwatch.synctex import PDFPosition, SyncTeXData
+        from texwatch.structure import Section, DocumentStructure
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={},
+            source_to_pdf={
+                ("main.tex", 30): [
+                    PDFPosition(page=4, x=72.0, y=400.0, width=200.0, height=14.0)
+                ],
+                ("main.tex", 10): [
+                    PDFPosition(page=2, x=72.0, y=500.0, width=200.0, height=14.0)
+                ],
+            },
+            input_files={},
+        )
+
+        mock_structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Introduction to Methods", file="main.tex", line=10),
+                Section(level="section", title="Introduction", file="main.tex", line=30),
+                Section(level="section", title="Conclusion", file="main.tex", line=50),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=mock_structure):
+            resp = await client.post("/goto", json={"section": "Introduction"})
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        # Should prefer exact match "Introduction" (line 30, page 4)
+        # over substring match "Introduction to Methods" (line 10, page 2)
+        assert data["section"] == "Introduction"
+        assert data["page"] == 4

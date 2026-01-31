@@ -161,7 +161,7 @@ class TestSubcommandParsing:
         """Test that dispatch table covers all subcommands."""
         expected = {
             None, "init", "status", "view", "goto", "compile", "capture",
-            "config", "files", "scan", "serve",
+            "config", "files", "scan", "serve", "mcp",
         }
         assert set(_DISPATCH.keys()) == expected
 

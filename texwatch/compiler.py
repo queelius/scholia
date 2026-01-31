@@ -17,6 +17,7 @@ class CompileMessage:
     line: int | None
     message: str
     type: Literal["error", "warning"]
+    context: list[str] | None = None
 
 
 @dataclass
@@ -160,6 +161,62 @@ def _parse_pandoc_errors(stderr: str) -> list[CompileMessage]:
     return [CompileMessage(file="", line=None, message=stderr.strip()[:200], type="error")]
 
 
+def enrich_error_context(
+    messages: list[CompileMessage], work_dir: Path, window: int = 5
+) -> None:
+    """Attach surrounding source lines to each message that has a file and line.
+
+    For each message, reads +/-*window* lines around the error line from the
+    source file on disk and stores them in ``message.context``.  The error
+    line itself is marked with ``>>> ... <<<`` markers.
+
+    Args:
+        messages: List of :class:`CompileMessage` to enrich (modified in place).
+        work_dir: Working directory used to resolve relative file paths.
+        window: Number of context lines above and below the error line.
+    """
+    # Cache file contents to avoid re-reading the same file for multiple errors
+    file_cache: dict[str, list[str]] = {}
+
+    for msg in messages:
+        if not msg.file or msg.line is None:
+            continue
+
+        # Resolve the source file path
+        file_path = work_dir / msg.file
+        if not file_path.is_file():
+            continue
+
+        # Read and cache file lines
+        cache_key = str(file_path)
+        if cache_key not in file_cache:
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+                file_cache[cache_key] = text.splitlines()
+            except OSError:
+                continue
+
+        lines = file_cache[cache_key]
+        total = len(lines)
+
+        # msg.line is 1-based
+        error_idx = msg.line - 1
+        if error_idx < 0 or error_idx >= total:
+            continue
+
+        start = max(0, error_idx - window)
+        end = min(total, error_idx + window + 1)
+
+        context_lines: list[str] = []
+        for i in range(start, end):
+            if i == error_idx:
+                context_lines.append(f">>> {lines[i]} <<<")
+            else:
+                context_lines.append(lines[i])
+
+        msg.context = context_lines
+
+
 async def compile_tex(
     main_file: Path,
     compiler: str = "latexmk",
@@ -238,6 +295,10 @@ async def compile_tex(
         else:
             errors = _parse_errors(log_output, str(main_file.name))
             warnings = _parse_warnings(log_output, str(main_file.name))
+
+        # Enrich errors and warnings with surrounding source lines
+        enrich_error_context(errors, work_dir)
+        enrich_error_context(warnings, work_dir)
 
         return CompileResult(
             success=success,

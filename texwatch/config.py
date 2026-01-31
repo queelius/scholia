@@ -12,10 +12,11 @@ class Config:
     """texwatch configuration."""
 
     main: str
-    watch: list[str] = field(default_factory=lambda: ["*.tex", "*.md", "*.txt"])
+    watch: list[str] = field(default_factory=lambda: ["*.tex", "*.bib", "*.md", "*.txt"])
     ignore: list[str] = field(default_factory=list)
     compiler: str = "auto"
     port: int = 8765
+    page_limit: int | None = None
     config_path: Path | None = None
 
     @classmethod
@@ -23,22 +24,26 @@ class Config:
         """Create Config from dictionary."""
         return cls(
             main=data.get("main", "main.tex"),
-            watch=data.get("watch", ["*.tex", "*.md", "*.txt"]),
+            watch=data.get("watch", ["*.tex", "*.bib", "*.md", "*.txt"]),
             ignore=data.get("ignore", []),
             compiler=data.get("compiler", "auto"),
             port=data.get("port", 8765),
+            page_limit=data.get("page_limit"),
             config_path=config_path,
         )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert config to dictionary (for API responses)."""
-        return {
+        d: dict[str, Any] = {
             "main": self.main,
             "watch": self.watch,
             "ignore": self.ignore,
             "compiler": self.compiler,
             "port": self.port,
         }
+        if self.page_limit is not None:
+            d["page_limit"] = self.page_limit
+        return d
 
 
 DEFAULT_CONFIG_NAME = ".texwatch.yaml"
@@ -116,7 +121,7 @@ def create_config(
 
     config_data = {
         "main": main,
-        "watch": watch or ["*.tex", "*.md", "*.txt", "**/*.tex"],
+        "watch": watch or ["*.tex", "*.bib", "*.md", "*.txt", "**/*.tex"],
         "ignore": ignore or ["*_backup.tex"],
         "compiler": compiler,
         "port": port,

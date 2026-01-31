@@ -54,7 +54,10 @@ def _normalize_path(path: str, base_dir: Path) -> str:
             return str(p.relative_to(base_dir))
         except ValueError:
             return str(p)
-    return str(p)
+    normalized = str(p)
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
 
 
 def parse_synctex(synctex_path: Path) -> SyncTeXData | None:
@@ -95,17 +98,14 @@ def parse_synctex(synctex_path: Path) -> SyncTeXData | None:
     # Parse page markers
     page_pattern = re.compile(r"^\{(\d+)$", re.MULTILINE)
 
-    # Parse position records
-    # Format varies but common patterns:
-    # h<file_id>,<line>,<column>:<x>,<y>:<width>,<height>
-    # v<file_id>,<line>,<column>:<x>,<y>:<width>,<height>
-    # x<file_id>,<line>,<column>:<x>,<y>
-    # k<file_id>,<line>,<column>:<x>,<y>:<width>,<height>
-    # g<file_id>,<line>,<column>:<x>,<y>
-    # $<file_id>,<line>,<column>:<x>,<y>
+    # Parse position records.  Two format variants exist:
+    #   WITH column:    h<fid>,<line>,<col>:<x>,<y>[:<w>,<h>]
+    #   WITHOUT column: h<fid>,<line>:<x>,<y>[:<w>[,<h>[,<d>]]]
+    # Record types: h/v (hbox/vbox content), x (current), k (kern),
+    #   g (glue), $ (math), [/] (vbox open/close), (/)(hbox open/close)
 
     record_pattern = re.compile(
-        r"^([hvxkg$\[\]])(\d+),(\d+),(-?\d+):(-?\d+),(-?\d+)(?::(-?\d+),(-?\d+))?",
+        r"^([hvxkg$\[\]()])(\d+),(\d+)(?:,(-?\d+))?:(-?\d+),(-?\d+)(?::(-?\d+)(?:,(-?\d+)(?:,(-?\d+))?)?)?",
         re.MULTILINE,
     )
 
@@ -127,7 +127,7 @@ def parse_synctex(synctex_path: Path) -> SyncTeXData | None:
             record_type = match.group(1)
             file_id = int(match.group(2))
             line_num = int(match.group(3))
-            column = int(match.group(4))
+            column = int(match.group(4)) if match.group(4) else 0
             x = int(match.group(5))
             y = int(match.group(6))
             width = int(match.group(7)) if match.group(7) else 0
@@ -229,6 +229,21 @@ def source_to_page(data: SyncTeXData, file: str, line: int) -> PDFPosition | Non
                 "synctex: source_to_page(%s:%d) -> NEAREST match: line %d (delta=%d), page=%d x=%.1f y=%.1f w=%.1f h=%.1f",
                 file, line, closest[1], abs(closest[1] - line),
                 pos.page, pos.x, pos.y, pos.width, pos.height,
+            )
+            return pos
+
+    # Try matching by basename (handles path prefix differences)
+    file_basename = Path(file).name
+    basename_keys = [(f, l) for f, l in data.source_to_pdf.keys() if Path(f).name == file_basename]
+    if basename_keys:
+        closest = min(basename_keys, key=lambda k: abs(k[1] - line))
+        positions = data.source_to_pdf[closest]
+        if positions:
+            pos = positions[0]
+            logger.debug(
+                "synctex: source_to_page(%s:%d) -> BASENAME match: %s:%d (delta=%d), page=%d x=%.1f y=%.1f",
+                file, line, closest[0], closest[1], abs(closest[1] - line),
+                pos.page, pos.x, pos.y,
             )
             return pos
 

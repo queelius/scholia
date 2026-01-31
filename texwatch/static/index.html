@@ -28,6 +28,7 @@
         </div>
         <div class="header-right">
             <span id="status-indicator" class="status watching">Watching</span>
+            <button id="btn-scroll-mode" title="Toggle continuous scroll">&#x2195;</button>
             <button id="btn-refresh" title="Force recompile">&#x21bb;</button>
             <button id="btn-settings" title="Settings">&#x2699;</button>
         </div>
@@ -45,7 +46,10 @@
         <div id="editor-pane">
             <div id="editor-header">
                 <span id="editor-filename">loading...</span>
-                <span id="editor-status"></span>
+                <div class="editor-header-right">
+                    <button id="btn-word-wrap" title="Toggle word wrap">&#x21A9;</button>
+                    <span id="editor-status"></span>
+                </div>
             </div>
             <div id="conflict-bar" class="hidden">
                 <span>File changed on disk.</span>
@@ -69,9 +73,16 @@
         <div id="error-panel" class="collapsed">
             <div id="error-header">
                 <span id="error-summary">No issues</span>
-                <button id="btn-toggle-errors">&#x25bc;</button>
+                <div class="error-header-buttons">
+                    <button id="btn-show-log" title="Show compilation log">Log</button>
+                    <button id="btn-toggle-errors">&#x25bc;</button>
+                </div>
             </div>
             <div id="error-list"></div>
+            <div id="todo-list"></div>
+            <div id="log-viewer" class="hidden">
+                <pre id="log-content"></pre>
+            </div>
         </div>
         <div id="status-bar">
             <span id="page-info">Page 1/1</span>

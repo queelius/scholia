@@ -12,8 +12,9 @@ from typing import Any
 
 from aiohttp import web, WSMsgType
 
-from .compiler import CompileMessage, CompileResult, compile_tex
+from .compiler import CompileMessage, CompileResult, compile_tex, enrich_error_context
 from .config import Config, get_main_file, get_watch_dir
+from .structure import parse_structure
 from .synctex import (
     PDFPosition,
     SyncTeXData,
@@ -123,10 +124,13 @@ class ProjectInstance:
         finally:
             self.compiling = False
             await self.broadcast({"type": "compiling", "status": False})
-            await self.broadcast({
+            msg = {
                 "type": "compiled",
                 "result": _result_to_dict(self.last_result) if self.last_result else None,
-            })
+            }
+            if self.last_result and self.last_result.log_output:
+                msg["log_output"] = self.last_result.log_output
+            await self.broadcast(msg)
 
     async def on_file_change(self, changed_path: str) -> None:
         """Handle file change from watcher."""
@@ -179,12 +183,15 @@ def _result_to_dict(result: CompileResult) -> dict[str, Any]:
 
 def _message_to_dict(msg: CompileMessage) -> dict[str, Any]:
     """Convert CompileMessage to dict."""
-    return {
+    d: dict[str, Any] = {
         "file": msg.file,
         "line": msg.line,
         "message": msg.message,
         "type": msg.type,
     }
+    if msg.context is not None:
+        d["context"] = msg.context
+    return d
 
 
 def _count_source_lines(path: Path) -> int:
@@ -346,6 +353,9 @@ class TexWatchServer:
         self.app.router.add_post(r"/p/{name:.+}/source", self._handle_project_post_source)
         self.app.router.add_get(r"/p/{name:.+}/pdf", self._handle_project_pdf)
         self.app.router.add_get(r"/p/{name:.+}/files", self._handle_project_files)
+        self.app.router.add_get(r"/p/{name:.+}/errors", self._handle_project_errors)
+        self.app.router.add_get(r"/p/{name:.+}/context", self._handle_project_context)
+        self.app.router.add_get(r"/p/{name:.+}/structure", self._handle_project_structure)
 
         # Legacy unprefixed routes (single-project backwards compat)
         self.app.router.add_get("/ws", self._handle_legacy_ws)
@@ -358,6 +368,9 @@ class TexWatchServer:
         self.app.router.add_post("/source", self._handle_legacy_post_source)
         self.app.router.add_get("/pdf", self._handle_legacy_pdf)
         self.app.router.add_get("/files", self._handle_legacy_files)
+        self.app.router.add_get("/errors", self._handle_legacy_errors)
+        self.app.router.add_get("/context", self._handle_legacy_context)
+        self.app.router.add_get("/structure", self._handle_legacy_structure)
 
     def _get_project(self, request: web.Request) -> ProjectInstance | None:
         """Extract project instance from URL path parameter."""
@@ -445,6 +458,18 @@ class TexWatchServer:
         proj = self._require_project(request)
         return self._build_files_response(proj)
 
+    async def _handle_project_errors(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_errors_response(proj)
+
+    async def _handle_project_context(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_context_response(proj)
+
+    async def _handle_project_structure(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_structure_response(proj)
+
     # --- Legacy single-project routes ---
 
     async def _handle_legacy_ws(self, request: web.Request) -> web.WebSocketResponse:
@@ -506,6 +531,24 @@ class TexWatchServer:
         if proj is None:
             raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/files")
         return self._build_files_response(proj)
+
+    async def _handle_legacy_errors(self, request: web.Request) -> web.Response:
+        proj = self._get_single_project()
+        if proj is None:
+            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/errors")
+        return self._build_errors_response(proj)
+
+    async def _handle_legacy_context(self, request: web.Request) -> web.Response:
+        proj = self._get_single_project()
+        if proj is None:
+            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/context")
+        return self._build_context_response(proj)
+
+    async def _handle_legacy_structure(self, request: web.Request) -> web.Response:
+        proj = self._get_single_project()
+        if proj is None:
+            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/structure")
+        return self._build_structure_response(proj)
 
     # --- Shared handler implementations ---
 
@@ -584,6 +627,9 @@ class TexWatchServer:
 
         if msg_type == "viewer_state":
             proj.viewer_state.update(data.get("state", {}))
+            if proj.synctex_data:
+                page = proj.viewer_state.get("page", 1)
+                proj.viewer_state["visible_lines"] = get_visible_lines(proj.synctex_data, page)
             logger.debug(f"[{proj.name}] Viewer state updated: {proj.viewer_state}")
 
         elif msg_type == "editor_state":
@@ -620,7 +666,7 @@ class TexWatchServer:
     def _build_status_response(self, proj: ProjectInstance) -> web.Response:
         """Build GET /status response for a project."""
         main_file = get_main_file(proj.config)
-        response = {
+        response: dict[str, Any] = {
             "file": str(main_file.name),
             "compiling": proj.compiling,
             "last_compile": (
@@ -637,8 +683,104 @@ class TexWatchServer:
                 if proj.last_result
                 else []
             ),
+            "page_limit": proj.config.page_limit,
+            "total_pages": proj.viewer_state.get("total_pages", 0),
             "viewer": proj.viewer_state,
             "editor": proj.editor_state,
+        }
+        return web.json_response(response)
+
+    def _build_errors_response(self, proj: ProjectInstance) -> web.Response:
+        """Build GET /errors response for a project."""
+        if proj.last_result is None:
+            return web.json_response({"errors": [], "warnings": []})
+
+        return web.json_response({
+            "errors": [_message_to_dict(m) for m in proj.last_result.errors],
+            "warnings": [_message_to_dict(m) for m in proj.last_result.warnings],
+        })
+
+    def _build_context_response(self, proj: ProjectInstance) -> web.Response:
+        """Build GET /context response for a project.
+
+        Combines viewer state, editor state, compile status, and
+        document structure into a single snapshot.
+        """
+        main_file = get_main_file(proj.config)
+        watch_dir = get_watch_dir(proj.config)
+
+        # Parse document structure (sections, todos, inputs, word count)
+        try:
+            structure = parse_structure(main_file, watch_dir)
+        except Exception:
+            logger.debug("context: parse_structure failed", exc_info=True)
+            structure = None
+
+        # Determine current_section from editor state
+        current_section: str | None = None
+        if structure and structure.sections:
+            editor_file = proj.editor_state.get("file")
+            editor_line = proj.editor_state.get("line")
+            if editor_file and editor_line is not None:
+                # Find the section heading closest to (and before) the cursor
+                best: str | None = None
+                best_line = -1
+                for sec in structure.sections:
+                    if sec.file == editor_file and sec.line <= editor_line:
+                        if sec.line > best_line:
+                            best = sec.title
+                            best_line = sec.line
+                current_section = best
+
+        errors_count = len(proj.last_result.errors) if proj.last_result else 0
+        warnings_count = len(proj.last_result.warnings) if proj.last_result else 0
+
+        response: dict[str, Any] = {
+            "editor": proj.editor_state,
+            "viewer": proj.viewer_state,
+            "compiling": proj.compiling,
+            "errors_count": errors_count,
+            "warnings_count": warnings_count,
+            "current_section": current_section,
+            "page_limit": proj.config.page_limit,
+            "word_count": structure.word_count if structure else None,
+        }
+        return web.json_response(response)
+
+    def _build_structure_response(self, proj: ProjectInstance) -> web.Response:
+        """Build GET /structure response for a project.
+
+        Returns the full document structure: sections, TODOs, inputs, and
+        word count.
+        """
+        main_file = get_main_file(proj.config)
+        watch_dir = get_watch_dir(proj.config)
+
+        try:
+            structure = parse_structure(main_file, watch_dir)
+        except Exception:
+            logger.debug("structure endpoint: parse_structure failed", exc_info=True)
+            return web.json_response({
+                "sections": [],
+                "todos": [],
+                "inputs": [],
+                "word_count": None,
+            })
+
+        response: dict[str, Any] = {
+            "sections": [
+                {"level": s.level, "title": s.title, "file": s.file, "line": s.line}
+                for s in structure.sections
+            ],
+            "todos": [
+                {"text": t.text, "file": t.file, "line": t.line, "tag": t.tag}
+                for t in structure.todos
+            ],
+            "inputs": [
+                {"path": i.path, "file": i.file, "line": i.line}
+                for i in structure.inputs
+            ],
+            "word_count": structure.word_count,
         }
         return web.json_response(response)
 
@@ -656,12 +798,13 @@ class TexWatchServer:
                     {"error": "SyncTeX not available for this file type"}, status=501
                 )
             line = data["line"]
+            file_name = data.get("file") or proj.editor_state.get("file") or str(main_file.name)
             logger.debug(
                 "goto: line=%d, file=%s, synctex_data=%s",
-                line, main_file.name, "loaded" if proj.synctex_data else "None",
+                line, file_name, "loaded" if proj.synctex_data else "None",
             )
             if proj.synctex_data:
-                pos = source_to_page(proj.synctex_data, str(main_file.name), line)
+                pos = source_to_page(proj.synctex_data, file_name, line)
                 if pos:
                     logger.debug(
                         "goto: synctex hit -> broadcasting page=%d x=%.1f y=%.1f w=%.1f h=%.1f",
@@ -702,10 +845,90 @@ class TexWatchServer:
             return web.json_response({"success": True, "page": page})
 
         if "section" in data:
-            return web.json_response(
-                {"error": "Section-based navigation is not yet implemented"},
-                status=501,
+            query = data["section"]
+            main_file = get_main_file(proj.config)
+            watch_dir = get_watch_dir(proj.config)
+
+            try:
+                structure = parse_structure(main_file, watch_dir)
+            except Exception:
+                logger.debug("goto section: parse_structure failed", exc_info=True)
+                return web.json_response(
+                    {"error": "Failed to parse document structure"}, status=500
+                )
+
+            # Find matching section: case-insensitive substring, prefer exact match
+            query_lower = query.lower()
+            candidates = [
+                s for s in structure.sections
+                if query_lower in s.title.lower()
+            ]
+
+            if not candidates:
+                available = [s.title for s in structure.sections]
+                return web.json_response(
+                    {
+                        "error": f"No section matching '{query}' found",
+                        "available_sections": available,
+                    },
+                    status=404,
+                )
+
+            # Prefer exact (case-insensitive) match over substring
+            exact = [s for s in candidates if s.title.lower() == query_lower]
+            matched = exact[0] if exact else candidates[0]
+
+            logger.debug(
+                "goto section: matched '%s' in %s:%d",
+                matched.title, matched.file, matched.line,
             )
+
+            # Forward sync via SyncTeX
+            if proj.synctex_data:
+                pos = source_to_page(proj.synctex_data, matched.file, matched.line)
+                if pos:
+                    logger.debug(
+                        "goto section: synctex hit -> page=%d x=%.1f y=%.1f",
+                        pos.page, pos.x, pos.y,
+                    )
+                    await proj.broadcast({
+                        "type": "goto",
+                        "page": pos.page,
+                        "x": pos.x,
+                        "y": pos.y,
+                        "width": pos.width,
+                        "height": pos.height,
+                    })
+                    return web.json_response({
+                        "success": True,
+                        "page": pos.page,
+                        "section": matched.title,
+                    })
+
+            # Fallback: estimate page from line position
+            logger.debug("goto section: synctex miss, falling back to page estimation")
+            total_pages = proj.viewer_state.get("total_pages", 0)
+            if total_pages > 0:
+                total_lines = _count_source_lines(main_file)
+                if total_lines > 0:
+                    estimated_page = round(matched.line / total_lines * total_pages)
+                    estimated_page = max(1, min(estimated_page, total_pages))
+                else:
+                    estimated_page = max(1, min(matched.line, total_pages))
+                await proj.broadcast({"type": "goto", "page": estimated_page})
+                return web.json_response({
+                    "success": True,
+                    "page": estimated_page,
+                    "section": matched.title,
+                    "estimated": True,
+                })
+
+            await proj.broadcast({"type": "goto", "page": 1})
+            return web.json_response({
+                "success": True,
+                "section": matched.title,
+                "estimated": True,
+            })
 
         return web.json_response({"error": "Must specify line, page, or section"}, status=400)
 
