@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "texwatch"
 version = "0.1.0"
 description = "TeX file watcher with browser-based PDF viewer"
-# readme = "README.md"  # Uncomment when README exists
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
