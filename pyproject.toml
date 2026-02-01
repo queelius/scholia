@@ -45,8 +45,8 @@ dev = [
 texwatch = "texwatch.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/spinoza/texwatch"
-Repository = "https://github.com/spinoza/texwatch"
+Homepage = "https://github.com/queelius/texwatch"
+Repository = "https://github.com/queelius/texwatch"
 
 [tool.hatch.build.targets.wheel]
 packages = ["texwatch"]
