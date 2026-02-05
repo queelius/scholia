@@ -4,7 +4,8 @@ import asyncio
 import fnmatch
 import logging
 from pathlib import Path
-from typing import Callable, Coroutine
+from concurrent.futures import Future
+from typing import Any, Callable, Coroutine
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -39,7 +40,7 @@ class TexFileHandler(FileSystemEventHandler):
         self.loop = loop
         self.debounce_seconds = debounce_seconds
         self._last_event_time: float = 0
-        self._pending_task: asyncio.Task | None = None
+        self._pending_task: Future[Any] | None = None
         self._pending_path: str | None = None
 
     def _matches_patterns(self, path: str, patterns: list[str]) -> bool:
@@ -95,9 +96,6 @@ class TexFileHandler(FileSystemEventHandler):
 
     def _schedule_callback(self, src_path: str):
         """Schedule the callback with debouncing."""
-        import time
-
-        current_time = time.time()
         self._pending_path = src_path
 
         # Cancel any pending callback
@@ -111,25 +109,37 @@ class TexFileHandler(FileSystemEventHandler):
             except Exception as e:
                 logger.error(f"Callback error: {e}")
 
+        # Schedule the coroutine without blocking (don't call .result())
+        # The Future is stored but we don't wait for it - the observer thread
+        # must not block or it will miss subsequent file system events.
         self._pending_task = asyncio.run_coroutine_threadsafe(
             delayed_callback(), self.loop
-        ).result()
+        )
+
+    def _get_src_path(self, event: FileSystemEvent) -> str:
+        """Extract src_path as string (handles bytes on some platforms)."""
+        src_path = event.src_path
+        if isinstance(src_path, bytes):
+            return src_path.decode("utf-8", errors="replace")
+        return src_path
 
     def on_modified(self, event: FileSystemEvent) -> None:
         """Handle file modification."""
         if event.is_directory:
             return
-        if self._should_process(event.src_path):
-            logger.info(f"File modified: {event.src_path}")
-            self._schedule_callback(event.src_path)
+        src_path = self._get_src_path(event)
+        if self._should_process(src_path):
+            logger.info(f"File modified: {src_path}")
+            self._schedule_callback(src_path)
 
     def on_created(self, event: FileSystemEvent) -> None:
         """Handle file creation."""
         if event.is_directory:
             return
-        if self._should_process(event.src_path):
-            logger.info(f"File created: {event.src_path}")
-            self._schedule_callback(event.src_path)
+        src_path = self._get_src_path(event)
+        if self._should_process(src_path):
+            logger.info(f"File created: {src_path}")
+            self._schedule_callback(src_path)
 
 
 class TexWatcher:
@@ -157,7 +167,7 @@ class TexWatcher:
         self.ignore_patterns = ignore_patterns
         self.on_change = on_change
         self.debounce_seconds = debounce_seconds
-        self._observer: Observer | None = None
+        self._observer: Any = None  # Observer type not well-typed in watchdog stubs
         self._handler: TexFileHandler | None = None
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:

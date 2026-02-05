@@ -19,36 +19,68 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Section:
-    """A section-level heading in a LaTeX document."""
+    """A section-level heading in a LaTeX document.
 
-    level: str  # "chapter", "section", "subsection", "subsubsection"
-    title: str  # e.g. "Related Work"
-    file: str  # source file (relative to watch_dir)
-    line: int  # 1-indexed line number
+    Attributes:
+        level: Sectioning command ("chapter", "section", "subsection", "subsubsection").
+        title: Section title text (from the mandatory {} argument).
+        file: Source file path (relative to watch_dir).
+        line: Line number where the heading appears (1-indexed).
+    """
+
+    level: str
+    title: str
+    file: str
+    line: int
 
 
 @dataclass
 class TodoItem:
-    """A TODO/FIXME/NOTE/XXX annotation found in a LaTeX file."""
+    """A TODO/FIXME/NOTE/XXX annotation found in a LaTeX file.
 
-    text: str  # TODO text content
-    file: str  # source file (relative to watch_dir)
-    line: int  # 1-indexed line number
-    tag: str  # "TODO", "FIXME", "NOTE", "XXX"
+    Matches both comment-style (% TODO: ...) and command-style (\\todo{...}).
+
+    Attributes:
+        text: The annotation text content.
+        file: Source file path (relative to watch_dir).
+        line: Line number (1-indexed).
+        tag: Annotation type ("TODO", "FIXME", "NOTE", or "XXX").
+    """
+
+    text: str
+    file: str
+    line: int
+    tag: str
 
 
 @dataclass
 class InputFile:
-    """An \\input or \\include reference in a LaTeX file."""
+    """An \\input or \\include reference in a LaTeX file.
 
-    path: str  # e.g. "chapters/intro.tex"
-    file: str  # parent file containing the \\input
-    line: int  # 1-indexed line number
+    Attributes:
+        path: The included file path as written in the source (e.g., "chapters/intro").
+        file: Parent file containing the \\input command.
+        line: Line number of the \\input command (1-indexed).
+    """
+
+    path: str
+    file: str
+    line: int
 
 
 @dataclass
 class DocumentStructure:
-    """Aggregated structure of a LaTeX project."""
+    """Aggregated structure of a LaTeX project.
+
+    Contains all sections, TODOs, input references, and word count
+    extracted by parsing .tex files in the project.
+
+    Attributes:
+        sections: All section headings found in the project.
+        todos: All TODO/FIXME/NOTE/XXX annotations.
+        inputs: All \\input/\\include references.
+        word_count: Total word count from texcount, or None if unavailable.
+    """
 
     sections: list[Section] = field(default_factory=list)
     todos: list[TodoItem] = field(default_factory=list)

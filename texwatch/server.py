@@ -12,11 +12,10 @@ from typing import Any
 
 from aiohttp import web, WSMsgType
 
-from .compiler import CompileMessage, CompileResult, compile_tex, enrich_error_context
+from .compiler import CompileMessage, CompileResult, compile_tex
 from .config import Config, get_main_file, get_watch_dir
 from .structure import parse_structure
 from .synctex import (
-    PDFPosition,
     SyncTeXData,
     find_synctex_file,
     get_visible_lines,
@@ -148,7 +147,6 @@ class ProjectInstance:
 
     def status_summary(self) -> dict[str, Any]:
         """Return a summary dict for the /projects endpoint."""
-        main_file = get_main_file(self.config)
         return {
             "name": self.name,
             "path": str(get_watch_dir(self.config)),
@@ -245,6 +243,7 @@ class TexWatchServer:
 
         # Legacy compatibility: expose state from the single project instance
         # (used by existing tests that access server._compiling etc.)
+        self._single: ProjectInstance | None
         if len(self._projects) == 1:
             self._single = next(iter(self._projects.values()))
         else:
@@ -399,7 +398,6 @@ class TexWatchServer:
     async def _handle_root(self, request: web.Request) -> web.Response:
         """Handle GET / — dashboard or redirect to single project."""
         if len(self._projects) == 1:
-            name = next(iter(self._projects))
             # For single-project, serve index.html directly (legacy compat)
             return self._serve_index_html("")
         return self._serve_dashboard_html()
@@ -575,7 +573,7 @@ class TexWatchServer:
         dashboard_path = static_dir / "dashboard.html"
 
         if dashboard_path.exists():
-            return web.FileResponse(dashboard_path)
+            return web.FileResponse(dashboard_path)  # type: ignore[return-value]
 
         # Fallback inline dashboard
         project_links = "".join(
@@ -1016,8 +1014,13 @@ class TexWatchServer:
             file_param = get_main_file(proj.config).name
 
         watch_dir = get_watch_dir(proj.config)
-        file_path = (watch_dir / file_param).resolve()
+        file_path = watch_dir / file_param
 
+        # Check for symlinks before resolving to prevent path traversal
+        if file_path.is_symlink():
+            return web.json_response({"error": "Symlinks not allowed"}, status=403)
+
+        file_path = file_path.resolve()
         if not file_path.is_relative_to(watch_dir.resolve()):
             return web.json_response({"error": "Access denied"}, status=403)
 
@@ -1046,8 +1049,13 @@ class TexWatchServer:
             )
 
         watch_dir = get_watch_dir(proj.config)
-        file_path = (watch_dir / file_param).resolve()
+        file_path = watch_dir / file_param
 
+        # Check for symlinks before resolving to prevent path traversal
+        if file_path.is_symlink():
+            return web.json_response({"error": "Symlinks not allowed"}, status=403)
+
+        file_path = file_path.resolve()
         if not file_path.is_relative_to(watch_dir.resolve()):
             return web.json_response({"error": "Access denied"}, status=403)
 
@@ -1073,7 +1081,8 @@ class TexWatchServer:
         pdf_path = main_file.with_suffix(".pdf")
 
         if pdf_path.exists():
-            return web.FileResponse(
+            # FileResponse is a StreamResponse subclass, but type stubs are imprecise
+            return web.FileResponse(  # type: ignore[return-value]
                 pdf_path,
                 headers={"Content-Type": "application/pdf"},
             )

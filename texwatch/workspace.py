@@ -20,11 +20,24 @@ from .config import Config
 
 @dataclass
 class ProjectConfig:
-    """One compilable paper."""
+    """Configuration for a single compilable LaTeX/Markdown paper.
 
-    name: str  # e.g. "thesis", "neurips/paper"
-    directory: Path  # absolute path to project dir
-    main: str = "main.tex"  # main file relative to directory
+    Represents one entry from .texwatch.yaml, either from the top-level
+    ``main:`` key or from an entry in the ``papers:`` list.
+
+    Attributes:
+        name: Project identifier (e.g., "thesis", "neurips/paper").
+            Used in URLs for multi-project mode.
+        directory: Absolute path to the project directory.
+        main: Main file path relative to directory.
+        watch: Glob patterns for files that trigger recompilation.
+        ignore: Glob patterns for files to exclude from watching.
+        compiler: Compiler to use ("auto", "latexmk", "pdflatex", etc.).
+    """
+
+    name: str
+    directory: Path
+    main: str = "main.tex"
     watch: list[str] = field(default_factory=lambda: ["*.tex", "*.md", "*.txt"])
     ignore: list[str] = field(default_factory=list)
     compiler: str = "auto"

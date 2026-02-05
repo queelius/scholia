@@ -8,6 +8,8 @@ LaTeX toolchains are slow to set up and painful to iterate on. texwatch gives yo
 
 ## Install
 
+**Requires Python 3.10+**
+
 ```bash
 pip install texwatch
 ```
@@ -85,6 +87,22 @@ port: 8765
 page_limit: 8         # optional: flag when PDF exceeds N pages
 ```
 
+**Multi-paper projects**: Use the `papers:` key to define multiple compilable documents in one directory:
+
+```yaml
+papers:
+  - name: main-paper
+    main: paper.tex
+  - name: supplementary
+    main: supplement.tex
+    compiler: pdflatex
+watch:
+  - "*.tex"
+  - "*.bib"
+```
+
+Each paper appears as a separate project at `/p/{dirname}/{name}/`.
+
 ## Web UI features
 
 - **Editor**: CodeMirror 6 with LaTeX syntax highlighting, word wrap toggle, conflict detection when files change on disk
@@ -131,6 +149,35 @@ This lets Claude see your current page, section, compile errors (with source con
 | `texwatch mcp` | Run MCP stdio server for Claude Code |
 
 Most commands accept `--port`, `--json`, and `--project` flags.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | General failure (compile error, file not found, etc.) |
+| 2 | Argument parsing error |
+| 3 | Server not running (for commands that require a running server) |
+
+## HTTP API
+
+When `texwatch serve` is running, the following endpoints are available. For multi-project mode, prefix with `/p/{project_name}`.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/status` | GET | Compile status, errors, viewer/editor state |
+| `/compile` | POST | Trigger recompilation |
+| `/goto` | POST | Navigate to `{"line": N}`, `{"page": N}`, or `{"section": "..."}` |
+| `/pdf` | GET | Serve the compiled PDF |
+| `/source` | GET | Get source file content (`?file=...`) |
+| `/source` | POST | Update source file (`{"file": "...", "content": "..."}`) |
+| `/files` | GET | Project file tree |
+| `/errors` | GET | Current errors and warnings |
+| `/context` | GET | Editor/viewer state + current section + word count |
+| `/structure` | GET | Document structure (sections, TODOs, inputs) |
+| `/capture` | GET | Screenshot PDF page as PNG (`?page=N&dpi=N`) |
+| `/ws` | WebSocket | Real-time updates (compile events, navigation) |
+| `/projects` | GET | List all projects (multi-project mode) |
 
 ## License
 

@@ -9,7 +9,7 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
 from . import __version__
-from .config import Config, create_config, find_config, get_main_file
+from .config import create_config, find_config, get_main_file
 from .compiler import check_compiler_available
 from .server import TexWatchServer
 
@@ -29,12 +29,29 @@ EXIT_SERVER_DOWN = 3
 
 @dataclass
 class APIResponse:
-    """Result of an HTTP call to the texwatch server."""
+    """Result of an HTTP request to the texwatch server.
+
+    Attributes:
+        status: HTTP status code (0 if connection failed).
+        data: Response body (dict for JSON, bytes for binary).
+        error: Error message if request failed.
+        server_down: True if the server is not running.
+    """
 
     status: int
     data: dict | bytes | None = None
     error: str | None = None
     server_down: bool = False
+
+
+def _handle_http_error(e: HTTPError) -> APIResponse:
+    """Convert HTTPError to APIResponse with error message."""
+    try:
+        body = json.loads(e.read().decode())
+        error_msg = body.get("error", f"HTTP {e.code}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        error_msg = f"HTTP {e.code}"
+    return APIResponse(status=e.code, error=error_msg)
 
 
 def _api_get(
@@ -57,12 +74,7 @@ def _api_get(
             else:
                 return APIResponse(status=response.status, data=raw)
     except HTTPError as e:
-        try:
-            body = json.loads(e.read().decode())
-            error_msg = body.get("error", f"HTTP {e.code}")
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            error_msg = f"HTTP {e.code}"
-        return APIResponse(status=e.code, error=error_msg)
+        return _handle_http_error(e)
     except URLError:
         return APIResponse(status=0, server_down=True)
 
@@ -87,12 +99,7 @@ def _api_post(
             result = json.loads(response.read().decode())
             return APIResponse(status=response.status, data=result)
     except HTTPError as e:
-        try:
-            body = json.loads(e.read().decode())
-            error_msg = body.get("error", f"HTTP {e.code}")
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            error_msg = f"HTTP {e.code}"
-        return APIResponse(status=e.code, error=error_msg)
+        return _handle_http_error(e)
     except URLError:
         return APIResponse(status=0, server_down=True)
 
@@ -104,7 +111,13 @@ def _api_post(
 
 @dataclass
 class GotoResult:
-    """Result of a goto command."""
+    """Result of a goto command to the texwatch server.
+
+    Attributes:
+        success: True if navigation succeeded.
+        error: Error message if navigation failed.
+        server_down: True if the server is not running.
+    """
 
     success: bool
     error: str | None = None

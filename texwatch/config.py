@@ -9,7 +9,20 @@ import yaml
 
 @dataclass
 class Config:
-    """texwatch configuration."""
+    """Runtime configuration for a texwatch project.
+
+    Loaded from .texwatch.yaml or constructed programmatically.
+    Used by the server and compiler to determine watch behavior.
+
+    Attributes:
+        main: Main file to compile (relative to project directory).
+        watch: Glob patterns for files that trigger recompilation.
+        ignore: Glob patterns for files to exclude from watching.
+        compiler: Compiler command ("auto", "latexmk", "pdflatex", etc.).
+        port: HTTP server port.
+        page_limit: Optional page count warning threshold.
+        config_path: Path to .texwatch.yaml file (used to resolve watch_dir).
+    """
 
     main: str
     watch: list[str] = field(default_factory=lambda: ["*.tex", "*.bib", "*.md", "*.txt"])

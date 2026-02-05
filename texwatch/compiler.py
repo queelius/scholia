@@ -11,7 +11,16 @@ from typing import Literal
 
 @dataclass
 class CompileMessage:
-    """A compiler error or warning."""
+    """A compiler error or warning with source location and context.
+
+    Attributes:
+        file: Source file name (relative to work directory).
+        line: Line number (1-indexed), or None if unknown.
+        message: Human-readable error/warning text.
+        type: Either "error" or "warning".
+        context: Optional list of surrounding source lines for context.
+            The error line is marked with >>> ... <<< markers.
+    """
 
     file: str
     line: int | None
@@ -22,7 +31,17 @@ class CompileMessage:
 
 @dataclass
 class CompileResult:
-    """Result of a compilation run."""
+    """Result of a TeX/Markdown compilation run.
+
+    Attributes:
+        success: Whether compilation succeeded (exit code 0 and PDF exists).
+        errors: List of error messages parsed from compiler output.
+        warnings: List of warning messages parsed from compiler output.
+        output_file: Path to generated PDF, or None if compilation failed.
+        timestamp: UTC time when compilation finished.
+        duration_seconds: Wall-clock time for compilation.
+        log_output: Full compiler stdout/stderr for debugging.
+    """
 
     success: bool
     errors: list[CompileMessage] = field(default_factory=list)
@@ -51,6 +70,16 @@ UNDERFULL_OVERFULL_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+# Whitelist of allowed compilers for security
+ALLOWED_COMPILERS = frozenset({
+    "auto",
+    "latexmk",
+    "pdflatex",
+    "xelatex",
+    "lualatex",
+    "pandoc",
+})
+
 
 def _detect_compiler(main_file: Path) -> str:
     """Detect the appropriate compiler based on file extension."""
@@ -62,6 +91,10 @@ def _detect_compiler(main_file: Path) -> str:
 
 def _get_compiler_command(compiler: str, main_file: Path, work_dir: Path) -> list[str]:
     """Build the compiler command."""
+    # Validate compiler against whitelist for security
+    if compiler not in ALLOWED_COMPILERS:
+        raise ValueError(f"Unknown compiler: {compiler}")
+
     if compiler == "auto":
         compiler = _detect_compiler(main_file)
 
