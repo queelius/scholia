@@ -168,7 +168,7 @@ class TestSubcommandParsing:
         expected = {
             None, "init", "status", "view", "goto", "compile", "capture",
             "config", "files", "activity", "bibliography", "environments",
-            "digest", "dashboard", "scan", "serve", "mcp",
+            "digest", "dashboard", "current", "scan", "serve", "mcp",
         }
         assert set(_DISPATCH.keys()) == expected
 
@@ -3009,3 +3009,535 @@ class TestCaptureNonBinaryFallthrough:
         with patch("texwatch.cli._api_get", return_value=resp):
             result = main(["capture", output, "--port", "59998"])
         assert result == EXIT_FAIL
+
+
+# ---------------------------------------------------------------------------
+# Test: cmd_current
+# ---------------------------------------------------------------------------
+
+
+class TestCmdCurrent:
+    """Tests for the current subcommand."""
+
+    @pytest.fixture
+    def current_handler_class(self):
+        """Handler simulating /current and /projects endpoints."""
+        class Handler(BaseHTTPRequestHandler):
+            current_project = None
+
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/current":
+                    if Handler.current_project:
+                        body = {"current": Handler.current_project}
+                    else:
+                        body = {"current": None, "projects": ["alpha", "beta"]}
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(body).encode())
+                elif self.path == "/projects":
+                    response = {
+                        "projects": [
+                            {"name": "alpha"},
+                            {"name": "beta"},
+                        ]
+                    }
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(response).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def do_POST(self):
+                if self.path == "/current":
+                    length = int(self.headers.get("Content-Length", 0))
+                    data = json.loads(self.rfile.read(length)) if length else {}
+                    name = data.get("project")
+                    if name and name not in ("alpha", "beta"):
+                        body = {"error": f"Unknown project: {name}",
+                                "projects": ["alpha", "beta"]}
+                        self.send_response(400)
+                    elif not name:
+                        Handler.current_project = None
+                        body = {"current": None}
+                        self.send_response(200)
+                    else:
+                        Handler.current_project = name
+                        body = {"current": name}
+                        self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(body).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+        return Handler
+
+    @pytest.fixture
+    def current_server(self, current_handler_class):
+        current_handler_class.current_project = None
+        server = HTTPServer(("localhost", 0), current_handler_class)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1})
+        thread.daemon = True
+        thread.start()
+        yield port
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    def test_current_show_none(self, current_server, capsys):
+        """Test 'texwatch current' when no current is set."""
+        result = main(["current", "--port", str(current_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "No current project set" in captured.out
+        assert "alpha" in captured.out
+        assert "beta" in captured.out
+
+    def test_current_show_set(self, current_server, current_handler_class, capsys):
+        """Test 'texwatch current' when a current project is set."""
+        current_handler_class.current_project = "alpha"
+        result = main(["current", "--port", str(current_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "Current project: alpha" in captured.out
+
+    def test_current_switch(self, current_server, capsys):
+        """Test 'texwatch current beta' switches the project."""
+        result = main(["current", "beta", "--port", str(current_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "Current project: beta" in captured.out
+
+    def test_current_switch_invalid(self, current_server, capsys):
+        """Test 'texwatch current nonexistent' returns error."""
+        result = main(["current", "nonexistent", "--port", str(current_server)])
+        assert result == EXIT_FAIL
+        captured = capsys.readouterr()
+        assert "Unknown project" in captured.out
+
+    def test_current_unset(self, current_server, current_handler_class, capsys):
+        """Test 'texwatch current --unset' clears the current project."""
+        current_handler_class.current_project = "alpha"
+        result = main(["current", "--unset", "--port", str(current_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "Cleared current project" in captured.out
+
+    def test_current_show_json(self, current_server, capsys):
+        """Test 'texwatch current --json' returns JSON."""
+        result = main(["current", "--json", "--port", str(current_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["current"] is None
+        assert "projects" in data
+
+    def test_current_switch_json(self, current_server, capsys):
+        """Test 'texwatch current alpha --json' returns JSON."""
+        result = main(["current", "alpha", "--json", "--port", str(current_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["current"] == "alpha"
+
+    def test_current_unset_json(self, current_server, capsys):
+        """Test 'texwatch current --unset --json' returns JSON."""
+        result = main(["current", "--unset", "--json", "--port", str(current_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["current"] is None
+
+    def test_current_server_down(self, capsys):
+        """Test 'texwatch current' when server is down."""
+        result = main(["current", "--port", "59999"])
+        assert result == EXIT_SERVER_DOWN
+        captured = capsys.readouterr()
+        assert "No texwatch instance" in captured.out
+
+    def test_current_server_down_json(self, capsys):
+        """Test 'texwatch current --json' when server is down."""
+        result = main(["current", "--json", "--port", "59999"])
+        assert result == EXIT_SERVER_DOWN
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert "error" in data
+
+    def test_current_switch_server_down(self, capsys):
+        """Test 'texwatch current alpha' when server is down."""
+        result = main(["current", "alpha", "--port", "59999"])
+        assert result == EXIT_SERVER_DOWN
+
+    def test_current_unset_server_down(self, capsys):
+        """Test 'texwatch current --unset' when server is down."""
+        result = main(["current", "--unset", "--port", "59999"])
+        assert result == EXIT_SERVER_DOWN
+
+
+# ---------------------------------------------------------------------------
+# Test: _reject_if_multi_project current-project fallback
+# ---------------------------------------------------------------------------
+
+
+class TestMultiProjectCurrentFallback:
+    """Tests for _reject_if_multi_project using current-project auto-resolution."""
+
+    @pytest.fixture
+    def fallback_handler_class(self):
+        """Handler that serves /projects, /current, and /p/{name}/environments."""
+        class Handler(BaseHTTPRequestHandler):
+            current_project = None
+
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/projects":
+                    response = {
+                        "projects": [
+                            {"name": "alpha"},
+                            {"name": "beta"},
+                        ]
+                    }
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(response).encode())
+                elif self.path == "/current":
+                    if Handler.current_project:
+                        body = {"current": Handler.current_project}
+                    else:
+                        body = {"current": None, "projects": ["alpha", "beta"]}
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(body).encode())
+                elif self.path == "/p/alpha/environments":
+                    body = {"environments": [{"env_type": "figure", "file": "main.tex",
+                                              "start_line": 10, "end_line": 15}]}
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(body).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+        return Handler
+
+    @pytest.fixture
+    def fallback_server(self, fallback_handler_class):
+        fallback_handler_class.current_project = None
+        server = HTTPServer(("localhost", 0), fallback_handler_class)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1})
+        thread.daemon = True
+        thread.start()
+        yield port
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    def test_no_current_shows_error_with_hint(self, fallback_server, capsys):
+        """Test that missing current project shows error with 'texwatch current' hint."""
+        result = main(["environments", "--port", str(fallback_server)])
+        assert result == EXIT_FAIL
+        captured = capsys.readouterr()
+        assert "requires --project" in captured.out
+        assert "texwatch current" in captured.out
+
+    def test_current_set_auto_resolves(self, fallback_server, fallback_handler_class, capsys):
+        """Test that environments works when current project is set."""
+        fallback_handler_class.current_project = "alpha"
+        result = main(["environments", "--port", str(fallback_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "figure" in captured.out
+
+    def test_no_current_json_error(self, fallback_server, capsys):
+        """Test that missing current project returns JSON error."""
+        result = main(["environments", "--json", "--port", str(fallback_server)])
+        assert result == EXIT_FAIL
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert "error" in data
+        assert "projects" in data
+
+    def test_explicit_project_overrides_current(self, fallback_server, fallback_handler_class, capsys):
+        """Test that --project overrides current project."""
+        fallback_handler_class.current_project = "beta"
+        result = main(["environments", "--project", "alpha", "--port", str(fallback_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "figure" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Test: Aggregate commands respect current project
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateCurrentAware:
+    """Tests for aggregate commands (status, view, compile, files, activity)
+    respecting the current-project pointer."""
+
+    @pytest.fixture
+    def agg_handler_class(self):
+        """Handler for multi-project aggregate + per-project endpoints."""
+        class Handler(BaseHTTPRequestHandler):
+            current_project = None
+
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/projects":
+                    response = {
+                        "projects": [
+                            {"name": "alpha", "compiling": False, "success": True,
+                             "error_count": 0, "viewer": {"page": 1, "total_pages": 5}},
+                            {"name": "beta", "compiling": False, "success": True,
+                             "error_count": 0, "viewer": {"page": 2, "total_pages": 10}},
+                        ]
+                    }
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(response).encode())
+                elif self.path == "/current":
+                    if Handler.current_project:
+                        body = {"current": Handler.current_project}
+                    else:
+                        body = {"current": None, "projects": ["alpha", "beta"]}
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(body).encode())
+                elif self.path == "/p/alpha/status":
+                    body = {
+                        "file": "main.tex", "compiling": False, "success": True,
+                        "errors": [], "warnings": [],
+                        "viewer": {"page": 1, "total_pages": 5},
+                        "editor": {"file": "main.tex", "line": 10},
+                    }
+                    self._json_response(body)
+                elif self.path == "/p/beta/status":
+                    body = {
+                        "file": "paper.tex", "compiling": False, "success": True,
+                        "errors": [], "warnings": [],
+                        "viewer": {"page": 2, "total_pages": 10},
+                        "editor": {"file": None, "line": None},
+                    }
+                    self._json_response(body)
+                elif self.path == "/p/alpha/files":
+                    self._json_response({"root": "alpha", "children": [
+                        {"name": "main.tex", "type": "file", "path": "main.tex"}
+                    ]})
+                elif self.path == "/p/beta/files":
+                    self._json_response({"root": "beta", "children": [
+                        {"name": "paper.tex", "type": "file", "path": "paper.tex"}
+                    ]})
+                elif self.path.startswith("/p/alpha/activity"):
+                    self._json_response({"events": [
+                        {"type": "compile_finish", "timestamp": "2025-01-01T10:00:00",
+                         "project": "alpha", "success": True}
+                    ]})
+                elif self.path.startswith("/activity"):
+                    self._json_response({"events": [
+                        {"type": "compile_finish", "timestamp": "2025-01-01T10:00:00",
+                         "project": "alpha", "success": True},
+                        {"type": "compile_finish", "timestamp": "2025-01-01T10:00:01",
+                         "project": "beta", "success": False},
+                    ]})
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def do_POST(self):
+                if self.path == "/compile":
+                    self._json_response({
+                        "projects": {
+                            "alpha": {"success": True, "errors": [], "warnings": [],
+                                      "duration_seconds": 1.0, "timestamp": "2025-01-01T00:00:00"},
+                            "beta": {"success": True, "errors": [], "warnings": [],
+                                     "duration_seconds": 2.0, "timestamp": "2025-01-01T00:00:00"},
+                        }
+                    })
+                elif self.path == "/p/alpha/compile":
+                    self._json_response({
+                        "success": True, "errors": [], "warnings": [],
+                        "duration_seconds": 1.0, "timestamp": "2025-01-01T00:00:00",
+                    })
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def _json_response(self, body):
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        return Handler
+
+    @pytest.fixture
+    def agg_server(self, agg_handler_class):
+        agg_handler_class.current_project = None
+        server = HTTPServer(("localhost", 0), agg_handler_class)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1})
+        thread.daemon = True
+        thread.start()
+        yield port
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    # --- status ---
+
+    def test_status_no_current_aggregates(self, agg_server, capsys):
+        """status with no current shows all projects."""
+        result = main(["status", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha" in captured.out
+        assert "beta" in captured.out
+
+    def test_status_current_set_scopes(self, agg_server, agg_handler_class, capsys):
+        """status with current set shows only that project's detailed status."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["status", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "File: main.tex" in captured.out
+        # Should NOT show multi-project table
+        assert "beta" not in captured.out
+
+    def test_status_all_overrides_current(self, agg_server, agg_handler_class, capsys):
+        """status --all shows all projects even when current is set."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["status", "--all", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha" in captured.out
+        assert "beta" in captured.out
+
+    # --- view ---
+
+    def test_view_no_current_aggregates(self, agg_server, capsys):
+        """view with no current shows all projects."""
+        result = main(["view", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha:" in captured.out
+        assert "beta:" in captured.out
+
+    def test_view_current_set_scopes(self, agg_server, agg_handler_class, capsys):
+        """view with current set shows only that project."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["view", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "Main file: main.tex" in captured.out
+        assert "beta:" not in captured.out
+
+    def test_view_all_overrides_current(self, agg_server, agg_handler_class, capsys):
+        """view --all shows all projects even when current is set."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["view", "--all", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha:" in captured.out
+        assert "beta:" in captured.out
+
+    # --- compile ---
+
+    def test_compile_no_current_aggregates(self, agg_server, capsys):
+        """compile with no current compiles all projects."""
+        result = main(["compile", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha: ok" in captured.out
+        assert "beta: ok" in captured.out
+
+    def test_compile_current_set_scopes(self, agg_server, agg_handler_class, capsys):
+        """compile with current set compiles only that project."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["compile", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "Compile successful" in captured.out
+        assert "beta" not in captured.out
+
+    def test_compile_all_overrides_current(self, agg_server, agg_handler_class, capsys):
+        """compile --all compiles all projects even when current is set."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["compile", "--all", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha: ok" in captured.out
+        assert "beta: ok" in captured.out
+
+    # --- files ---
+
+    def test_files_no_current_aggregates(self, agg_server, capsys):
+        """files with no current shows all projects."""
+        result = main(["files", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha/" in captured.out
+        assert "beta/" in captured.out
+
+    def test_files_current_set_scopes(self, agg_server, agg_handler_class, capsys):
+        """files with current set shows only that project."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["files", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "main.tex" in captured.out
+        assert "beta/" not in captured.out
+
+    def test_files_all_overrides_current(self, agg_server, agg_handler_class, capsys):
+        """files --all shows all projects even when current is set."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["files", "--all", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha/" in captured.out
+        assert "beta/" in captured.out
+
+    # --- activity ---
+
+    def test_activity_no_current_global(self, agg_server, capsys):
+        """activity with no current shows global events."""
+        result = main(["activity", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha" in captured.out
+        assert "beta" in captured.out
+
+    def test_activity_current_set_scopes(self, agg_server, agg_handler_class, capsys):
+        """activity with current set shows only that project's events."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["activity", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha" in captured.out
+        assert "beta" not in captured.out
+
+    def test_activity_all_overrides_current(self, agg_server, agg_handler_class, capsys):
+        """activity --all shows global events even when current is set."""
+        agg_handler_class.current_project = "alpha"
+        result = main(["activity", "--all", "--port", str(agg_server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "alpha" in captured.out
+        assert "beta" in captured.out

@@ -247,18 +247,63 @@ def _print_multi_project_required(command: str, project_names: list[str]) -> Non
         print(f"  {name}")
 
 
-def _reject_if_multi_project(
-    command: str, args: argparse.Namespace,
-) -> int | None:
-    """Return EXIT_FAIL if the server is multi-project and --project is not set.
+def _probe_and_inject_current(args: argparse.Namespace) -> bool:
+    """Probe ``GET /current`` and inject into ``args.project`` if set.
 
-    Returns None when the command may proceed (single-project or --project given).
+    Returns True if a current project was found and injected.
+    """
+    current_resp = _api_get("/current", port=args.port)
+    if not current_resp.server_down and isinstance(current_resp.data, dict):
+        current = current_resp.data.get("current")
+        if current:
+            args.project = current
+            return True
+    return False
+
+
+def _should_aggregate(args: argparse.Namespace) -> list[str] | None:
+    """Decide whether an aggregate command should show all projects.
+
+    Returns a list of project names when the command should aggregate,
+    or None when it should operate on a single project (``args.project``
+    may have been injected with the current project).
+
+    Resolution order:
+    1. ``--project`` set → single project (None)
+    2. Single-project server → single project (None)
+    3. ``--all`` flag → aggregate (project names)
+    4. Current project set → inject and single project (None)
+    5. No current → aggregate (project names)
     """
     if _get_project(args):
         return None
     project_names = _detect_multi_project(args)
     if project_names is None:
         return None
+    if getattr(args, "all", False):
+        return project_names
+    if _probe_and_inject_current(args):
+        return None
+    return project_names
+
+
+def _reject_if_multi_project(
+    command: str, args: argparse.Namespace,
+) -> int | None:
+    """Return EXIT_FAIL if the server is multi-project and --project is not set.
+
+    Returns None when the command may proceed (single-project or --project given).
+    When a current project is set on the server, it is automatically injected
+    into ``args.project`` so all downstream code uses it transparently.
+    """
+    if _get_project(args):
+        return None
+    project_names = _detect_multi_project(args)
+    if project_names is None:
+        return None
+    if _probe_and_inject_current(args):
+        return None
+
     if getattr(args, "json", False):
         print(json.dumps({
             "error": f"{command} requires --project in multi-project mode",
@@ -266,23 +311,28 @@ def _reject_if_multi_project(
         }))
     else:
         _print_multi_project_required(command, project_names)
+        print("Tip: set a default with 'texwatch current <name>'")
     return EXIT_FAIL
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     """Handle status command."""
-    project = _get_project(args)
-
-    if project:
-        # Single project status
-        resp = _api_get("/status", port=args.port, project=project)
-    else:
-        # Try all-projects first, fall back to single status
+    project_names = _should_aggregate(args)
+    if project_names is not None:
         resp = _api_get("/projects", port=args.port)
         if not resp.server_down and isinstance(resp.data, dict) and "projects" in resp.data:
             return _print_all_projects_status(resp.data, args)
-        # Fall back to single-project status
-        resp = _api_get("/status", port=args.port)
+
+    project = _get_project(args)
+
+    # Fallback: when no project was resolved, prefer /projects aggregate view
+    # (handles servers with 0 or 1 projects where _should_aggregate returned None)
+    if not project:
+        resp = _api_get("/projects", port=args.port)
+        if not resp.server_down and isinstance(resp.data, dict) and "projects" in resp.data:
+            return _print_all_projects_status(resp.data, args)
+
+    resp = _api_get("/status", port=args.port, project=project)
 
     if resp.server_down:
         if getattr(args, "json", False):
@@ -367,14 +417,11 @@ def _print_all_projects_status(data: dict, args: argparse.Namespace) -> int:
 
 def cmd_view(args: argparse.Namespace) -> int:
     """Handle view command."""
+    project_names = _should_aggregate(args)
+    if project_names is not None:
+        return _view_all_projects(project_names, args)
+
     project = _get_project(args)
-
-    # Multi-project aggregate when no --project
-    if not project:
-        project_names = _detect_multi_project(args)
-        if project_names is not None:
-            return _view_all_projects(project_names, args)
-
     resp = _api_get("/status", port=args.port, project=project)
     if resp.server_down:
         if getattr(args, "json", False):
@@ -553,14 +600,11 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 def cmd_compile(args: argparse.Namespace) -> int:
     """Handle compile command."""
+    project_names = _should_aggregate(args)
+    if project_names is not None:
+        return _compile_all_projects(args)
+
     project = _get_project(args)
-
-    # Multi-project mode without --project: compile all via aggregate /compile
-    if not project:
-        project_names = _detect_multi_project(args)
-        if project_names is not None:
-            return _compile_all_projects(args)
-
     resp = _api_post("/compile", {}, port=args.port, project=project)
 
     if resp.server_down:
@@ -820,14 +864,13 @@ def _files_all_projects(data: dict, args: argparse.Namespace) -> int:
 
 def cmd_files(args: argparse.Namespace) -> int:
     """Handle files command."""
-    project = _get_project(args)
-
-    # In multi-project mode without --project, list files for all projects
-    if not project:
+    project_names = _should_aggregate(args)
+    if project_names is not None:
         probe = _api_get("/projects", port=args.port)
         if not probe.server_down and isinstance(probe.data, dict) and "projects" in probe.data:
             return _files_all_projects(probe.data, args)
 
+    project = _get_project(args)
     resp = _api_get("/files", port=args.port, project=project)
 
     if resp.server_down:
@@ -862,6 +905,9 @@ def cmd_files(args: argparse.Namespace) -> int:
 
 def cmd_activity(args: argparse.Namespace) -> int:
     """Handle activity command — show recent events."""
+    # Resolve project scope: current project if set, else global
+    _should_aggregate(args)
+
     params = []
     limit = getattr(args, "limit", None)
     if limit is not None:
@@ -1145,6 +1191,86 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_current(args: argparse.Namespace) -> int:
+    """Handle current command — show or switch the current project."""
+    unset = getattr(args, "unset", False)
+    name = getattr(args, "name", None)
+
+    if unset:
+        # Clear the current project
+        resp = _api_post("/current", {"project": None}, port=args.port)
+        if resp.server_down:
+            if getattr(args, "json", False):
+                print(json.dumps({"error": "server not running", "port": args.port}))
+            else:
+                _print_server_down(args.port)
+            return EXIT_SERVER_DOWN
+        if resp.error:
+            if getattr(args, "json", False):
+                print(json.dumps({"error": resp.error}))
+            else:
+                print(f"Failed to clear current project: {resp.error}")
+            return EXIT_FAIL
+        if getattr(args, "json", False):
+            print(json.dumps({"current": None}))
+        else:
+            print("Cleared current project")
+        return EXIT_OK
+
+    if name:
+        # Switch to a named project
+        resp = _api_post("/current", {"project": name}, port=args.port)
+        if resp.server_down:
+            if getattr(args, "json", False):
+                print(json.dumps({"error": "server not running", "port": args.port}))
+            else:
+                _print_server_down(args.port)
+            return EXIT_SERVER_DOWN
+        if resp.error:
+            if getattr(args, "json", False):
+                print(json.dumps({"error": resp.error}))
+            else:
+                print(f"Error: {resp.error}")
+            return EXIT_FAIL
+        data = resp.data if isinstance(resp.data, dict) else {}
+        if getattr(args, "json", False):
+            print(json.dumps(data))
+        else:
+            print(f"Current project: {data.get('current', name)}")
+        return EXIT_OK
+
+    # No args: show the current project
+    resp = _api_get("/current", port=args.port)
+    if resp.server_down:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": "server not running", "port": args.port}))
+        else:
+            _print_server_down(args.port)
+        return EXIT_SERVER_DOWN
+    if resp.error:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": resp.error}))
+        else:
+            print(f"Failed to get current project: {resp.error}")
+        return EXIT_FAIL
+
+    data = resp.data if isinstance(resp.data, dict) else {}
+    current = data.get("current")
+    projects = data.get("projects", [])
+
+    if getattr(args, "json", False):
+        print(json.dumps(data))
+    elif current:
+        print(f"Current project: {current}")
+    else:
+        print("No current project set")
+        if projects:
+            print("Available projects:")
+            for p in projects:
+                print(f"  {p}")
+    return EXIT_OK
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     """List directories containing .texwatch.yaml."""
     from .workspace import discover_projects
@@ -1304,10 +1430,12 @@ def build_parser() -> argparse.ArgumentParser:
     # --- status ---
     p_status = subparsers.add_parser("status", help="Query running texwatch instance")
     _add_server_options(p_status)
+    p_status.add_argument("--all", action="store_true", help="Show all projects (override current)")
 
     # --- view ---
     p_view = subparsers.add_parser("view", help="Show editor and viewer pane state")
     _add_server_options(p_view)
+    p_view.add_argument("--all", action="store_true", help="Show all projects (override current)")
 
     # --- goto ---
     p_goto = subparsers.add_parser("goto", help="Navigate to line number, pN for page, or section name")
@@ -1317,6 +1445,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --- compile ---
     p_compile = subparsers.add_parser("compile", help="Trigger manual recompile")
     _add_server_options(p_compile)
+    p_compile.add_argument("--all", action="store_true", help="Compile all projects (override current)")
 
     # --- capture ---
     p_capture = subparsers.add_parser("capture", help="Screenshot PDF page to PNG file")
@@ -1337,6 +1466,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --- files ---
     p_files = subparsers.add_parser("files", help="List project file tree")
     _add_server_options(p_files)
+    p_files.add_argument("--all", action="store_true", help="Show all projects (override current)")
 
     # --- activity ---
     p_activity = subparsers.add_parser("activity", help="Show recent activity events")
@@ -1345,6 +1475,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_activity.add_argument("--limit", type=int, default=None,
                             help="Maximum number of events (default: 50)")
     _add_server_options(p_activity)
+    p_activity.add_argument("--all", action="store_true", help="Show all project events (override current)")
 
     # --- bibliography ---
     p_bib = subparsers.add_parser("bibliography", help="Show bibliography analysis")
@@ -1361,6 +1492,12 @@ def build_parser() -> argparse.ArgumentParser:
     # --- dashboard ---
     p_dashboard = subparsers.add_parser("dashboard", help="Show unified paper dashboard")
     _add_server_options(p_dashboard)
+
+    # --- current ---
+    p_current = subparsers.add_parser("current", help="Show or switch the current project")
+    p_current.add_argument("name", nargs="?", default=None, help="Project name to switch to")
+    p_current.add_argument("--unset", action="store_true", help="Clear the current project")
+    _add_server_options(p_current)
 
     # --- scan ---
     p_scan = subparsers.add_parser("scan", help="List projects (directories with .texwatch.yaml)")
@@ -1403,6 +1540,7 @@ _DISPATCH = {
     "environments": cmd_environments,
     "digest": cmd_digest,
     "dashboard": cmd_dashboard,
+    "current": cmd_current,
     "scan": cmd_scan,
     "serve": cmd_serve,
     "mcp": cmd_mcp,

@@ -790,14 +790,20 @@ class TexWatchServer:
         })
 
     async def _handle_set_current(self, request: web.Request) -> web.Response:
-        """Handle POST /current — switch current project."""
+        """Handle POST /current — switch or clear current project."""
         try:
             data = await request.json()
         except json.JSONDecodeError:
             return web.json_response({"error": "Invalid JSON"}, status=400)
 
         name = data.get("project")
-        if not name or name not in self._projects:
+
+        # Clear current project when name is None/empty
+        if not name:
+            self._current_project_name = None
+            return web.json_response({"current": None})
+
+        if name not in self._projects:
             return web.json_response({
                 "error": f"Unknown project: {name}",
                 "projects": list(self._projects.keys()),

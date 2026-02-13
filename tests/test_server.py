@@ -3413,12 +3413,12 @@ class TestSetCurrentInvalidJson:
         assert "Invalid JSON" in data["error"]
 
     @pytest.mark.asyncio
-    async def test_post_current_missing_project(self, multi_client):
-        """Test POST /current without project field returns 400."""
+    async def test_post_current_missing_project_clears(self, multi_client):
+        """Test POST /current without project field clears current."""
         resp = await multi_client.post("/current", json={})
-        assert resp.status == 400
+        assert resp.status == 200
         data = await resp.json()
-        assert "Unknown project" in data["error"]
+        assert data["current"] is None
 
 
 class TestMultiProjectHistoryError:
@@ -3618,3 +3618,78 @@ class TestDashboardEndpoint:
         assert "defined" in bib
         assert "cited" in bib
         assert "undefined_keys" in bib
+
+
+class TestCurrentEndpointUnset:
+    """Tests for POST /current with null to clear the current project."""
+
+    @pytest.fixture
+    def multi_config(self, tmp_path):
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nA\n\\end{document}\n"
+        )
+        config_a = Config(
+            main="main.tex", watch=["*.tex"], ignore=[],
+            compiler="latexmk", port=0,
+            config_path=dir_a / ".texwatch.yaml",
+        )
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nB\n\\end{document}\n"
+        )
+        config_b = Config(
+            main="main.tex", watch=["*.tex"], ignore=[],
+            compiler="latexmk", port=0,
+            config_path=dir_b / ".texwatch.yaml",
+        )
+        return [("alpha", config_a), ("beta", config_b)]
+
+    @pytest.fixture
+    def multi_server(self, multi_config):
+        return TexWatchServer(projects=multi_config)
+
+    @pytest.fixture
+    async def multi_client(self, multi_server):
+        async with TestClient(TestServer(multi_server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_post_current_null_clears(self, multi_client, multi_server):
+        """Test POST /current with project=null clears the current project."""
+        multi_server._current_project_name = "alpha"
+        resp = await multi_client.post("/current", json={"project": None})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["current"] is None
+        assert multi_server._current_project_name is None
+
+    @pytest.mark.asyncio
+    async def test_post_current_empty_string_clears(self, multi_client, multi_server):
+        """Test POST /current with project='' clears the current project."""
+        multi_server._current_project_name = "beta"
+        resp = await multi_client.post("/current", json={"project": ""})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["current"] is None
+        assert multi_server._current_project_name is None
+
+    @pytest.mark.asyncio
+    async def test_clear_then_get_shows_null(self, multi_client, multi_server):
+        """Test that clearing current and then GET /current shows null."""
+        multi_server._current_project_name = "alpha"
+        await multi_client.post("/current", json={"project": None})
+        resp = await multi_client.get("/current")
+        data = await resp.json()
+        assert data["current"] is None
+        assert "projects" in data
+
+    @pytest.mark.asyncio
+    async def test_unprefixed_goto_fails_after_clear(self, multi_client, multi_server):
+        """Test that unprefixed goto fails after clearing current."""
+        multi_server._current_project_name = "alpha"
+        await multi_client.post("/current", json={"project": None})
+        resp = await multi_client.post("/goto", json={"page": 1})
+        assert resp.status == 400
