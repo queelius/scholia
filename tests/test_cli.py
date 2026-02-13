@@ -28,6 +28,7 @@ from texwatch.cli import (
     cmd_bibliography,
     cmd_environments,
     cmd_digest,
+    cmd_dashboard,
 )
 
 
@@ -167,7 +168,7 @@ class TestSubcommandParsing:
         expected = {
             None, "init", "status", "view", "goto", "compile", "capture",
             "config", "files", "activity", "bibliography", "environments",
-            "digest", "scan", "serve", "mcp",
+            "digest", "dashboard", "scan", "serve", "mcp",
         }
         assert set(_DISPATCH.keys()) == expected
 
@@ -2358,6 +2359,95 @@ class TestCmdDigest:
             args = parser.parse_args(["digest"])
             result = cmd_digest(args)
 
+        assert result == EXIT_SERVER_DOWN
+
+
+class TestCmdDashboard:
+    """Tests for texwatch dashboard command."""
+
+    def test_dashboard_subparser_exists(self):
+        parser = build_parser()
+        args = parser.parse_args(["dashboard"])
+        assert args.command == "dashboard"
+
+    def test_dispatch_registered(self):
+        assert "dashboard" in _DISPATCH
+
+    def test_dashboard_json(self, capsys):
+        dashboard_data = {
+            "health": {"title": "Test", "documentclass": "article", "word_count": 100,
+                       "page_count": 5, "page_limit": None, "compile_status": "success",
+                       "last_compile": "2026-02-13T14:30:00Z", "error_count": 0,
+                       "warning_count": 0, "author": "Test Author"},
+            "sections": [], "issues": [], "bibliography": {"defined": 0, "cited": 0,
+                "undefined_keys": [], "uncited_keys": []},
+            "changes": [], "environments": {"items": []},
+        }
+        with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=dashboard_data)):
+            parser = build_parser()
+            args = parser.parse_args(["dashboard", "--json"])
+            result = cmd_dashboard(args)
+
+        assert result == EXIT_OK
+        output = capsys.readouterr().out
+        parsed = json.loads(output)
+        assert "health" in parsed
+
+    def test_dashboard_human_output(self, capsys):
+        dashboard_data = {
+            "health": {"title": "Test", "documentclass": "article", "word_count": 100,
+                       "page_count": 5, "page_limit": None, "compile_status": "success",
+                       "last_compile": "2026-02-13T14:30:00Z", "error_count": 0,
+                       "warning_count": 0, "author": "Test Author"},
+            "sections": [], "issues": [], "bibliography": {"defined": 0, "cited": 0,
+                "undefined_keys": [], "uncited_keys": []},
+            "changes": [], "environments": {"items": []},
+        }
+        with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=dashboard_data)):
+            parser = build_parser()
+            args = parser.parse_args(["dashboard"])
+            result = cmd_dashboard(args)
+
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "Test" in captured.out
+        assert "article" in captured.out
+
+    def test_dashboard_with_sections(self, capsys):
+        dashboard_data = {
+            "health": {"title": "Paper", "documentclass": "article", "word_count": 1000,
+                       "page_count": 10, "page_limit": 20, "compile_status": "success",
+                       "last_compile": "2026-02-13T14:30:00Z", "error_count": 0,
+                       "warning_count": 0, "author": None},
+            "sections": [
+                {"title": "Introduction", "level": "section", "file": "main.tex", "line": 5,
+                 "word_count": 500, "citation_count": 3, "todo_count": 1, "figure_count": 0,
+                 "table_count": 0, "is_dirty": True},
+            ],
+            "issues": [{"type": "todo", "tag": "TODO", "text": "fix this", "file": "main.tex", "line": 10}],
+            "bibliography": {"defined": 5, "cited": 3, "undefined_keys": ["foo"], "uncited_keys": ["bar"]},
+            "changes": [{"section_title": "Introduction", "words_added": 50, "words_removed": 10}],
+            "environments": {"items": []},
+        }
+        with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=dashboard_data)):
+            parser = build_parser()
+            args = parser.parse_args(["dashboard"])
+            result = cmd_dashboard(args)
+
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "Introduction" in captured.out
+        assert "todo" in captured.out.lower()
+        assert "foo" in captured.out
+        assert "bar" in captured.out
+        assert "10 pages / 20" in captured.out
+        assert "+50 words" in captured.out
+
+    def test_dashboard_fetch_failure(self):
+        with patch("texwatch.cli._api_get", return_value=APIResponse(status=0, server_down=True)):
+            parser = build_parser()
+            args = parser.parse_args(["dashboard"])
+            result = cmd_dashboard(args)
         assert result == EXIT_SERVER_DOWN
 
 

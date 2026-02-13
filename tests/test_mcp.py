@@ -546,6 +546,7 @@ class TestMcpServerCreation:
             "texwatch_bibliography",
             "texwatch_environments",
             "texwatch_digest",
+            "texwatch_dashboard",
         }
         assert tool_names == expected
 
@@ -875,6 +876,7 @@ class TestSemanticMcpTools:
             "texwatch_bibliography",
             "texwatch_environments",
             "texwatch_digest",
+            "texwatch_dashboard",
         }
         assert semantic_tools.issubset(tool_names)
 
@@ -957,3 +959,31 @@ class TestSemanticMcpTools:
             result = await _call_tool(server, "texwatch_digest", {"port": 8765, "project": "thesis"})
 
             mock_client.get.assert_called_once_with("http://localhost:8765/p/thesis/digest")
+
+    @pytest.mark.asyncio
+    async def test_dashboard_url(self):
+        """Test texwatch_dashboard builds correct URL."""
+        mock_resp = _mock_response(text='{"health":{}}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            server = create_server()
+            result = await _call_tool(server, "texwatch_dashboard", {"port": 8765})
+            mock_client.get.assert_called_once_with("http://localhost:8765/dashboard")
+
+    @pytest.mark.asyncio
+    async def test_dashboard_url_with_project(self):
+        """Test texwatch_dashboard builds correct URL with project."""
+        mock_resp = _mock_response(text='{"health":{}}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            server = create_server()
+            result = await _call_tool(server, "texwatch_dashboard", {"port": 9000, "project": "paper1"})
+            mock_client.get.assert_called_once_with("http://localhost:9000/p/paper1/dashboard")

@@ -232,6 +232,11 @@ def create_server() -> "FastMCP":
         """Get document metadata: class, title, author, date, abstract, packages, and custom commands."""
         return await _get("/digest", port, project)
 
+    @mcp.tool()
+    async def texwatch_dashboard(port: int = 8765, project: str | None = None) -> str:
+        """Get unified paper dashboard: health, sections, issues, bibliography, changes, and environments in a single view."""
+        return await _get("/dashboard", port, project)
+
     return mcp
 
 

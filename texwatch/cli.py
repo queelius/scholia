@@ -1047,6 +1047,104 @@ def cmd_digest(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Handle dashboard command — show unified paper state."""
+    result = _fetch_endpoint("/dashboard", "dashboard", args)
+    if isinstance(result, int):
+        return result
+    data, _ = result
+
+    # Health summary
+    health = data.get("health", {})
+    title = health.get("title") or "Untitled"
+    docclass = health.get("documentclass") or "?"
+    words = health.get("word_count", 0)
+    pages = health.get("page_count", 0)
+    status = health.get("compile_status", "none")
+    last = health.get("last_compile") or ""
+    if last and "T" in last:
+        last = last.split("T")[1].split(".")[0]  # HH:MM:SS
+
+    page_str = f"{pages} pages"
+    if health.get("page_limit"):
+        page_str += f" / {health['page_limit']}"
+
+    print(f"{title} ({docclass}) -- {words:,} words, {page_str}")
+    print(f"Compile: {status} ({last})")
+
+    # Sections
+    sections = data.get("sections", [])
+    if sections:
+        print("\nSections:")
+        for sec in sections:
+            dirty = "*" if sec.get("is_dirty") else " "
+            name = sec["title"]
+            wc = sec.get("word_count", 0)
+            cites = sec.get("citation_count", 0)
+            todos = sec.get("todo_count", 0)
+            figs = sec.get("figure_count", 0)
+
+            parts = [f"{wc:>6,} words"]
+            if cites:
+                parts.append(f"{cites} cites")
+            if todos:
+                parts.append(f"{todos} TODO")
+            if figs:
+                parts.append(f"{figs} figs")
+
+            print(f"  {dirty} {name:<25s} {' '.join(parts)}")
+
+    # Issues
+    issues = data.get("issues", [])
+    if issues:
+        print(f"\nIssues ({len(issues)}):")
+        for iss in issues:
+            itype = iss.get("type", "")
+            if itype == "error":
+                prefix = "x"
+            elif itype == "warning":
+                prefix = "!"
+            elif itype == "undefined_citation":
+                prefix = "x"
+            elif itype == "todo":
+                prefix = "-"
+            else:
+                prefix = "?"
+            msg = iss.get("message") or iss.get("text") or iss.get("key", "")
+            loc = ""
+            if iss.get("file"):
+                loc = f" ({iss['file']}"
+                if iss.get("line"):
+                    loc += f":{iss['line']}"
+                loc += ")"
+            print(f"  {prefix} {itype}: {msg}{loc}")
+
+    # Changes
+    changes = data.get("changes", [])
+    if changes:
+        print("\nChanges since last compile:")
+        for ch in changes:
+            added = ch.get("words_added", 0)
+            removed = ch.get("words_removed", 0)
+            parts = []
+            if added:
+                parts.append(f"+{added} words")
+            if removed:
+                parts.append(f"-{removed} words")
+            print(f"  {ch.get('section_title', '?')}: {', '.join(parts)}")
+
+    # Bibliography
+    bib = data.get("bibliography", {})
+    if bib.get("defined") or bib.get("cited"):
+        print(f"\nBibliography: {bib.get('defined', 0)} defined, {bib.get('cited', 0)} cited")
+        if bib.get("undefined_keys"):
+            print(f"  Undefined: {', '.join(bib['undefined_keys'])}")
+        if bib.get("uncited_keys"):
+            print(f"  Uncited: {', '.join(bib['uncited_keys'])}")
+
+    return EXIT_OK
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     """List directories containing .texwatch.yaml."""
     from .workspace import discover_projects
@@ -1260,6 +1358,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_digest = subparsers.add_parser("digest", help="Show document metadata")
     _add_server_options(p_digest)
 
+    # --- dashboard ---
+    p_dashboard = subparsers.add_parser("dashboard", help="Show unified paper dashboard")
+    _add_server_options(p_dashboard)
+
     # --- scan ---
     p_scan = subparsers.add_parser("scan", help="List projects (directories with .texwatch.yaml)")
     p_scan.add_argument("directory", help="Directory to scan")
@@ -1300,6 +1402,7 @@ _DISPATCH = {
     "bibliography": cmd_bibliography,
     "environments": cmd_environments,
     "digest": cmd_digest,
+    "dashboard": cmd_dashboard,
     "scan": cmd_scan,
     "serve": cmd_serve,
     "mcp": cmd_mcp,
