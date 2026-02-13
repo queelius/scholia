@@ -18,6 +18,7 @@ from typing import Any, Callable
 from aiohttp import web, WSMsgType
 
 from .bibliography import parse_bibliography
+from .changes import ChangeLog, SectionDelta, compute_changes
 from .compiler import CompileMessage, CompileResult, compile_tex
 from .config import Config, get_main_file, get_watch_dir
 from .digest import Digest, parse_digest
@@ -76,6 +77,9 @@ class ProjectInstance:
 
         # File snapshots (ring buffer) — stash old content before source_write
         self.file_snapshots: deque[dict] = deque(maxlen=20)
+
+        # Change tracking
+        self.change_log = ChangeLog()
 
     def log_event(self, event_type: str, **data: Any) -> dict:
         """Record an event in the per-project ring buffer."""
@@ -163,6 +167,29 @@ class ProjectInstance:
             if self.watcher and self.watcher._handler and self.last_result:
                 self.watcher._handler.update_debounce(self.last_result.duration_seconds)
 
+            # Change tracking (only on successful compile)
+            if self.last_result and self.last_result.success:
+                try:
+                    watch_dir = get_watch_dir(self.config)
+                    current_contents: dict[str, str] = {}
+                    for tex_file in watch_dir.rglob("*.tex"):
+                        try:
+                            rel = str(tex_file.relative_to(watch_dir))
+                            current_contents[rel] = tex_file.read_text(errors="replace")
+                        except Exception:
+                            pass
+                    structure = parse_structure(get_main_file(self.config), watch_dir)
+                    deltas = compute_changes(
+                        structure.sections,
+                        self.change_log.last_compiled_snapshots,
+                        current_contents,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                    )
+                    self.change_log.record(deltas)
+                    self.change_log.last_compiled_snapshots = current_contents
+                except Exception:
+                    logger.debug("Change tracking failed", exc_info=True)
+
         finally:
             self.compiling = False
             _duration = (datetime.now(timezone.utc) - _compile_start).total_seconds()
@@ -181,6 +208,7 @@ class ProjectInstance:
             if self.last_result and self.last_result.log_output:
                 msg["log_output"] = self.last_result.log_output
             await self.broadcast(msg)
+            await self.broadcast({"type": "dashboard_updated"})
 
     async def on_file_change(self, changed_path: str) -> None:
         """Handle file change from watcher."""
@@ -444,6 +472,7 @@ class TexWatchServer:
         self.app.router.add_get(r"/p/{name:.+}/bibliography", self._handle_project_bibliography)
         self.app.router.add_get(r"/p/{name:.+}/environments", self._handle_project_environments)
         self.app.router.add_get(r"/p/{name:.+}/digest", self._handle_project_digest)
+        self.app.router.add_get(r"/p/{name:.+}/dashboard", self._handle_project_dashboard)
         self.app.router.add_get(r"/p/{name:.+}/activity", self._handle_project_activity)
         self.app.router.add_get(r"/p/{name}/history/{file:.+}", self._handle_project_history)
 
@@ -464,6 +493,7 @@ class TexWatchServer:
         self.app.router.add_get("/bibliography", self._handle_root_bibliography)
         self.app.router.add_get("/environments", self._handle_root_environments)
         self.app.router.add_get("/digest", self._handle_root_digest)
+        self.app.router.add_get("/dashboard", self._handle_root_dashboard)
         self.app.router.add_get("/activity", self._handle_root_activity)
         self.app.router.add_get(r"/history/{file:.+}", self._handle_root_history)
         self.app.router.add_get("/current", self._handle_get_current)
@@ -607,6 +637,10 @@ class TexWatchServer:
         proj = self._require_project(request)
         return self._build_digest_response(proj)
 
+    async def _handle_project_dashboard(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_dashboard_response(proj)
+
     async def _handle_project_activity(self, request: web.Request) -> web.Response:
         proj = self._require_project(request)
         return self._build_activity_response(proj.events, request)
@@ -726,6 +760,9 @@ class TexWatchServer:
 
     async def _handle_root_digest(self, request: web.Request) -> web.Response:
         return self._single_or_aggregate("_build_digest_response")
+
+    async def _handle_root_dashboard(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_dashboard_response")
 
     async def _handle_root_activity(self, request: web.Request) -> web.Response:
         """Handle GET /activity — global activity log."""
@@ -1060,6 +1097,143 @@ class TexWatchServer:
             digest = Digest()
 
         return web.json_response(dataclasses.asdict(digest))
+
+    def _build_dashboard_response(self, proj: ProjectInstance) -> web.Response:
+        """Build GET /dashboard response — unified paper state."""
+        main_file = get_main_file(proj.config)
+        watch_dir = get_watch_dir(proj.config)
+
+        # Parse all data sources with exception fallbacks
+        try:
+            structure = parse_structure(main_file, watch_dir)
+        except Exception:
+            logger.debug("dashboard: parse_structure failed", exc_info=True)
+            structure = DocumentStructure()
+
+        try:
+            bib = parse_bibliography(main_file, watch_dir)
+        except Exception:
+            logger.debug("dashboard: parse_bibliography failed", exc_info=True)
+            bib = None
+
+        try:
+            envs = parse_environments(main_file, watch_dir)
+        except Exception:
+            logger.debug("dashboard: parse_environments failed", exc_info=True)
+            envs = []
+
+        try:
+            digest = parse_digest(main_file, watch_dir)
+        except Exception:
+            logger.debug("dashboard: parse_digest failed", exc_info=True)
+            digest = Digest()
+
+        # Health section
+        error_count = len(proj.last_result.errors) if proj.last_result else 0
+        warning_count = len(proj.last_result.warnings) if proj.last_result else 0
+        compile_status = "success" if (proj.last_result and proj.last_result.success) else ("error" if proj.last_result else "none")
+
+        health: dict[str, Any] = {
+            "title": digest.title,
+            "author": digest.author,
+            "documentclass": digest.documentclass,
+            "word_count": structure.word_count,
+            "page_count": proj.viewer_state.get("total_pages", 0),
+            "page_limit": proj.config.page_limit,
+            "compile_status": compile_status,
+            "last_compile": proj.last_result.timestamp.isoformat() if proj.last_result else None,
+            "error_count": error_count,
+            "warning_count": warning_count,
+        }
+
+        # Section map with dirty markers from change log (match by file+line)
+        dirty_sections: set[tuple[str, int]] = set()
+        for delta in proj.change_log.deltas:
+            if delta.is_dirty:
+                dirty_sections.add((delta.section_file, delta.section_line))
+
+        section_levels = {
+            (s.file, s.line): s.level for s in structure.sections
+        }
+        sections_list = []
+        for stat in structure.section_stats:
+            sections_list.append({
+                "title": stat.section_title,
+                "level": section_levels.get(
+                    (stat.section_file, stat.section_line), "section"
+                ),
+                "file": stat.section_file,
+                "line": stat.section_line,
+                "word_count": stat.word_count,
+                "citation_count": stat.citation_count,
+                "todo_count": stat.todo_count,
+                "figure_count": stat.figure_count,
+                "table_count": stat.table_count,
+                "is_dirty": (stat.section_file, stat.section_line) in dirty_sections,
+            })
+
+        # Issues: compile errors + undefined citations + TODOs
+        issues: list[dict[str, Any]] = []
+        if proj.last_result:
+            for err in proj.last_result.errors:
+                issues.append({
+                    "type": "error",
+                    "message": err.message,
+                    "file": err.file or "",
+                    "line": err.line or 0,
+                })
+            for warn in proj.last_result.warnings:
+                issues.append({
+                    "type": "warning",
+                    "message": warn.message,
+                    "file": warn.file or "",
+                    "line": warn.line or 0,
+                })
+        if bib:
+            for key in bib.undefined_keys:
+                issues.append({
+                    "type": "undefined_citation",
+                    "key": key,
+                    "file": "",
+                    "line": 0,
+                })
+        for todo in structure.todos:
+            issues.append({
+                "type": "todo",
+                "tag": todo.tag,
+                "text": todo.text,
+                "file": todo.file,
+                "line": todo.line,
+            })
+
+        # Bibliography summary
+        bibliography: dict[str, Any] = {
+            "defined": len(bib.entries) if bib else 0,
+            "cited": len(bib.citations) if bib else 0,
+            "undefined_keys": bib.undefined_keys if bib else [],
+            "uncited_keys": bib.uncited_keys if bib else [],
+        }
+
+        # Changes
+        changes = [dataclasses.asdict(d) for d in proj.change_log.deltas if d.is_dirty]
+
+        # Environments
+        env_counts: dict[str, int] = {}
+        for e in envs:
+            env_counts[e.env_type] = env_counts.get(e.env_type, 0) + 1
+        environments: dict[str, Any] = {
+            **env_counts,
+            "items": [dataclasses.asdict(e) for e in envs],
+        }
+
+        return web.json_response({
+            "health": health,
+            "sections": sections_list,
+            "issues": issues,
+            "bibliography": bibliography,
+            "changes": changes,
+            "environments": environments,
+        })
 
     async def _goto_estimated_page(
         self,

@@ -3528,3 +3528,93 @@ class TestServerNoConfigOrProjects:
         """Test that TexWatchServer raises ValueError without config or projects."""
         with pytest.raises(ValueError, match="Must provide config or projects"):
             TexWatchServer()
+
+
+class TestDashboardEndpoint:
+    """Tests for GET /dashboard."""
+
+    @pytest.mark.asyncio
+    async def test_dashboard_returns_all_sections(self, client, config):
+        project_dir = config.config_path.parent
+        main = project_dir / "main.tex"
+        main.write_text(
+            "\\documentclass{article}\n\\title{Test}\n"
+            "\\begin{document}\n\\section{Intro}\nHello.\n\\end{document}\n"
+        )
+        resp = await client.get("/dashboard")
+        assert resp.status == 200
+        data = await resp.json()
+        for key in ("health", "sections", "issues", "bibliography", "changes", "environments"):
+            assert key in data
+
+    @pytest.mark.asyncio
+    async def test_dashboard_health_fields(self, client, config):
+        project_dir = config.config_path.parent
+        main = project_dir / "main.tex"
+        main.write_text("\\documentclass{article}\n\\title{Test Paper}\n\\begin{document}\n\\end{document}\n")
+        resp = await client.get("/dashboard")
+        data = await resp.json()
+        health = data["health"]
+        assert health["title"] == "Test Paper"
+        assert health["documentclass"] == "article"
+        assert "compile_status" in health
+        assert "error_count" in health
+
+    @pytest.mark.asyncio
+    async def test_dashboard_per_project(self, client, config):
+        project_dir = config.config_path.parent
+        main = project_dir / "main.tex"
+        main.write_text("\\documentclass{article}\n\\begin{document}\n\\end{document}\n")
+        resp = await client.get("/p/test/dashboard")
+        # The project name from the fixture is based on the main file stem
+        # Let's check: if 404, the name is different
+        if resp.status == 404:
+            # Get the actual project name
+            projects_resp = await client.get("/projects")
+            projects_data = await projects_resp.json()
+            name = projects_data["projects"][0]["name"]
+            resp = await client.get(f"/p/{name}/dashboard")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "health" in data
+
+    @pytest.mark.asyncio
+    async def test_dashboard_issues_include_todos(self, client, config):
+        project_dir = config.config_path.parent
+        main = project_dir / "main.tex"
+        main.write_text(
+            "\\documentclass{article}\n\\begin{document}\n"
+            "% TODO: fix this\n\\end{document}\n"
+        )
+        resp = await client.get("/dashboard")
+        data = await resp.json()
+        todo_issues = [i for i in data["issues"] if i["type"] == "todo"]
+        assert len(todo_issues) >= 1
+
+    @pytest.mark.asyncio
+    async def test_dashboard_environments(self, client, config):
+        project_dir = config.config_path.parent
+        main = project_dir / "main.tex"
+        main.write_text(
+            "\\documentclass{article}\n\\begin{document}\n"
+            "\\begin{theorem}[Main]\n\\label{thm:main}\nStatement.\n\\end{theorem}\n"
+            "\\end{document}\n"
+        )
+        resp = await client.get("/dashboard")
+        data = await resp.json()
+        assert "items" in data["environments"]
+
+    @pytest.mark.asyncio
+    async def test_dashboard_bibliography(self, client, config):
+        project_dir = config.config_path.parent
+        main = project_dir / "main.tex"
+        main.write_text(
+            "\\documentclass{article}\n\\begin{document}\n"
+            "\\cite{foo2024}\n\\end{document}\n"
+        )
+        resp = await client.get("/dashboard")
+        data = await resp.json()
+        bib = data["bibliography"]
+        assert "defined" in bib
+        assert "cited" in bib
+        assert "undefined_keys" in bib

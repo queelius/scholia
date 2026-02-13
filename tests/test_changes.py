@@ -325,3 +325,26 @@ class TestChangeLogIntegration:
         assert len(log.deltas) == 2
         assert log.deltas[0].is_dirty is True
         assert log.deltas[1].is_dirty is True
+
+
+class TestChangeLogIntegrationWithSnapshots:
+    def test_full_snapshot_cycle(self):
+        """Test reading files and computing changes like the server would."""
+        log = ChangeLog()
+        sections = [
+            Section(level="section", title="Intro", file="main.tex", line=1),
+            Section(level="section", title="Methods", file="main.tex", line=4),
+        ]
+        v1 = {"main.tex": "\\section{Intro}\nOld.\n\n\\section{Methods}\nOld methods.\n"}
+        deltas = compute_changes(sections, log.last_compiled_snapshots, v1)
+        log.record(deltas)
+        log.last_compiled_snapshots = dict(v1)
+
+        v2 = {"main.tex": "\\section{Intro}\nNew intro added.\n\n\\section{Methods}\nOld methods.\n"}
+        deltas2 = compute_changes(sections, log.last_compiled_snapshots, v2)
+        log.record(deltas2)
+        log.last_compiled_snapshots = dict(v2)
+
+        dirty = [d for d in deltas2 if d.is_dirty]
+        assert len(dirty) == 1
+        assert dirty[0].section_title == "Intro"
