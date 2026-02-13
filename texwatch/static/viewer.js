@@ -289,6 +289,9 @@ class TexWatchViewer {
                     detail: { file: data.file, mtime_ns: data.mtime_ns }
                 }));
                 break;
+            case 'dashboard_updated':
+                window.dispatchEvent(new Event('texwatch:dashboard-updated'));
+                break;
         }
     }
 

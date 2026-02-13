@@ -18,7 +18,7 @@ from typing import Any, Callable
 from aiohttp import web, WSMsgType
 
 from .bibliography import parse_bibliography
-from .changes import ChangeLog, SectionDelta, compute_changes
+from .changes import ChangeLog, compute_changes
 from .compiler import CompileMessage, CompileResult, compile_tex
 from .config import Config, get_main_file, get_watch_dir
 from .digest import Digest, parse_digest
@@ -208,7 +208,8 @@ class ProjectInstance:
             if self.last_result and self.last_result.log_output:
                 msg["log_output"] = self.last_result.log_output
             await self.broadcast(msg)
-            await self.broadcast({"type": "dashboard_updated"})
+            if self.last_result and self.last_result.success:
+                await self.broadcast({"type": "dashboard_updated"})
 
     async def on_file_change(self, changed_path: str) -> None:
         """Handle file change from watcher."""

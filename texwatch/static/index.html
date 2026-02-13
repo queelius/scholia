@@ -49,11 +49,38 @@
 
     <main>
         <div id="file-tree-pane">
-            <div id="tree-header">
-                <span>Files</span>
-                <button id="btn-toggle-tree" title="Toggle file tree">&#x25c0;</button>
+            <div id="sidebar-tabs">
+                <button class="sidebar-tab active" data-tab="files">Files</button>
+                <button class="sidebar-tab" data-tab="dashboard">Dashboard</button>
+                <button id="btn-toggle-tree" title="Toggle sidebar">&#x25c0;</button>
             </div>
             <div id="tree-container"></div>
+            <div id="dashboard-container" style="display:none">
+                <details class="dashboard-panel" id="panel-health" open>
+                    <summary>Health <span class="badge" id="badge-health"></span></summary>
+                    <div class="panel-content" id="content-health"></div>
+                </details>
+                <details class="dashboard-panel" id="panel-sections" open>
+                    <summary>Sections <span class="badge" id="badge-sections"></span></summary>
+                    <div class="panel-content" id="content-sections"></div>
+                </details>
+                <details class="dashboard-panel" id="panel-issues">
+                    <summary>Issues <span class="badge" id="badge-issues"></span></summary>
+                    <div class="panel-content" id="content-issues"></div>
+                </details>
+                <details class="dashboard-panel" id="panel-bibliography">
+                    <summary>Bibliography <span class="badge" id="badge-bibliography"></span></summary>
+                    <div class="panel-content" id="content-bibliography"></div>
+                </details>
+                <details class="dashboard-panel" id="panel-changes">
+                    <summary>Changes <span class="badge" id="badge-changes"></span></summary>
+                    <div class="panel-content" id="content-changes"></div>
+                </details>
+                <details class="dashboard-panel" id="panel-environments">
+                    <summary>Environments <span class="badge" id="badge-environments"></span></summary>
+                    <div class="panel-content" id="content-environments"></div>
+                </details>
+            </div>
         </div>
         <div id="tree-handle"></div>
         <div id="editor-pane">
@@ -104,6 +131,7 @@
         </div>
     </footer>
 
+    <script src="/static/dashboard.js"></script>
     <script src="/static/filetree.js"></script>
     <script src="/static/viewer.js"></script>
     <script type="module" src="/static/editor.js"></script>
