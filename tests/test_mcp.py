@@ -201,6 +201,104 @@ class TestMcpToolUrls:
                 "http://localhost:8765/source", params={"file": "intro.tex"}
             )
 
+    @pytest.mark.asyncio
+    async def test_write_source_sends_post(self):
+        """Test texwatch_write_source sends POST with file and content."""
+        mock_resp = _mock_response(text='{"ok":true}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_write_source", {
+                "file": "main.tex", "content": "\\documentclass{article}",
+                "port": 8765,
+            })
+
+            mock_client.post.assert_called_once_with(
+                "http://localhost:8765/source",
+                json={"file": "main.tex", "content": "\\documentclass{article}"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_write_source_with_mtime(self):
+        """Test texwatch_write_source includes base_mtime_ns when provided."""
+        mock_resp = _mock_response(text='{"ok":true}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_write_source", {
+                "file": "main.tex", "content": "hello",
+                "base_mtime_ns": "1234567890", "port": 8765,
+            })
+
+            mock_client.post.assert_called_once_with(
+                "http://localhost:8765/source",
+                json={"file": "main.tex", "content": "hello", "base_mtime_ns": "1234567890"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_write_source_with_project(self):
+        """Test texwatch_write_source routes to project URL."""
+        mock_resp = _mock_response(text='{"ok":true}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_write_source", {
+                "file": "main.tex", "content": "hello",
+                "port": 8765, "project": "paper1",
+            })
+
+            mock_client.post.assert_called_once_with(
+                "http://localhost:8765/p/paper1/source",
+                json={"file": "main.tex", "content": "hello"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_files_sends_get(self):
+        """Test texwatch_files sends GET to /files."""
+        mock_resp = _mock_response(text='{"files":["main.tex"]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_files", {"port": 8765})
+
+            mock_client.get.assert_called_once_with("http://localhost:8765/files")
+
+    @pytest.mark.asyncio
+    async def test_files_with_project(self):
+        """Test texwatch_files routes to project URL."""
+        mock_resp = _mock_response(text='{"files":["main.tex"]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_files", {"port": 9000, "project": "thesis"})
+
+            mock_client.get.assert_called_once_with("http://localhost:9000/p/thesis/files")
+
 
 # ---------------------------------------------------------------------------
 # TestMcpToolParameters — verify parameter handling
@@ -439,6 +537,15 @@ class TestMcpServerCreation:
             "texwatch_compile",
             "texwatch_capture",
             "texwatch_source",
+            "texwatch_write_source",
+            "texwatch_files",
+            "texwatch_activity",
+            "texwatch_current",
+            "texwatch_switch",
+            "texwatch_history",
+            "texwatch_bibliography",
+            "texwatch_environments",
+            "texwatch_digest",
         }
         assert tool_names == expected
 
@@ -505,6 +612,37 @@ class TestMcpServerCreation:
         assert "port" in props
         assert "project" in props
 
+    @pytest.mark.asyncio
+    async def test_write_source_tool_schema(self):
+        """Test that texwatch_write_source has file, content, base_mtime_ns, port, project params."""
+        server = create_server()
+        tools = await server.list_tools()
+        tool = next(t for t in tools if t.name == "texwatch_write_source")
+
+        schema = tool.inputSchema
+        props = schema.get("properties", {})
+        assert "file" in props
+        assert "content" in props
+        assert "base_mtime_ns" in props
+        assert "port" in props
+        assert "project" in props
+        # file and content should be required
+        required = schema.get("required", [])
+        assert "file" in required
+        assert "content" in required
+
+    @pytest.mark.asyncio
+    async def test_files_tool_schema(self):
+        """Test that texwatch_files has port and project params."""
+        server = create_server()
+        tools = await server.list_tools()
+        tool = next(t for t in tools if t.name == "texwatch_files")
+
+        schema = tool.inputSchema
+        props = schema.get("properties", {})
+        assert "port" in props
+        assert "project" in props
+
 
 # ---------------------------------------------------------------------------
 # TestCliMcpSubcommand — verify CLI integration
@@ -552,3 +690,270 @@ class TestCliMcpSubcommand:
 
         assert "mcp" in _DISPATCH
         assert _DISPATCH["mcp"] is cmd_mcp
+
+
+# ---------------------------------------------------------------------------
+# TestNewMcpTools — tests for activity, current, switch, history tools
+# ---------------------------------------------------------------------------
+
+
+class TestNewMcpTools:
+    """Tests for the new MCP tools: activity, current, switch, history."""
+
+    @pytest.mark.asyncio
+    async def test_activity_url(self):
+        """Test texwatch_activity calls correct URL."""
+        mock_resp = _mock_response(text='{"events":[]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_activity", {"port": 8765})
+
+            mock_client.get.assert_called_once_with(
+                "http://localhost:8765/activity",
+                params={"limit": 50},
+            )
+
+    @pytest.mark.asyncio
+    async def test_activity_with_type_filter(self):
+        """Test texwatch_activity with type filter."""
+        mock_resp = _mock_response(text='{"events":[]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_activity", {
+                "port": 8765, "type": "goto", "limit": 10,
+            })
+
+            mock_client.get.assert_called_once_with(
+                "http://localhost:8765/activity",
+                params={"limit": 10, "type": "goto"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_activity_with_project(self):
+        """Test texwatch_activity with project routes correctly."""
+        mock_resp = _mock_response(text='{"events":[]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_activity", {
+                "port": 8765, "project": "paper1",
+            })
+
+            mock_client.get.assert_called_once_with(
+                "http://localhost:8765/p/paper1/activity",
+                params={"limit": 50},
+            )
+
+    @pytest.mark.asyncio
+    async def test_current_url(self):
+        """Test texwatch_current calls /current."""
+        mock_resp = _mock_response(text='{"current":"thesis"}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_current", {"port": 8765})
+
+            mock_client.get.assert_called_once_with(
+                "http://localhost:8765/current",
+            )
+
+    @pytest.mark.asyncio
+    async def test_switch_url(self):
+        """Test texwatch_switch posts to /current."""
+        mock_resp = _mock_response(text='{"current":"thesis"}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_switch", {
+                "project": "thesis", "port": 8765,
+            })
+
+            mock_client.post.assert_called_once_with(
+                "http://localhost:8765/current",
+                json={"project": "thesis"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_history_url(self):
+        """Test texwatch_history calls correct URL."""
+        mock_resp = _mock_response(text='{"file":"main.tex","snapshots":[]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_history", {
+                "file": "main.tex", "port": 8765,
+            })
+
+            mock_client.get.assert_called_once_with(
+                "http://localhost:8765/history/main.tex",
+            )
+
+    @pytest.mark.asyncio
+    async def test_history_with_project(self):
+        """Test texwatch_history with project routes correctly."""
+        mock_resp = _mock_response(text='{"file":"main.tex","snapshots":[]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_history", {
+                "file": "intro.tex", "port": 8765, "project": "paper1",
+            })
+
+            mock_client.get.assert_called_once_with(
+                "http://localhost:8765/p/paper1/history/intro.tex",
+            )
+
+    @pytest.mark.asyncio
+    async def test_server_has_new_tools(self):
+        """Test that the server registers all new tools."""
+        server = create_server()
+        tools = await server.list_tools()
+        tool_names = {t.name for t in tools}
+
+        new_tools = {
+            "texwatch_activity",
+            "texwatch_current",
+            "texwatch_switch",
+            "texwatch_history",
+        }
+        assert new_tools.issubset(tool_names)
+
+
+# ---------------------------------------------------------------------------
+# Semantic extraction tools
+# ---------------------------------------------------------------------------
+
+
+class TestSemanticMcpTools:
+    """Tests for bibliography, environments, and digest MCP tools."""
+
+    @pytest.mark.asyncio
+    async def test_server_has_semantic_tools(self):
+        """Test that the server registers the semantic extraction tools."""
+        server = create_server()
+        tools = await server.list_tools()
+        tool_names = {t.name for t in tools}
+
+        semantic_tools = {
+            "texwatch_bibliography",
+            "texwatch_environments",
+            "texwatch_digest",
+        }
+        assert semantic_tools.issubset(tool_names)
+
+    @pytest.mark.asyncio
+    async def test_bibliography_url(self):
+        """Test texwatch_bibliography builds correct URL."""
+        mock_resp = _mock_response(text='{"entries":[]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            result = await _call_tool(server, "texwatch_bibliography", {"port": 8765})
+
+            mock_client.get.assert_called_once_with("http://localhost:8765/bibliography")
+
+    @pytest.mark.asyncio
+    async def test_bibliography_url_with_project(self):
+        """Test texwatch_bibliography builds correct URL with project."""
+        mock_resp = _mock_response(text='{"entries":[]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            result = await _call_tool(server, "texwatch_bibliography", {"port": 9000, "project": "paper1"})
+
+            mock_client.get.assert_called_once_with("http://localhost:9000/p/paper1/bibliography")
+
+    @pytest.mark.asyncio
+    async def test_environments_url(self):
+        """Test texwatch_environments builds correct URL."""
+        mock_resp = _mock_response(text='{"environments":[]}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            result = await _call_tool(server, "texwatch_environments", {"port": 8765})
+
+            mock_client.get.assert_called_once_with("http://localhost:8765/environments")
+
+    @pytest.mark.asyncio
+    async def test_digest_url(self):
+        """Test texwatch_digest builds correct URL."""
+        mock_resp = _mock_response(text='{"documentclass":"article"}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            result = await _call_tool(server, "texwatch_digest", {"port": 8765})
+
+            mock_client.get.assert_called_once_with("http://localhost:8765/digest")
+
+    @pytest.mark.asyncio
+    async def test_digest_url_with_project(self):
+        """Test texwatch_digest builds correct URL with project."""
+        mock_resp = _mock_response(text='{"documentclass":"article"}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            result = await _call_tool(server, "texwatch_digest", {"port": 8765, "project": "thesis"})
+
+            mock_client.get.assert_called_once_with("http://localhost:8765/p/thesis/digest")

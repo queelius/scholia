@@ -76,6 +76,20 @@ class TexWatchViewer {
             this.forceCompile();
         });
 
+        // Zoom controls
+        document.getElementById('btn-zoom-in').addEventListener('click', () => this.zoomIn());
+        document.getElementById('btn-zoom-out').addEventListener('click', () => this.zoomOut());
+        document.getElementById('zoom-select').addEventListener('change', (e) => {
+            const val = e.target.value;
+            if (val === 'fit-width') {
+                this.fitWidth();
+            } else if (val === 'fit-page') {
+                this.fitPage();
+            } else {
+                this.setZoom(parseFloat(val));
+            }
+        });
+
         // Scroll mode toggle
         document.getElementById('btn-scroll-mode').addEventListener('click', () => {
             this.toggleScrollMode();
@@ -1188,6 +1202,74 @@ class TexWatchViewer {
         _dbg('exitContinuousMode');
         this._teardownContinuous();
         this.container.classList.remove('continuous');
+    }
+
+    // ===================================================================
+    // Zoom controls
+    // ===================================================================
+
+    setZoom(newScale) {
+        newScale = Math.max(0.25, Math.min(5.0, newScale));
+        if (Math.abs(newScale - this.scale) < 0.001) return;
+
+        this.scale = newScale;
+        this._updateZoomDisplay();
+
+        if (this.scrollMode === 'continuous') {
+            if (this.pdfDoc) this.initContinuousMode();
+        } else {
+            if (this.pdfDoc) this.renderPage(this.currentPage);
+        }
+    }
+
+    zoomIn() {
+        this.setZoom(this.scale * 1.25);
+    }
+
+    zoomOut() {
+        this.setZoom(this.scale / 1.25);
+    }
+
+    async fitWidth() {
+        if (!this.pdfDoc) return;
+        const page = await this.pdfDoc.getPage(this.currentPage || 1);
+        const viewport = page.getViewport({ scale: 1.0 });
+        const paneWidth = this.viewerPane.clientWidth - 40; // minus padding
+        this.setZoom(paneWidth / viewport.width);
+    }
+
+    async fitPage() {
+        if (!this.pdfDoc) return;
+        const page = await this.pdfDoc.getPage(this.currentPage || 1);
+        const viewport = page.getViewport({ scale: 1.0 });
+        const paneWidth = this.viewerPane.clientWidth - 40;
+        const paneHeight = this.viewerPane.clientHeight - 40;
+        const scaleW = paneWidth / viewport.width;
+        const scaleH = paneHeight / viewport.height;
+        this.setZoom(Math.min(scaleW, scaleH));
+    }
+
+    _updateZoomDisplay() {
+        const pct = Math.round(this.scale * 100);
+        const span = document.getElementById('zoom-level');
+        if (span) span.textContent = pct + '%';
+
+        // Update select to match (or deselect if custom)
+        const select = document.getElementById('zoom-select');
+        if (!select) return;
+        const rounded = Math.round(this.scale * 100) / 100;
+        let matched = false;
+        for (const opt of select.options) {
+            if (opt.value !== 'fit-width' && opt.value !== 'fit-page' &&
+                Math.abs(parseFloat(opt.value) - rounded) < 0.01) {
+                select.value = opt.value;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            select.value = '';
+        }
     }
 }
 

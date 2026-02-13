@@ -50,15 +50,10 @@ class TexFileHandler(FileSystemEventHandler):
         relative = str(path_obj)
 
         for pattern in patterns:
-            # Try matching against filename and relative path
             if fnmatch.fnmatch(name, pattern):
                 return True
             if fnmatch.fnmatch(relative, pattern):
                 return True
-            # Handle ** patterns
-            if "**" in pattern:
-                if fnmatch.fnmatch(relative, pattern):
-                    return True
 
         return False
 
@@ -141,6 +136,17 @@ class TexFileHandler(FileSystemEventHandler):
             logger.info(f"File created: {src_path}")
             self._schedule_callback(src_path)
 
+    def update_debounce(self, last_compile_seconds: float) -> None:
+        """Adapt debounce interval based on compilation speed.
+
+        Fast compiles (<2s) → shorten debounce for responsiveness.
+        Slow compiles (>10s) → lengthen debounce to avoid re-triggering mid-compile.
+        """
+        if last_compile_seconds < 2.0:
+            self.debounce_seconds = max(0.3, self.debounce_seconds * 0.8)
+        elif last_compile_seconds > 10.0:
+            self.debounce_seconds = min(3.0, last_compile_seconds * 0.2)
+
 
 class TexWatcher:
     """Watch TeX files for changes and trigger recompilation."""
@@ -195,6 +201,9 @@ class TexWatcher:
 
     def stop(self) -> None:
         """Stop watching for file changes."""
+        if self._handler and self._handler._pending_task:
+            self._handler._pending_task.cancel()
+            self._handler._pending_task = None
         if self._observer:
             self._observer.stop()
             self._observer.join(timeout=5)

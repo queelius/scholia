@@ -9,15 +9,86 @@ from texwatch.structure import (
     DocumentStructure,
     InputFile,
     Section,
+    SectionStats,
+    StructureSummary,
     TodoItem,
+    _compute_section_stats,
+    _extract_braced,
     _find_tex_files,
     _get_word_count,
     _parse_inputs,
     _parse_sections,
     _parse_todos,
     _relative,
+    _strip_comment,
     parse_structure,
 )
+
+
+# ---------------------------------------------------------------------------
+# Shared helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractBraced:
+    """Tests for the _extract_braced helper."""
+
+    def test_simple(self):
+        assert _extract_braced("{hello}", 0) == ("hello", 7)
+
+    def test_nested(self):
+        assert _extract_braced("{a {b} c}", 0) == ("a {b} c", 9)
+
+    def test_deeply_nested(self):
+        assert _extract_braced("{a {b {c}} d}", 0) == ("a {b {c}} d", 13)
+
+    def test_offset(self):
+        assert _extract_braced("xx{val}yy", 2) == ("val", 7)
+
+    def test_no_opening_brace(self):
+        assert _extract_braced("hello", 0) is None
+
+    def test_unmatched(self):
+        assert _extract_braced("{no close", 0) is None
+
+    def test_out_of_bounds(self):
+        assert _extract_braced("", 0) is None
+        assert _extract_braced("x", 5) is None
+
+    def test_escaped_braces_ignored(self):
+        r"""Escaped braces \{ and \} should not affect depth counting."""
+        assert _extract_braced(r"{\{inner\}}", 0) == (r"\{inner\}", 11)
+
+    def test_escaped_brace_unbalanced(self):
+        r"""A lone \} inside braces should not close the group."""
+        assert _extract_braced(r"{use \} for end}", 0) == (r"use \} for end", 16)
+
+
+class TestStripComment:
+    """Tests for the _strip_comment helper."""
+
+    def test_full_comment(self):
+        assert _strip_comment("% comment") == ""
+
+    def test_inline_comment(self):
+        assert _strip_comment("text % comment") == "text "
+
+    def test_no_comment(self):
+        assert _strip_comment("no comment here") == "no comment here"
+
+    def test_escaped_percent(self):
+        assert _strip_comment("50\\% of data") == "50\\% of data"
+
+    def test_escaped_then_real(self):
+        assert _strip_comment("50\\% and % comment") == "50\\% and "
+
+    def test_double_backslash_then_percent(self):
+        r"""\\% means line-break + comment, not escaped percent."""
+        assert _strip_comment("text\\\\% comment") == "text\\\\"
+
+    def test_triple_backslash_then_percent(self):
+        r"""\\\% means line-break + literal percent."""
+        assert _strip_comment("text\\\\\\% data") == "text\\\\\\% data"
 
 
 # ---------------------------------------------------------------------------
@@ -581,3 +652,283 @@ class TestDocumentStructureDefaults:
         assert ds.todos == []
         assert ds.inputs == []
         assert ds.word_count is None
+        assert ds.section_stats == []
+        assert isinstance(ds.summary, StructureSummary)
+
+
+# ---------------------------------------------------------------------------
+# Section stats
+# ---------------------------------------------------------------------------
+
+
+class TestSectionStats:
+    """Tests for _compute_section_stats helper."""
+
+    def test_single_section_word_count(self):
+        sections = [Section(level="section", title="Intro", file="main.tex", line=1)]
+        todos: list[TodoItem] = []
+        contents = {"main.tex": "\\section{Intro}\nThis is some text with several words.\n"}
+        stats, summary = _compute_section_stats(sections, todos, contents)
+        assert len(stats) == 1
+        assert stats[0].section_title == "Intro"
+        assert stats[0].word_count > 0
+
+    def test_two_sections_splits_correctly(self):
+        sections = [
+            Section(level="section", title="A", file="main.tex", line=1),
+            Section(level="section", title="B", file="main.tex", line=3),
+        ]
+        contents = {
+            "main.tex": (
+                "\\section{A}\n"    # line 1
+                "Words in A.\n"     # line 2
+                "\\section{B}\n"    # line 3
+                "Words in B here.\n"  # line 4
+            ),
+        }
+        stats, summary = _compute_section_stats(sections, [], contents)
+        assert len(stats) == 2
+        assert stats[0].section_title == "A"
+        assert stats[0].start_line == 1
+        assert stats[0].end_line == 2  # before section B
+        assert stats[1].section_title == "B"
+        assert stats[1].start_line == 3
+        assert stats[1].end_line == 4  # EOF
+
+    def test_citation_counting(self):
+        sections = [Section(level="section", title="S", file="main.tex", line=1)]
+        contents = {
+            "main.tex": (
+                "\\section{S}\n"
+                "See \\cite{a,b} and \\citep{c}.\n"
+            ),
+        }
+        stats, summary = _compute_section_stats(sections, [], contents)
+        assert stats[0].citation_count == 3  # a, b, c
+        assert summary.total_citations == 3
+
+    def test_environment_counting(self):
+        sections = [Section(level="section", title="S", file="main.tex", line=1)]
+        contents = {
+            "main.tex": (
+                "\\section{S}\n"
+                "\\begin{equation}\nx=1\n\\end{equation}\n"
+                "\\begin{figure}\n\\end{figure}\n"
+                "\\begin{table}\n\\end{table}\n"
+            ),
+        }
+        stats, summary = _compute_section_stats(sections, [], contents)
+        assert stats[0].environment_counts.get("equation", 0) == 1
+        assert stats[0].figure_count == 1
+        assert stats[0].table_count == 1
+        assert summary.total_equations == 1
+        assert summary.total_figures == 1
+        assert summary.total_tables == 1
+
+    def test_todo_counting(self):
+        sections = [Section(level="section", title="S", file="main.tex", line=1)]
+        todos = [
+            TodoItem(text="fix", file="main.tex", line=2, tag="TODO"),
+            TodoItem(text="other", file="other.tex", line=2, tag="TODO"),
+        ]
+        contents = {"main.tex": "\\section{S}\n% TODO: fix\n"}
+        stats, summary = _compute_section_stats(sections, todos, contents)
+        assert stats[0].todo_count == 1
+        assert summary.total_todos == 2  # all todos, not just in-section
+
+    def test_no_sections_still_computes_summary(self):
+        contents = {
+            "main.tex": (
+                "\\begin{equation}\nx=1\n\\end{equation}\n"
+                "\\cite{a}\n"
+            ),
+        }
+        stats, summary = _compute_section_stats([], [], contents)
+        assert stats == []
+        assert summary.total_equations == 1
+        assert summary.total_citations == 1
+
+    def test_no_sections_counts_figures_tables(self):
+        """When there are no sections, the summary should still count
+        figures and tables from file contents via _accumulate_line_stats.
+
+        Covers the branches at lines 400-402 (iterating file_contents
+        when sections list is empty) including figure/table counting.
+        """
+        contents = {
+            "main.tex": (
+                "\\begin{figure}\n\\end{figure}\n"
+                "\\begin{figure*}\n\\end{figure*}\n"
+                "\\begin{table}\n\\end{table}\n"
+                "\\begin{table*}\n\\end{table*}\n"
+                "\\cite{a,b,c}\n"
+            ),
+        }
+        stats, summary = _compute_section_stats([], [], contents)
+        assert stats == []
+        assert summary.total_figures == 2
+        assert summary.total_tables == 2
+        assert summary.total_citations == 3
+
+    def test_section_beyond_eof_clamped(self):
+        """When a section's line number exceeds total lines, start_line
+        should be clamped to total_lines.
+
+        Covers the branch at line 416: min(sec.line, total_lines).
+        """
+        sections = [Section(level="section", title="Ghost", file="main.tex", line=999)]
+        contents = {"main.tex": "Just one line.\n"}
+        stats, summary = _compute_section_stats(sections, [], contents)
+        assert len(stats) == 1
+        # start_line should be clamped to the file length
+        assert stats[0].start_line <= 1
+
+    def test_sections_across_files(self):
+        sections = [
+            Section(level="section", title="A", file="a.tex", line=1),
+            Section(level="section", title="B", file="b.tex", line=1),
+        ]
+        contents = {
+            "a.tex": "\\section{A}\nWords in file A.\n",
+            "b.tex": "\\section{B}\nWords in file B.\n",
+        }
+        stats, summary = _compute_section_stats(sections, [], contents)
+        assert len(stats) == 2
+        assert stats[0].section_file == "a.tex"
+        assert stats[1].section_file == "b.tex"
+
+    def test_integration_with_parse_structure(self, tmp_path):
+        """Section stats are populated through parse_structure."""
+        main = tmp_path / "main.tex"
+        main.write_text(
+            "\\section{Introduction}\n"
+            "Some introductory text here.\n"
+            "\\cite{ref2020}\n"
+            "\\section{Methods}\n"
+            "\\begin{equation}\nx=1\n\\end{equation}\n"
+            "% TODO: add more\n"
+        )
+        with patch("texwatch.structure._get_word_count", return_value=None):
+            ds = parse_structure(main, tmp_path)
+        assert len(ds.section_stats) == 2
+        assert ds.section_stats[0].section_title == "Introduction"
+        assert ds.section_stats[0].citation_count >= 1
+        assert ds.section_stats[1].section_title == "Methods"
+        assert ds.section_stats[1].todo_count == 1
+        assert ds.summary.total_todos == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression tests — comment handling and nested braces
+# ---------------------------------------------------------------------------
+
+
+class TestSectionCommentHandling:
+    """Regression tests for comment filtering in _parse_sections."""
+
+    def test_commented_section_ignored(self):
+        """A commented-out \\section should not appear in results."""
+        content = "% \\section{Old Title}\n\\section{Real Title}\n"
+        result = _parse_sections(content, "main.tex")
+        assert len(result) == 1
+        assert result[0].title == "Real Title"
+
+    def test_inline_comment_hides_section(self):
+        """A \\section after inline % should be ignored."""
+        content = "text here % \\section{Hidden}\n"
+        result = _parse_sections(content, "main.tex")
+        assert result == []
+
+    def test_section_with_nested_braces(self):
+        """Section title containing nested braces should not truncate."""
+        content = "\\section{The $O(n^{2})$ Algorithm}\n"
+        result = _parse_sections(content, "main.tex")
+        assert len(result) == 1
+        assert result[0].title == "The $O(n^{2})$ Algorithm"
+
+    def test_section_with_textbf(self):
+        """Section title containing \\textbf with nested braces."""
+        content = "\\section{A \\textbf{Bold} Claim}\n"
+        result = _parse_sections(content, "main.tex")
+        assert len(result) == 1
+        assert result[0].title == "A \\textbf{Bold} Claim"
+
+    def test_subsection_with_math(self):
+        """Subsection title with inline math containing braces."""
+        content = "\\subsection{Analysis of $f(x) = \\frac{1}{x}$}\n"
+        result = _parse_sections(content, "main.tex")
+        assert len(result) == 1
+        assert "\\frac{1}{x}" in result[0].title
+
+
+class TestInputCommentHandling:
+    """Regression tests for comment filtering in _parse_inputs."""
+
+    def test_commented_input_ignored(self):
+        """A commented-out \\input should not appear in results."""
+        content = "% \\input{deleted_chapter}\n\\input{real_chapter}\n"
+        result = _parse_inputs(content, "main.tex")
+        assert len(result) == 1
+        assert result[0].path == "real_chapter"
+
+    def test_inline_comment_hides_input(self):
+        """An \\input after inline % should be ignored."""
+        content = "text here % \\input{hidden}\n"
+        result = _parse_inputs(content, "main.tex")
+        assert result == []
+
+
+class TestStatsCommentHandling:
+    """Regression tests for comment filtering in _compute_section_stats."""
+
+    def test_commented_cite_not_counted(self):
+        """A commented-out \\cite should not inflate citation count."""
+        sections = [Section(level="section", title="Intro", file="main.tex", line=1)]
+        contents = {
+            "main.tex": (
+                "\\section{Intro}\n"
+                "Real citation \\cite{real}\n"
+                "% \\cite{commented_out}\n"
+            ),
+        }
+        stats, summary = _compute_section_stats(sections, [], contents)
+        assert stats[0].citation_count == 1
+        assert summary.total_citations == 1
+
+    def test_commented_begin_not_counted(self):
+        """A commented-out \\begin{figure} should not inflate counts."""
+        sections = [Section(level="section", title="Intro", file="main.tex", line=1)]
+        contents = {
+            "main.tex": (
+                "\\section{Intro}\n"
+                "% \\begin{figure}\n"
+                "% \\end{figure}\n"
+            ),
+        }
+        stats, summary = _compute_section_stats(sections, [], contents)
+        assert stats[0].figure_count == 0
+        assert summary.total_figures == 0
+
+    def test_no_sections_commented_cite_not_counted(self):
+        """In no-sections path, commented \\cite should not inflate counts."""
+        contents = {
+            "main.tex": (
+                "Real citation \\cite{real}\n"
+                "% \\cite{commented_out}\n"
+                "Inline comment \\cite{also_real} % \\cite{inline_hidden}\n"
+            ),
+        }
+        stats, summary = _compute_section_stats([], [], contents)
+        assert summary.total_citations == 2
+
+    def test_inline_comment_cite_not_counted(self):
+        """A \\cite in an inline comment should not be counted."""
+        sections = [Section(level="section", title="Intro", file="main.tex", line=1)]
+        contents = {
+            "main.tex": (
+                "\\section{Intro}\n"
+                "Some text \\cite{real} % \\cite{hidden}\n"
+            ),
+        }
+        stats, summary = _compute_section_stats(sections, [], contents)
+        assert stats[0].citation_count == 1

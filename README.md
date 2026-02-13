@@ -129,9 +129,9 @@ texwatch includes an MCP server that exposes your document state to Claude Code.
 }
 ```
 
-Available tools: `texwatch_status`, `texwatch_context`, `texwatch_errors`, `texwatch_structure`, `texwatch_goto`, `texwatch_compile`, `texwatch_capture`, `texwatch_source`.
+Available tools: `texwatch_status`, `texwatch_context`, `texwatch_errors`, `texwatch_structure`, `texwatch_goto`, `texwatch_compile`, `texwatch_capture`, `texwatch_source`, `texwatch_write_source`, `texwatch_files`.
 
-This lets Claude see your current page, section, compile errors (with source context), and word count -- and navigate or recompile for you.
+This lets Claude see your current page, section, compile errors (with source context), and word count -- navigate or recompile for you -- and read/write source files directly.
 
 ## CLI reference
 

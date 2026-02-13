@@ -36,20 +36,27 @@ class APIResponse:
         data: Response body (dict for JSON, bytes for binary).
         error: Error message if request failed.
         server_down: True if the server is not running.
+        auto_project: Project name when server auto-selected via current pointer.
     """
 
     status: int
     data: dict | bytes | None = None
     error: str | None = None
     server_down: bool = False
+    auto_project: str | None = None
 
 
 def _handle_http_error(e: HTTPError) -> APIResponse:
     """Convert HTTPError to APIResponse with error message."""
     try:
-        body = json.loads(e.read().decode())
-        error_msg = body.get("error", f"HTTP {e.code}")
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        raw = e.read().decode()
+        try:
+            body = json.loads(raw)
+            error_msg = body.get("error", f"HTTP {e.code}")
+        except json.JSONDecodeError:
+            # Plain text error (e.g. "Multi-project server: use /p/{name}/files")
+            error_msg = raw.strip() if raw.strip() else f"HTTP {e.code}"
+    except UnicodeDecodeError:
         error_msg = f"HTTP {e.code}"
     return APIResponse(status=e.code, error=error_msg)
 
@@ -66,13 +73,14 @@ def _api_get(
         url = f"http://localhost:{port}{prefix}{path}"
         with urlopen(url, timeout=timeout) as response:
             content_type = response.headers.get("Content-Type", "")
+            auto_project = response.headers.get("X-Texwatch-Project")
             raw = response.read()
             if "application/json" in content_type:
-                return APIResponse(status=response.status, data=json.loads(raw.decode()))
-            elif "image/" in content_type:
-                return APIResponse(status=response.status, data=raw)
+                data = json.loads(raw.decode())
             else:
-                return APIResponse(status=response.status, data=raw)
+                data = raw
+            return APIResponse(status=response.status, data=data,
+                               auto_project=auto_project)
     except HTTPError as e:
         return _handle_http_error(e)
     except URLError:
@@ -96,8 +104,10 @@ def _api_post(
             method="POST",
         )
         with urlopen(req, timeout=timeout) as response:
+            auto_project = response.headers.get("X-Texwatch-Project")
             result = json.loads(response.read().decode())
-            return APIResponse(status=response.status, data=result)
+            return APIResponse(status=response.status, data=result,
+                               auto_project=auto_project)
     except HTTPError as e:
         return _handle_http_error(e)
     except URLError:
@@ -105,7 +115,7 @@ def _api_post(
 
 
 # ---------------------------------------------------------------------------
-# Legacy helpers (kept for public API / test compatibility)
+# Public helpers
 # ---------------------------------------------------------------------------
 
 
@@ -134,17 +144,17 @@ def get_status(port: int = 8765) -> dict | None:
     return None
 
 
-def send_goto(target: str, port: int = 8765) -> GotoResult:
-    """Send goto command to running instance."""
-    data: dict
+def _parse_goto_target(target: str) -> dict:
+    """Parse a goto target string into a request payload dict."""
     if target.isdigit():
-        data = {"line": int(target)}
-    elif target.startswith("p") and target[1:].isdigit():
-        data = {"page": int(target[1:])}
-    else:
-        data = {"section": target}
+        return {"line": int(target)}
+    if target.startswith("p") and target[1:].isdigit():
+        return {"page": int(target[1:])}
+    return {"section": target}
 
-    resp = _api_post("/goto", data, port=port)
+
+def _goto_response_to_result(resp: APIResponse) -> GotoResult:
+    """Convert an APIResponse from /goto into a GotoResult."""
     if resp.server_down:
         return GotoResult(success=False, server_down=True)
     if resp.error:
@@ -152,6 +162,12 @@ def send_goto(target: str, port: int = 8765) -> GotoResult:
     if isinstance(resp.data, dict):
         return GotoResult(success=resp.data.get("success", False))
     return GotoResult(success=False, error="Unexpected response")
+
+
+def send_goto(target: str, port: int = 8765) -> GotoResult:
+    """Send goto command to running instance."""
+    resp = _api_post("/goto", _parse_goto_target(target), port=port)
+    return _goto_response_to_result(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +228,47 @@ def _get_project(args: argparse.Namespace) -> str | None:
     return getattr(args, "project", None) or None
 
 
+def _detect_multi_project(args: argparse.Namespace) -> list[str] | None:
+    """Probe /projects. Return project names if multi-project, else None."""
+    probe = _api_get("/projects", port=args.port)
+    if probe.server_down or not isinstance(probe.data, dict):
+        return None
+    projects = probe.data.get("projects", [])
+    if len(projects) <= 1:
+        return None
+    return [p["name"] for p in projects]
+
+
+def _print_multi_project_required(command: str, project_names: list[str]) -> None:
+    """Print helpful error when a command requires --project in multi-project mode."""
+    print(f"Error: {command} requires --project in multi-project mode.")
+    print("Available projects:")
+    for name in project_names:
+        print(f"  {name}")
+
+
+def _reject_if_multi_project(
+    command: str, args: argparse.Namespace,
+) -> int | None:
+    """Return EXIT_FAIL if the server is multi-project and --project is not set.
+
+    Returns None when the command may proceed (single-project or --project given).
+    """
+    if _get_project(args):
+        return None
+    project_names = _detect_multi_project(args)
+    if project_names is None:
+        return None
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "error": f"{command} requires --project in multi-project mode",
+            "projects": project_names,
+        }))
+    else:
+        _print_multi_project_required(command, project_names)
+    return EXIT_FAIL
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """Handle status command."""
     project = _get_project(args)
@@ -224,7 +281,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         resp = _api_get("/projects", port=args.port)
         if not resp.server_down and isinstance(resp.data, dict) and "projects" in resp.data:
             return _print_all_projects_status(resp.data, args)
-        # Fall back to legacy single-project status
+        # Fall back to single-project status
         resp = _api_get("/status", port=args.port)
 
     if resp.server_down:
@@ -311,6 +368,13 @@ def _print_all_projects_status(data: dict, args: argparse.Namespace) -> int:
 def cmd_view(args: argparse.Namespace) -> int:
     """Handle view command."""
     project = _get_project(args)
+
+    # Multi-project aggregate when no --project
+    if not project:
+        project_names = _detect_multi_project(args)
+        if project_names is not None:
+            return _view_all_projects(project_names, args)
+
     resp = _api_get("/status", port=args.port, project=project)
     if resp.server_down:
         if getattr(args, "json", False):
@@ -355,30 +419,58 @@ def cmd_view(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _view_all_projects(project_names: list[str], args: argparse.Namespace) -> int:
+    """Show viewer state for all projects."""
+    all_views: dict = {}
+    for name in project_names:
+        resp = _api_get("/status", port=args.port, project=name)
+        if resp.error or not isinstance(resp.data, dict):
+            all_views[name] = {"error": resp.error or "unknown"}
+            continue
+        status = resp.data
+        all_views[name] = {
+            "main_file": status.get("file"),
+            "editor": status.get("editor", {}),
+            "viewer": status.get("viewer", {}),
+        }
+
+    if getattr(args, "json", False):
+        print(json.dumps(all_views))
+        return EXIT_OK
+
+    for name, view in all_views.items():
+        print(f"{name}:")
+        if "error" in view:
+            print(f"  (error: {view['error']})")
+            continue
+        editor = view.get("editor", {})
+        viewer = view.get("viewer", {})
+        file_str = editor.get("file") or "(no file)"
+        line_str = f":{editor['line']}" if editor.get("line") else ""
+        page_str = ""
+        if viewer.get("page"):
+            page_str = f"Page {viewer['page']}/{viewer.get('total_pages', '?')}"
+        print(f"  File: {file_str}{line_str}  {page_str}")
+
+    return EXIT_OK
+
+
+def _print_auto_project(resp: APIResponse) -> None:
+    """Print auto-selected project hint if present."""
+    if resp.auto_project:
+        print(f"(using project: {resp.auto_project})")
+
+
 def cmd_goto(args: argparse.Namespace) -> int:
     """Handle goto command."""
-    project = _get_project(args)
-    result = send_goto(args.target, args.port)
+    rejected = _reject_if_multi_project("goto", args)
+    if rejected is not None:
+        return rejected
 
-    if project:
-        # Use project-aware API
-        data: dict
-        target = args.target
-        if target.isdigit():
-            data = {"line": int(target)}
-        elif target.startswith("p") and target[1:].isdigit():
-            data = {"page": int(target[1:])}
-        else:
-            data = {"section": target}
-        resp = _api_post("/goto", data, port=args.port, project=project)
-        if resp.server_down:
-            result = GotoResult(success=False, server_down=True)
-        elif resp.error:
-            result = GotoResult(success=False, error=resp.error)
-        elif isinstance(resp.data, dict):
-            result = GotoResult(success=resp.data.get("success", False))
-        else:
-            result = GotoResult(success=False, error="Unexpected response")
+    project = _get_project(args)
+    data = _parse_goto_target(args.target)
+    resp = _api_post("/goto", data, port=args.port, project=project)
+    result = _goto_response_to_result(resp)
 
     if result.server_down:
         if getattr(args, "json", False):
@@ -396,18 +488,23 @@ def cmd_goto(args: argparse.Namespace) -> int:
         }))
         return EXIT_OK if result.success else EXIT_FAIL
 
+    _print_auto_project(resp)
     if result.success:
         print(f"Navigated to: {args.target}")
         return EXIT_OK
-    else:
-        print(f"Failed to navigate to: {args.target}")
-        if result.error:
-            print(result.error)
-        return EXIT_FAIL
+
+    print(f"Failed to navigate to: {args.target}")
+    if result.error:
+        print(result.error)
+    return EXIT_FAIL
 
 
 def cmd_capture(args: argparse.Namespace) -> int:
     """Handle capture command."""
+    rejected = _reject_if_multi_project("capture", args)
+    if rejected is not None:
+        return rejected
+
     project = _get_project(args)
     params = []
     if getattr(args, "page", None) is not None:
@@ -438,6 +535,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
         if getattr(args, "json", False):
             print(json.dumps({"saved": args.output, "bytes": len(resp.data)}))
         else:
+            _print_auto_project(resp)
             print(f"Saved: {args.output}")
         return EXIT_OK
 
@@ -456,6 +554,13 @@ def cmd_capture(args: argparse.Namespace) -> int:
 def cmd_compile(args: argparse.Namespace) -> int:
     """Handle compile command."""
     project = _get_project(args)
+
+    # Multi-project mode without --project: compile all via aggregate /compile
+    if not project:
+        project_names = _detect_multi_project(args)
+        if project_names is not None:
+            return _compile_all_projects(args)
+
     resp = _api_post("/compile", {}, port=args.port, project=project)
 
     if resp.server_down:
@@ -503,6 +608,51 @@ def cmd_compile(args: argparse.Namespace) -> int:
                 print(f"  ... and {len(warnings) - 5} more")
 
     return EXIT_OK if success else EXIT_FAIL
+
+
+def _compile_all_projects(args: argparse.Namespace) -> int:
+    """Compile all projects via the aggregate /compile endpoint."""
+    resp = _api_post("/compile", {}, port=args.port)
+
+    if resp.server_down:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": "server not running", "port": args.port}))
+        else:
+            _print_server_down(args.port)
+        return EXIT_SERVER_DOWN
+
+    if resp.error:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": resp.error}))
+        else:
+            print(f"Compile failed: {resp.error}")
+        return EXIT_FAIL
+
+    data = resp.data if isinstance(resp.data, dict) else {}
+
+    if getattr(args, "json", False):
+        print(json.dumps(data))
+        return EXIT_OK
+
+    projects = data.get("projects", {})
+    all_ok = True
+    for name, result in projects.items():
+        if result is None:
+            print(f"  {name}: no result")
+            all_ok = False
+            continue
+        success = result.get("success", False)
+        if not success:
+            all_ok = False
+        duration = result.get("duration_seconds")
+        dur_str = f" ({duration:.1f}s)" if duration is not None else ""
+        err_count = len(result.get("errors", []))
+        if success:
+            print(f"  {name}: ok{dur_str}")
+        else:
+            print(f"  {name}: failed, {err_count} errors{dur_str}")
+
+    return EXIT_OK if all_ok else EXIT_FAIL
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -614,9 +764,70 @@ def cmd_config(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _print_file_tree(entries: list, prefix: str = "") -> None:
+    """Print a file tree with box-drawing connectors."""
+    for i, entry in enumerate(entries):
+        is_last = i == len(entries) - 1
+        connector = "└── " if is_last else "├── "
+        name = entry.get("name", "?")
+        print(f"{prefix}{connector}{name}")
+        children = entry.get("children", entry.get("entries", []))
+        if children:
+            extension = "    " if is_last else "│   "
+            _print_file_tree(children, prefix + extension)
+
+
+def _extract_file_entries(data: object) -> list:
+    """Extract file entries from a /files response."""
+    if isinstance(data, dict):
+        entries = data.get("entries") or data.get("children") or []
+        return entries  # type: ignore[return-value]
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _files_all_projects(data: dict, args: argparse.Namespace) -> int:
+    """List files for all projects in multi-project mode."""
+    projects = data.get("projects", [])
+
+    if getattr(args, "json", False):
+        all_files: dict = {}
+        for p in projects:
+            name = p.get("name", "?")
+            resp = _api_get("/files", port=args.port, project=name)
+            if not resp.error:
+                all_files[name] = resp.data
+        print(json.dumps(all_files))
+        return EXIT_OK
+
+    for p in projects:
+        name = p.get("name", "?")
+        resp = _api_get("/files", port=args.port, project=name)
+        print(f"{name}/")
+        if resp.error:
+            print(f"  (error: {resp.error})")
+            continue
+
+        entries = _extract_file_entries(resp.data)
+        if entries:
+            _print_file_tree(entries, prefix="  ")
+        else:
+            print("  (no files)")
+
+    return EXIT_OK
+
+
 def cmd_files(args: argparse.Namespace) -> int:
     """Handle files command."""
     project = _get_project(args)
+
+    # In multi-project mode without --project, list files for all projects
+    if not project:
+        probe = _api_get("/projects", port=args.port)
+        if not probe.server_down and isinstance(probe.data, dict) and "projects" in probe.data:
+            return _files_all_projects(probe.data, args)
+
     resp = _api_get("/files", port=args.port, project=project)
 
     if resp.server_down:
@@ -640,28 +851,198 @@ def cmd_files(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     # Tree-formatted output
-    if isinstance(data, dict):
-        entries = data.get("entries", data.get("children", []))
-    elif isinstance(data, list):
-        entries = data
-    else:
-        entries = []
-
-    def _print_tree(entries: list, prefix: str = "") -> None:
-        for i, entry in enumerate(entries):
-            is_last = i == len(entries) - 1
-            connector = "└── " if is_last else "├── "
-            name = entry.get("name", "?")
-            print(f"{prefix}{connector}{name}")
-            children = entry.get("children", entry.get("entries", []))
-            if children:
-                extension = "    " if is_last else "│   "
-                _print_tree(children, prefix + extension)
-
+    entries = _extract_file_entries(data)
     if entries:
-        _print_tree(entries)
+        _print_file_tree(entries)
     else:
         print("No files found")
+
+    return EXIT_OK
+
+
+def cmd_activity(args: argparse.Namespace) -> int:
+    """Handle activity command — show recent events."""
+    params = []
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        params.append(f"limit={limit}")
+    event_type = getattr(args, "type", None)
+    if event_type:
+        params.append(f"type={event_type}")
+    query = f"?{'&'.join(params)}" if params else ""
+
+    result = _fetch_endpoint(f"/activity{query}", "activity", args, reject_multi=False)
+    if isinstance(result, int):
+        return result
+    data, _ = result
+
+    events = data.get("events", [])
+    if not events:
+        print("No activity recorded yet")
+        return EXIT_OK
+
+    for ev in events:
+        ts = ev.get("timestamp", "?")
+        if "T" in ts:
+            ts = ts.split("T")[1][:8]
+        etype = ev.get("type", "?")
+        proj_name = ev.get("project", "")
+        extra_parts = [
+            f"{k}={v}" for k, v in ev.items()
+            if k not in ("type", "timestamp", "project")
+        ]
+        extra = " ".join(extra_parts)
+        print(f"  {ts}  {proj_name:<16s} {etype:<16s} {extra}")
+
+    return EXIT_OK
+
+
+def _fetch_endpoint(
+    endpoint: str,
+    command_name: str,
+    args: argparse.Namespace,
+    *,
+    reject_multi: bool = True,
+) -> tuple[dict, APIResponse] | int:
+    """Fetch a JSON endpoint with standard error handling.
+
+    Handles multi-project rejection, server-down, HTTP errors, and JSON
+    output mode.  Returns either the parsed (data, response) tuple on
+    success, or an exit code on failure.
+    """
+    if reject_multi:
+        rejected = _reject_if_multi_project(command_name, args)
+        if rejected is not None:
+            return rejected
+
+    project = _get_project(args)
+    resp = _api_get(endpoint, port=args.port, project=project)
+
+    if resp.server_down:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": "server not running", "port": args.port}))
+        else:
+            _print_server_down(args.port)
+        return EXIT_SERVER_DOWN
+
+    if resp.error:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": resp.error}))
+        else:
+            print(f"Failed to get {command_name}: {resp.error}")
+        return EXIT_FAIL
+
+    data = resp.data
+    if not isinstance(data, dict):
+        return EXIT_FAIL
+
+    if getattr(args, "json", False):
+        print(json.dumps(data))
+        return EXIT_OK
+
+    _print_auto_project(resp)
+    return data, resp
+
+
+def cmd_bibliography(args: argparse.Namespace) -> int:
+    """Handle bibliography command — show bibliography analysis."""
+    result = _fetch_endpoint("/bibliography", "bibliography", args)
+    if isinstance(result, int):
+        return result
+    data, _ = result
+
+    entries = data.get("entries", [])
+    citations = data.get("citations", [])
+    uncited = data.get("uncited_keys", [])
+    undefined = data.get("undefined_keys", [])
+
+    print(f"Bibliography entries: {len(entries)}")
+    for e in entries:
+        fields = e.get("fields", {})
+        author = fields.get("author", "")
+        year = fields.get("year", "")
+        title = fields.get("title", "")
+        print(f"  [{e['key']}] {author} ({year}) {title}")
+
+    print(f"\nCitations: {len(citations)}")
+
+    if uncited:
+        print(f"\nUncited entries ({len(uncited)}):")
+        for key in uncited:
+            print(f"  {key}")
+
+    if undefined:
+        print(f"\nUndefined citations ({len(undefined)}):")
+        for key in undefined:
+            print(f"  {key}")
+
+    return EXIT_OK
+
+
+def cmd_environments(args: argparse.Namespace) -> int:
+    """Handle environments command — list LaTeX environments."""
+    result = _fetch_endpoint("/environments", "environments", args)
+    if isinstance(result, int):
+        return result
+    data, _ = result
+
+    envs = data.get("environments", [])
+
+    if not envs:
+        print("No tracked environments found")
+        return EXIT_OK
+
+    print(f"Environments ({len(envs)}):")
+    for e in envs:
+        label_str = f" [{e['label']}]" if e.get("label") else ""
+        name_str = f" \"{e['name']}\"" if e.get("name") else ""
+        caption_str = f" — {e['caption']}" if e.get("caption") else ""
+        lines_str = f"{e['start_line']}"
+        if e.get("end_line"):
+            lines_str += f"-{e['end_line']}"
+        print(f"  {e['env_type']}{name_str}{label_str}{caption_str}  ({e['file']}:{lines_str})")
+
+    return EXIT_OK
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    """Handle digest command — show document metadata."""
+    result = _fetch_endpoint("/digest", "digest", args)
+    if isinstance(result, int):
+        return result
+    data, _ = result
+
+    if data.get("documentclass"):
+        opts = ", ".join(data.get("class_options", []))
+        opts_str = f"[{opts}]" if opts else ""
+        print(f"Document class: {data['documentclass']}{opts_str}")
+
+    if data.get("title"):
+        print(f"Title: {data['title']}")
+    if data.get("author"):
+        print(f"Author: {data['author']}")
+    if data.get("date"):
+        print(f"Date: {data['date']}")
+
+    packages = data.get("packages", [])
+    if packages:
+        print(f"\nPackages ({len(packages)}):")
+        for p in packages:
+            opts_str = f"[{p['options']}]" if p.get("options") else ""
+            print(f"  {p['name']}{opts_str}")
+
+    commands = data.get("commands", [])
+    if commands:
+        print(f"\nCustom commands ({len(commands)}):")
+        for c in commands:
+            args_str = f"[{c['args']}]" if c.get("args") is not None else ""
+            print(f"  {c['name']}{args_str} = {c['definition']}")
+
+    if data.get("abstract"):
+        abstract = data["abstract"]
+        if len(abstract) > 200:
+            abstract = abstract[:200] + "..."
+        print(f"\nAbstract: {abstract}")
 
     return EXIT_OK
 
@@ -859,6 +1240,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_files = subparsers.add_parser("files", help="List project file tree")
     _add_server_options(p_files)
 
+    # --- activity ---
+    p_activity = subparsers.add_parser("activity", help="Show recent activity events")
+    p_activity.add_argument("--type", type=str, default=None,
+                            help="Filter by event type (e.g. compile_finish, goto, page_view)")
+    p_activity.add_argument("--limit", type=int, default=None,
+                            help="Maximum number of events (default: 50)")
+    _add_server_options(p_activity)
+
+    # --- bibliography ---
+    p_bib = subparsers.add_parser("bibliography", help="Show bibliography analysis")
+    _add_server_options(p_bib)
+
+    # --- environments ---
+    p_envs = subparsers.add_parser("environments", help="List LaTeX environments")
+    _add_server_options(p_envs)
+
+    # --- digest ---
+    p_digest = subparsers.add_parser("digest", help="Show document metadata")
+    _add_server_options(p_digest)
+
     # --- scan ---
     p_scan = subparsers.add_parser("scan", help="List projects (directories with .texwatch.yaml)")
     p_scan.add_argument("directory", help="Directory to scan")
@@ -895,6 +1296,10 @@ _DISPATCH = {
     "capture": cmd_capture,
     "config": cmd_config,
     "files": cmd_files,
+    "activity": cmd_activity,
+    "bibliography": cmd_bibliography,
+    "environments": cmd_environments,
+    "digest": cmd_digest,
     "scan": cmd_scan,
     "serve": cmd_serve,
     "mcp": cmd_mcp,

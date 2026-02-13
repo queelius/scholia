@@ -28,6 +28,19 @@
         </div>
         <div class="header-right">
             <span id="status-indicator" class="status watching">Watching</span>
+            <div class="zoom-controls">
+                <button id="btn-zoom-out" title="Zoom out">&#x2212;</button>
+                <span id="zoom-level">150%</span>
+                <button id="btn-zoom-in" title="Zoom in">&#x2b;</button>
+                <select id="zoom-select" title="Zoom preset">
+                    <option value="fit-width">Fit width</option>
+                    <option value="fit-page">Fit page</option>
+                    <option value="0.75">75%</option>
+                    <option value="1.0">100%</option>
+                    <option value="1.5" selected>150%</option>
+                    <option value="2.0">200%</option>
+                </select>
+            </div>
             <button id="btn-scroll-mode" title="Toggle continuous scroll">&#x2195;</button>
             <button id="btn-refresh" title="Force recompile">&#x21bb;</button>
             <button id="btn-settings" title="Settings">&#x2699;</button>

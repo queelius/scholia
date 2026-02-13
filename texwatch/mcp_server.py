@@ -45,6 +45,14 @@ def _base_url(port: int, project: str | None) -> str:
     return base
 
 
+async def _get(endpoint: str, port: int, project: str | None = None) -> str:
+    """GET a texwatch endpoint and return the response text."""
+    base = _base_url(port, project)
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{base}{endpoint}")
+        return resp.text
+
+
 def create_server() -> "FastMCP":
     """Create and configure the MCP server with all tools."""
     _check_deps()
@@ -54,34 +62,22 @@ def create_server() -> "FastMCP":
     @mcp.tool()
     async def texwatch_status(port: int = 8765, project: str | None = None) -> str:
         """Get compilation status, errors, and warnings from the running texwatch instance."""
-        base = _base_url(port, project)
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{base}/status")
-            return resp.text
+        return await _get("/status", port, project)
 
     @mcp.tool()
     async def texwatch_context(port: int = 8765, project: str | None = None) -> str:
         """Get what the user is currently looking at: editor position, viewer page, current section, and compile status."""
-        base = _base_url(port, project)
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{base}/context")
-            return resp.text
+        return await _get("/context", port, project)
 
     @mcp.tool()
     async def texwatch_errors(port: int = 8765, project: str | None = None) -> str:
         """Get compilation errors with source context lines."""
-        base = _base_url(port, project)
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{base}/errors")
-            return resp.text
+        return await _get("/errors", port, project)
 
     @mcp.tool()
     async def texwatch_structure(port: int = 8765, project: str | None = None) -> str:
         """Get paper outline: sections, TODOs, input files, and word count."""
-        base = _base_url(port, project)
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{base}/structure")
-            return resp.text
+        return await _get("/structure", port, project)
 
     @mcp.tool()
     async def texwatch_goto(
@@ -92,7 +88,6 @@ def create_server() -> "FastMCP":
         project: str | None = None,
     ) -> str:
         """Navigate the PDF viewer to a specific line, page, or section. Exactly one of line, page, or section must be provided."""
-        # Validate: exactly one target must be specified
         targets = [x for x in (line, page, section) if x is not None]
         if len(targets) != 1:
             return json.dumps({"error": "Exactly one of line, page, or section must be provided"})
@@ -126,10 +121,9 @@ def create_server() -> "FastMCP":
         project: str | None = None,
     ) -> list[TextContent | ImageContent]:
         """Screenshot current PDF page as PNG image. Returns the image as base64-encoded data."""
-        params: dict = {}
+        params: dict = {"dpi": dpi}
         if page is not None:
             params["page"] = page
-        params["dpi"] = dpi
 
         base = _base_url(port, project)
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -137,16 +131,8 @@ def create_server() -> "FastMCP":
 
             if resp.headers.get("content-type", "").startswith("image/"):
                 b64_data = base64.b64encode(resp.content).decode("ascii")
-                return [
-                    ImageContent(
-                        type="image",
-                        data=b64_data,
-                        mimeType="image/png",
-                    )
-                ]
-            else:
-                # Error response (JSON)
-                return [TextContent(type="text", text=resp.text)]
+                return [ImageContent(type="image", data=b64_data, mimeType="image/png")]
+            return [TextContent(type="text", text=resp.text)]
 
     @mcp.tool()
     async def texwatch_source(
@@ -163,6 +149,88 @@ def create_server() -> "FastMCP":
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{base}/source", params=params)
             return resp.text
+
+    @mcp.tool()
+    async def texwatch_write_source(
+        file: str,
+        content: str,
+        base_mtime_ns: str | None = None,
+        port: int = 8765,
+        project: str | None = None,
+    ) -> str:
+        """Write content to a source file. Provide base_mtime_ns for conflict detection."""
+        base = _base_url(port, project)
+        data: dict = {"file": file, "content": content}
+        if base_mtime_ns is not None:
+            data["base_mtime_ns"] = base_mtime_ns
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(f"{base}/source", json=data)
+            return resp.text
+
+    @mcp.tool()
+    async def texwatch_files(port: int = 8765, project: str | None = None) -> str:
+        """List all project source files (TeX, BibTeX, etc.)."""
+        return await _get("/files", port, project)
+
+    @mcp.tool()
+    async def texwatch_activity(
+        limit: int = 50,
+        type: str | None = None,
+        port: int = 8765,
+        project: str | None = None,
+    ) -> str:
+        """Get recent activity events: compilations, navigations, edits, page views. Filter by type (compile_start, compile_finish, goto, page_view, file_edit, capture, source_read, source_write, click)."""
+        base = _base_url(port, project)
+        params: dict = {"limit": limit}
+        if type is not None:
+            params["type"] = type
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{base}/activity", params=params)
+            return resp.text
+
+    @mcp.tool()
+    async def texwatch_current(port: int = 8765) -> str:
+        """Get the name of the currently active project."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"http://localhost:{port}/current")
+            return resp.text
+
+    @mcp.tool()
+    async def texwatch_switch(project: str, port: int = 8765) -> str:
+        """Switch the active project by name."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"http://localhost:{port}/current",
+                json={"project": project},
+            )
+            return resp.text
+
+    @mcp.tool()
+    async def texwatch_history(
+        file: str,
+        port: int = 8765,
+        project: str | None = None,
+    ) -> str:
+        """Get previous versions of a source file (saved before each write). Returns snapshots newest-first."""
+        base = _base_url(port, project)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{base}/history/{file}")
+            return resp.text
+
+    @mcp.tool()
+    async def texwatch_bibliography(port: int = 8765, project: str | None = None) -> str:
+        """Get bibliography analysis: BibTeX entries, citations, uncited keys, and undefined keys."""
+        return await _get("/bibliography", port, project)
+
+    @mcp.tool()
+    async def texwatch_environments(port: int = 8765, project: str | None = None) -> str:
+        """Get LaTeX environments: theorems, equations, figures, tables, proofs, and more with labels and captions."""
+        return await _get("/environments", port, project)
+
+    @mcp.tool()
+    async def texwatch_digest(port: int = 8765, project: str | None = None) -> str:
+        """Get document metadata: class, title, author, date, abstract, packages, and custom commands."""
+        return await _get("/digest", port, project)
 
     return mcp
 

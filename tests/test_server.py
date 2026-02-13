@@ -2042,3 +2042,1489 @@ class TestGotoSection:
         # over substring match "Introduction to Methods" (line 10, page 2)
         assert data["section"] == "Introduction"
         assert data["page"] == 4
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Phase 2 coverage tests
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestMultiProjectLegacyBehavior:
+    """Tests for legacy routes on a multi-project server.
+
+    Aggregate endpoints (files, errors, structure, context, compile) return 200.
+    Single-project-only endpoints (goto, capture, source, pdf, config) return
+    structured JSON 400 with project list.
+    """
+
+    @pytest.fixture
+    def multi_config(self, tmp_path):
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("\\documentclass{article}\n\\begin{document}\nA\n\\end{document}\n")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("\\documentclass{article}\n\\begin{document}\nB\n\\end{document}\n")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+        return [("a", config_a), ("b", config_b)]
+
+    @pytest.fixture
+    def multi_server(self, multi_config):
+        return TexWatchServer(projects=multi_config)
+
+    @pytest.fixture
+    async def multi_client(self, multi_server):
+        async with TestClient(TestServer(multi_server.app)) as client:
+            yield client
+
+    # --- Structured 400 endpoints (require --project) ---
+
+    @pytest.mark.asyncio
+    async def test_legacy_goto_json_error(self, multi_client):
+        """Test /goto returns JSON 400 with project list."""
+        resp = await multi_client.post("/goto", json={"line": 1})
+        assert resp.status == 400
+        data = await resp.json()
+        assert "error" in data
+        assert "projects" in data
+        assert set(data["projects"]) == {"a", "b"}
+        assert "hint" in data
+
+    @pytest.mark.asyncio
+    async def test_legacy_capture_json_error(self, multi_client):
+        """Test /capture returns JSON 400 with project list."""
+        resp = await multi_client.get("/capture")
+        assert resp.status == 400
+        data = await resp.json()
+        assert "projects" in data
+        assert set(data["projects"]) == {"a", "b"}
+
+    @pytest.mark.asyncio
+    async def test_legacy_source_json_error(self, multi_client):
+        """Test /source GET returns JSON 400 with project list."""
+        resp = await multi_client.get("/source")
+        assert resp.status == 400
+        data = await resp.json()
+        assert "projects" in data
+        assert set(data["projects"]) == {"a", "b"}
+
+    @pytest.mark.asyncio
+    async def test_legacy_post_source_json_error(self, multi_client):
+        """Test /source POST returns JSON 400 with project list."""
+        resp = await multi_client.post("/source", json={"file": "x", "content": "y"})
+        assert resp.status == 400
+        data = await resp.json()
+        assert "projects" in data
+
+    @pytest.mark.asyncio
+    async def test_legacy_pdf_json_error(self, multi_client):
+        """Test /pdf returns JSON 400 with project list."""
+        resp = await multi_client.get("/pdf")
+        assert resp.status == 400
+        data = await resp.json()
+        assert "projects" in data
+
+    @pytest.mark.asyncio
+    async def test_legacy_config_json_error(self, multi_client):
+        """Test /config returns JSON 400 with project list."""
+        resp = await multi_client.get("/config")
+        assert resp.status == 400
+        data = await resp.json()
+        assert "projects" in data
+
+    # --- Aggregate endpoints (return combined data) ---
+
+    @pytest.mark.asyncio
+    async def test_legacy_files_aggregate(self, multi_client):
+        """Test /files returns combined file trees keyed by project name."""
+        resp = await multi_client.get("/files")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "a" in data
+        assert "b" in data
+        # Each project's files response should have root/children
+        assert "root" in data["a"]
+        assert "children" in data["a"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_errors_aggregate(self, multi_client):
+        """Test /errors returns combined errors keyed by project name."""
+        resp = await multi_client.get("/errors")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "a" in data
+        assert "b" in data
+        # Each should have errors/warnings keys
+        assert "errors" in data["a"]
+        assert "warnings" in data["a"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_structure_aggregate(self, multi_client):
+        """Test /structure returns combined structure keyed by project name."""
+        resp = await multi_client.get("/structure")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "a" in data
+        assert "b" in data
+        assert "sections" in data["a"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_context_aggregate(self, multi_client):
+        """Test /context returns combined context keyed by project name."""
+        resp = await multi_client.get("/context")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "a" in data
+        assert "b" in data
+        assert "editor" in data["a"]
+        assert "viewer" in data["a"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_compile_aggregate(self, multi_client, multi_server):
+        """Test /compile compiles all projects and returns combined results."""
+        with patch("texwatch.server.compile_tex") as mock_compile:
+            mock_compile.return_value = CompileResult(success=True)
+            resp = await multi_client.post("/compile")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "projects" in data
+        assert "a" in data["projects"]
+        assert "b" in data["projects"]
+        assert data["projects"]["a"]["success"] is True
+        assert data["projects"]["b"]["success"] is True
+
+
+class TestBroadcastErrorHandling:
+    """Tests for WebSocket broadcast error handling."""
+
+    @pytest.mark.asyncio
+    async def test_broadcast_removes_failed_ws(self, server):
+        """Test that broadcast discards WebSocket connections that fail on send."""
+        from texwatch.server import ProjectInstance
+
+        proj = server._single
+        ws_good = MagicMock(spec=web.WebSocketResponse)
+        ws_good.send_json = AsyncMock()
+        ws_bad = MagicMock(spec=web.WebSocketResponse)
+        ws_bad.send_json = AsyncMock(side_effect=ConnectionError("closed"))
+
+        proj.websockets = {ws_good, ws_bad}
+        await proj.broadcast({"type": "test"})
+
+        ws_good.send_json.assert_called_once()
+        ws_bad.send_json.assert_called_once()
+        assert ws_bad not in proj.websockets
+        assert ws_good in proj.websockets
+
+
+class TestSymlinkSecurity:
+    """Tests for symlink security checks in source and files endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_get_source_symlink_blocked(self, client, config):
+        """Test GET /source blocks symlinks."""
+        watch_dir = config.config_path.parent
+        link = watch_dir / "evil.tex"
+        link.symlink_to("/etc/hostname")
+
+        resp = await client.get("/source?file=evil.tex")
+        assert resp.status == 403
+        data = await resp.json()
+        assert "symlink" in data["error"].lower() or "denied" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_post_source_symlink_blocked(self, client, config):
+        """Test POST /source blocks symlinks."""
+        watch_dir = config.config_path.parent
+        link = watch_dir / "evil.tex"
+        link.symlink_to("/etc/hostname")
+
+        resp = await client.post("/source", json={"file": "evil.tex", "content": "hack"})
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_files_symlink_outside_excluded(self, client, config):
+        """Test /files excludes symlinks pointing outside the project."""
+        watch_dir = config.config_path.parent
+        sub = watch_dir / "linked_dir"
+        sub.symlink_to("/tmp")
+
+        resp = await client.get("/files")
+        data = await resp.json()
+        names = [c["name"] for c in data["children"]]
+        assert "linked_dir" not in names
+
+
+class TestGotoEdgeCases:
+    """Tests for goto handler edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_goto_line_non_tex_file(self, config, tmp_path):
+        """Test goto line on non-tex file returns 501."""
+        # Create a markdown-based config
+        md_config = Config(
+            main="paper.md",
+            watch=["*.md"],
+            ignore=[],
+            compiler="latexmk",
+            port=0,
+            config_path=tmp_path / ".texwatch.yaml",
+        )
+        (tmp_path / "paper.md").write_text("# Hello\n\nWorld\n")
+        server = TexWatchServer(md_config)
+
+        async with TestClient(TestServer(server.app)) as c:
+            resp = await c.post("/goto", json={"line": 1})
+            assert resp.status == 501
+            data = await resp.json()
+            assert "SyncTeX" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_goto_section_parse_failure(self, client, server):
+        """Test goto section when parse_structure raises returns 500."""
+        with patch("texwatch.server.parse_structure", side_effect=RuntimeError("parse error")):
+            resp = await client.post("/goto", json={"section": "Intro"})
+        assert resp.status == 500
+        data = await resp.json()
+        assert "Failed to parse" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_goto_section_synctex_miss_with_estimation(self, client, server):
+        """Test goto section falls back to page estimation when synctex misses."""
+        from texwatch.structure import Section, DocumentStructure
+
+        server._synctex_data = None
+        server._viewer_state["total_pages"] = 10
+
+        mock_structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Results", file="main.tex", line=3),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=mock_structure):
+            resp = await client.post("/goto", json={"section": "Results"})
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["estimated"] is True
+        assert data["section"] == "Results"
+        assert "page" in data
+
+    @pytest.mark.asyncio
+    async def test_goto_section_no_pages(self, client, server):
+        """Test goto section with no total_pages falls to page 1 fallback."""
+        from texwatch.structure import Section, DocumentStructure
+
+        server._synctex_data = None
+        server._viewer_state["total_pages"] = 0
+
+        mock_structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Discussion", file="main.tex", line=3),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=mock_structure):
+            resp = await client.post("/goto", json={"section": "Discussion"})
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["estimated"] is True
+        assert data["section"] == "Discussion"
+
+
+class TestStructureContextFailures:
+    """Tests for parse_structure failure handling in structure and context endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_structure_parse_failure(self, client):
+        """Test /structure returns empty structure on parse error."""
+        with patch("texwatch.server.parse_structure", side_effect=RuntimeError("bad")):
+            resp = await client.get("/structure")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["sections"] == []
+        assert data["todos"] == []
+        assert data["inputs"] == []
+        assert data["word_count"] is None
+
+    @pytest.mark.asyncio
+    async def test_context_parse_failure(self, client):
+        """Test /context returns valid context with null section on parse error."""
+        with patch("texwatch.server.parse_structure", side_effect=RuntimeError("bad")):
+            resp = await client.get("/context")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["current_section"] is None
+        assert data["word_count"] is None
+
+
+class TestDashboardFallback:
+    """Tests for dashboard fallback when dashboard.html is missing."""
+
+    @pytest.mark.asyncio
+    async def test_dashboard_fallback_no_file(self, tmp_path):
+        """Test that dashboard serves inline HTML when dashboard.html is missing."""
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("\\documentclass{article}\n\\begin{document}\nA\n\\end{document}\n")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("\\documentclass{article}\n\\begin{document}\nB\n\\end{document}\n")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+
+        server = TexWatchServer(projects=[("alpha", config_a), ("beta", config_b)])
+
+        # Rename the real dashboard.html temporarily so the fallback path runs
+        static_dir = Path(__file__).parent.parent / "texwatch" / "static"
+        dashboard = static_dir / "dashboard.html"
+        backup = static_dir / "dashboard.html.bak"
+        renamed = False
+        if dashboard.exists():
+            dashboard.rename(backup)
+            renamed = True
+        try:
+            async with TestClient(TestServer(server.app)) as c:
+                resp = await c.get("/")
+                assert resp.status == 200
+                content = await resp.text()
+                assert "dashboard" in content.lower()
+                assert "alpha" in content
+                assert "beta" in content
+        finally:
+            if renamed:
+                backup.rename(dashboard)
+
+    @pytest.mark.asyncio
+    async def test_dashboard_html_escapes_project_names(self, tmp_path):
+        """Test that project names are HTML-escaped in the dashboard fallback."""
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("doc\n")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("doc\n")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+
+        # Use a project name containing HTML-special characters (needs multi-project for dashboard)
+        server = TexWatchServer(projects=[
+            ("<script>alert(1)</script>", config_a),
+            ("safe", config_b),
+        ])
+
+        static_dir = Path(__file__).parent.parent / "texwatch" / "static"
+        dashboard = static_dir / "dashboard.html"
+        backup = static_dir / "dashboard.html.bak"
+        renamed = False
+        if dashboard.exists():
+            dashboard.rename(backup)
+            renamed = True
+        try:
+            async with TestClient(TestServer(server.app)) as c:
+                resp = await c.get("/")
+                assert resp.status == 200
+                content = await resp.text()
+                # The raw <script> tag must NOT appear — it must be escaped
+                assert "<script>alert(1)</script>" not in content
+                assert "&lt;script&gt;" in content
+        finally:
+            if renamed:
+                backup.rename(dashboard)
+
+
+class TestMultiProjectPropertyProxies:
+    """Tests for multi-project property proxies."""
+
+    def test_multi_compiling_any(self, tmp_path):
+        """Test _compiling returns True if any project is compiling."""
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("hi")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("hi")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+
+        server = TexWatchServer(projects=[("a", config_a), ("b", config_b)])
+        assert server._compiling is False
+
+        server._projects["a"].compiling = True
+        assert server._compiling is True
+
+    def test_multi_websockets_union(self, tmp_path):
+        """Test _websockets returns union of all project WebSocket sets."""
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("hi")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("hi")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+
+        server = TexWatchServer(projects=[("a", config_a), ("b", config_b)])
+        ws1 = MagicMock()
+        ws2 = MagicMock()
+        server._projects["a"].websockets.add(ws1)
+        server._projects["b"].websockets.add(ws2)
+
+        assert ws1 in server._websockets
+        assert ws2 in server._websockets
+        assert len(server._websockets) == 2
+
+
+class TestFilesSymlinkFile:
+    """Tests for file-level symlink exclusion in _build_file_tree."""
+
+    @pytest.mark.asyncio
+    async def test_files_file_symlink_outside_excluded(self, client, config):
+        """Test /files excludes file symlinks pointing outside the project."""
+        watch_dir = config.config_path.parent
+        link = watch_dir / "external.tex"
+        link.symlink_to("/etc/hostname")
+
+        resp = await client.get("/files")
+        data = await resp.json()
+        names = [c["name"] for c in data["children"]]
+        assert "external.tex" not in names
+
+
+class TestCaptureViewerPage:
+    """Tests for capture using viewer state page."""
+
+    @pytest.mark.asyncio
+    async def test_capture_uses_viewer_page(self, client, server, config):
+        """Test capture without ?page= uses viewer_state page."""
+        import pymupdf
+
+        pdf_path = config.config_path.parent / "main.pdf"
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.new_page()
+        doc.new_page()
+        doc.save(str(pdf_path))
+        doc.close()
+
+        server._viewer_state["page"] = 2
+
+        resp = await client.get("/capture")
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type") == "image/png"
+
+
+class TestGotoLineNoTotalLines:
+    """Tests for goto line fallback when total_lines is 0."""
+
+    @pytest.mark.asyncio
+    async def test_goto_line_no_total_lines(self, client, server, config):
+        """Test goto line estimation when source file can't be read."""
+        server._viewer_state["total_pages"] = 5
+
+        # Replace main file with empty so total_lines = 0
+        main_path = config.config_path.parent / "main.tex"
+        main_path.write_text("")
+
+        resp = await client.post("/goto", json={"line": 3})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["estimated"] is True
+        # When total_lines=0, estimated_page = max(1, min(line, total_pages))
+        assert data["page"] == 3
+
+
+class TestGotoSectionNoTotalLines:
+    """Tests for goto section estimation when total_lines is 0."""
+
+    @pytest.mark.asyncio
+    async def test_goto_section_no_total_lines(self, client, server, config):
+        """Test goto section estimation when source file can't be read."""
+        from texwatch.structure import Section, DocumentStructure
+
+        server._synctex_data = None
+        server._viewer_state["total_pages"] = 5
+
+        # Empty main so total_lines = 0
+        main_path = config.config_path.parent / "main.tex"
+        main_path.write_text("")
+
+        mock_structure = DocumentStructure(
+            sections=[
+                Section(level="section", title="Intro", file="main.tex", line=3),
+            ],
+        )
+
+        with patch("texwatch.server.parse_structure", return_value=mock_structure):
+            resp = await client.post("/goto", json={"section": "Intro"})
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert data["estimated"] is True
+        assert data["page"] == 3
+
+
+class TestParallelCompilation:
+    """Test that multi-project start compiles all projects in parallel."""
+
+    @pytest.mark.asyncio
+    async def test_start_compiles_parallel(self, tmp_path):
+        """Verify start() uses asyncio.gather to compile all projects."""
+        # Create two project directories
+        for name in ("proj1", "proj2"):
+            d = tmp_path / name
+            d.mkdir()
+            (d / "main.tex").write_text("\\documentclass{article}\\begin{document}Hi\\end{document}\n")
+
+        projects = [
+            ("proj1", Config(
+                main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                port=0, config_path=tmp_path / "proj1" / ".texwatch.yaml",
+            )),
+            ("proj2", Config(
+                main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                port=0, config_path=tmp_path / "proj2" / ".texwatch.yaml",
+            )),
+        ]
+
+        server = TexWatchServer(projects=projects)
+
+        compile_calls = []
+        original_do_compile = type(list(server._projects.values())[0]).do_compile
+
+        async def mock_do_compile(self_proj):
+            compile_calls.append(self_proj.name)
+
+        # Patch do_compile on each project instance
+        for proj in server._projects.values():
+            proj.do_compile = lambda p=proj: mock_do_compile(p)
+
+        await server.start()
+
+        # Both projects should have been compiled
+        assert set(compile_calls) == {"proj1", "proj2"}
+
+        # Clean up
+        await server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test: Current Project Tracking
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentProjectTracking:
+    """Tests for current-project pointer feature."""
+
+    @pytest.fixture
+    def multi_config(self, tmp_path):
+        """Create configs for two projects."""
+        dir_a = tmp_path / "project_a"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nA\n\\end{document}\n"
+        )
+        config_a = Config(
+            main="main.tex", watch=["*.tex"], ignore=[],
+            compiler="latexmk", port=0,
+            config_path=dir_a / ".texwatch.yaml",
+        )
+
+        dir_b = tmp_path / "project_b"
+        dir_b.mkdir()
+        (dir_b / "paper.tex").write_text(
+            "\\documentclass{article}\n\\begin{document}\nB\n\\end{document}\n"
+        )
+        config_b = Config(
+            main="paper.tex", watch=["*.tex"], ignore=[],
+            compiler="latexmk", port=0,
+            config_path=dir_b / ".texwatch.yaml",
+        )
+        return [("alpha", config_a), ("beta", config_b)]
+
+    @pytest.fixture
+    def multi_server(self, multi_config):
+        return TexWatchServer(projects=multi_config)
+
+    @pytest.fixture
+    async def multi_client(self, multi_server):
+        async with TestClient(TestServer(multi_server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_initial_current_is_none(self, multi_server):
+        """Test that _current_project_name starts as None."""
+        assert multi_server._current_project_name is None
+
+    @pytest.mark.asyncio
+    async def test_project_access_sets_current(self, multi_client, multi_server):
+        """Test accessing /p/alpha/status sets current to alpha."""
+        resp = await multi_client.get("/p/alpha/status")
+        assert resp.status == 200
+        assert multi_server._current_project_name == "alpha"
+
+    @pytest.mark.asyncio
+    async def test_current_switches_on_different_project(self, multi_client, multi_server):
+        """Test accessing different projects updates current."""
+        await multi_client.get("/p/alpha/status")
+        assert multi_server._current_project_name == "alpha"
+        await multi_client.get("/p/beta/status")
+        assert multi_server._current_project_name == "beta"
+
+    @pytest.mark.asyncio
+    async def test_unprefixed_goto_works_after_project_access(self, multi_client, multi_server):
+        """Test unprefixed goto auto-selects after accessing a project."""
+        await multi_client.get("/p/alpha/status")
+        resp = await multi_client.post("/goto", json={"page": 1})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_unprefixed_goto_400_when_no_current(self, multi_client, multi_server):
+        """Test unprefixed goto still returns 400 when no current set."""
+        resp = await multi_client.post("/goto", json={"page": 1})
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_get_current_returns_name(self, multi_client, multi_server):
+        """Test GET /current returns current project name."""
+        multi_server._current_project_name = "alpha"
+        resp = await multi_client.get("/current")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["current"] == "alpha"
+
+    @pytest.mark.asyncio
+    async def test_get_current_returns_null(self, multi_client, multi_server):
+        """Test GET /current returns null when no current."""
+        resp = await multi_client.get("/current")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["current"] is None
+        assert "projects" in data
+
+    @pytest.mark.asyncio
+    async def test_post_current_switches_project(self, multi_client, multi_server):
+        """Test POST /current switches the current project."""
+        resp = await multi_client.post("/current", json={"project": "beta"})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["current"] == "beta"
+        assert multi_server._current_project_name == "beta"
+
+    @pytest.mark.asyncio
+    async def test_post_current_unknown_project(self, multi_client, multi_server):
+        """Test POST /current with unknown project returns 400."""
+        resp = await multi_client.post("/current", json={"project": "unknown"})
+        assert resp.status == 400
+        data = await resp.json()
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_auto_selected_header(self, multi_client, multi_server):
+        """Test X-Texwatch-Project header on auto-selected responses."""
+        await multi_client.get("/p/alpha/status")
+        resp = await multi_client.post("/goto", json={"page": 1})
+        assert resp.status == 200
+        assert resp.headers.get("X-Texwatch-Project") == "alpha"
+
+
+# ---------------------------------------------------------------------------
+# Test: Event Logging
+# ---------------------------------------------------------------------------
+
+
+class TestEventLogging:
+    """Tests for per-project and global event logging."""
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        main_file = tmp_path / "main.tex"
+        main_file.write_text(
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n"
+        )
+        return Config(
+            main="main.tex", watch=["*.tex"], ignore=[],
+            compiler="latexmk", port=0,
+            config_path=tmp_path / ".texwatch.yaml",
+        )
+
+    @pytest.fixture
+    def server(self, config):
+        return TexWatchServer(config)
+
+    @pytest.fixture
+    async def client(self, server):
+        async with TestClient(TestServer(server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_empty_activity_initially(self, client):
+        """Test /activity returns empty events initially."""
+        resp = await client.get("/activity")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["events"] == []
+
+    @pytest.mark.asyncio
+    async def test_goto_logs_event(self, client, server):
+        """Test goto logs an event."""
+        await client.post("/goto", json={"page": 3})
+        resp = await client.get("/activity")
+        data = await resp.json()
+        events = data["events"]
+        goto_events = [e for e in events if e["type"] == "goto"]
+        assert len(goto_events) == 1
+        assert goto_events[0]["target_type"] == "page"
+        assert goto_events[0]["value"] == 3
+
+    @pytest.mark.asyncio
+    async def test_activity_limit_filter(self, client, server):
+        """Test /activity with limit parameter."""
+        for i in range(5):
+            await client.post("/goto", json={"page": i + 1})
+        resp = await client.get("/activity?limit=2")
+        data = await resp.json()
+        assert len(data["events"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_activity_type_filter(self, client, server):
+        """Test /activity with type filter."""
+        await client.post("/goto", json={"page": 1})
+        resp = await client.get("/activity?type=goto")
+        data = await resp.json()
+        assert len(data["events"]) >= 1
+        assert all(e["type"] == "goto" for e in data["events"])
+
+    @pytest.mark.asyncio
+    async def test_activity_newest_first(self, client, server):
+        """Test /activity returns events newest first."""
+        await client.post("/goto", json={"page": 1})
+        await client.post("/goto", json={"page": 2})
+        resp = await client.get("/activity")
+        data = await resp.json()
+        events = [e for e in data["events"] if e["type"] == "goto"]
+        assert events[0]["value"] == 2
+        assert events[1]["value"] == 1
+
+    @pytest.mark.asyncio
+    async def test_page_view_dedup(self, server):
+        """Test page_view events are deduplicated."""
+        proj = server._single
+        # Simulate same page twice
+        proj._last_page_view = {}
+        proj.viewer_state["page"] = 5
+        proj.viewer_state["total_pages"] = 10
+
+        ws = MagicMock()
+        ws.send_json = AsyncMock()
+
+        await server._handle_ws_message(ws, {"type": "viewer_state", "state": {"page": 5}}, proj)
+        count1 = len([e for e in proj.events if e["type"] == "page_view"])
+        await server._handle_ws_message(ws, {"type": "viewer_state", "state": {"page": 5}}, proj)
+        count2 = len([e for e in proj.events if e["type"] == "page_view"])
+        assert count1 == count2  # no duplicate
+
+        await server._handle_ws_message(ws, {"type": "viewer_state", "state": {"page": 6}}, proj)
+        count3 = len([e for e in proj.events if e["type"] == "page_view"])
+        assert count3 == count2 + 1  # new page = new event
+
+    @pytest.mark.asyncio
+    async def test_file_edit_dedup(self, server):
+        """Test file_edit events are deduplicated."""
+        proj = server._single
+        proj._last_file_edit = {}
+
+        ws = MagicMock()
+        ws.send_json = AsyncMock()
+
+        await server._handle_ws_message(
+            ws, {"type": "editor_state", "state": {"file": "a.tex", "line": 1}}, proj,
+        )
+        count1 = len([e for e in proj.events if e["type"] == "file_edit"])
+        await server._handle_ws_message(
+            ws, {"type": "editor_state", "state": {"file": "a.tex", "line": 1}}, proj,
+        )
+        count2 = len([e for e in proj.events if e["type"] == "file_edit"])
+        assert count1 == count2
+
+        await server._handle_ws_message(
+            ws, {"type": "editor_state", "state": {"file": "a.tex", "line": 2}}, proj,
+        )
+        count3 = len([e for e in proj.events if e["type"] == "file_edit"])
+        assert count3 == count2 + 1
+
+    @pytest.mark.asyncio
+    async def test_ring_buffer_overflow(self, server):
+        """Test ring buffer drops oldest events when full."""
+        proj = server._single
+        for i in range(250):
+            proj.log_event("test_event", index=i)
+        assert len(proj.events) == 200
+        # Oldest should be index=50
+        assert proj.events[0]["index"] == 50
+
+    @pytest.mark.asyncio
+    async def test_global_events(self, server):
+        """Test global events receive per-project events."""
+        proj = server._single
+        proj.log_event("test_event", data="hello")
+        assert len(server._global_events) == 1
+        assert server._global_events[0]["type"] == "test_event"
+
+    @pytest.mark.asyncio
+    async def test_source_read_logs_event(self, client, server):
+        """Test GET /source logs source_read event."""
+        await client.get("/source")
+        events = [e for e in server._single.events if e["type"] == "source_read"]
+        assert len(events) == 1
+        assert events[0]["file"] == "main.tex"
+
+
+# ---------------------------------------------------------------------------
+# Test: File Snapshots
+# ---------------------------------------------------------------------------
+
+
+class TestFileSnapshots:
+    """Tests for file snapshot feature."""
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        main_file = tmp_path / "main.tex"
+        main_file.write_text("original content")
+        return Config(
+            main="main.tex", watch=["*.tex"], ignore=[],
+            compiler="latexmk", port=0,
+            config_path=tmp_path / ".texwatch.yaml",
+        )
+
+    @pytest.fixture
+    def server(self, config):
+        return TexWatchServer(config)
+
+    @pytest.fixture
+    async def client(self, server):
+        async with TestClient(TestServer(server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_no_snapshots_initially(self, server):
+        """Test no snapshots at start."""
+        assert len(server._single.file_snapshots) == 0
+
+    @pytest.mark.asyncio
+    async def test_write_source_stashes_old_content(self, client, server):
+        """Test writing source creates a snapshot of old content."""
+        resp = await client.post(
+            "/source",
+            json={"file": "main.tex", "content": "new content"},
+        )
+        assert resp.status == 200
+        assert len(server._single.file_snapshots) == 1
+        snap = server._single.file_snapshots[0]
+        assert snap["file"] == "main.tex"
+        assert snap["content"] == "original content"
+
+    @pytest.mark.asyncio
+    async def test_history_endpoint_returns_snapshots(self, client, server):
+        """Test GET /p/{name}/history/{file} returns snapshots newest-first."""
+        name = server._single.name
+        # Write twice
+        await client.post("/source", json={"file": "main.tex", "content": "v2"})
+        await client.post("/source", json={"file": "main.tex", "content": "v3"})
+
+        resp = await client.get(f"/p/{name}/history/main.tex")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["file"] == "main.tex"
+        assert len(data["snapshots"]) == 2
+        # Newest first
+        assert data["snapshots"][0]["content"] == "v2"
+        assert data["snapshots"][1]["content"] == "original content"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_ring_buffer_capped(self, client, server):
+        """Test snapshots ring buffer is capped at 20."""
+        for i in range(25):
+            await client.post(
+                "/source",
+                json={"file": "main.tex", "content": f"version {i}"},
+            )
+        assert len(server._single.file_snapshots) == 20
+
+    @pytest.mark.asyncio
+    async def test_unprefixed_history_route(self, client, server):
+        """Test GET /history/{file} resolves to single project."""
+        await client.post("/source", json={"file": "main.tex", "content": "v2"})
+        resp = await client.get("/history/main.tex")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["file"] == "main.tex"
+        assert len(data["snapshots"]) == 1
+        assert data["snapshots"][0]["content"] == "original content"
+
+
+# ---------------------------------------------------------------------------
+# Semantic extraction endpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rich_config(tmp_path):
+    """Config with .bib, environments, and metadata in the main.tex."""
+    main_file = tmp_path / "main.tex"
+    main_file.write_text(
+        "\\documentclass[12pt]{article}\n"
+        "\\usepackage{amsmath}\n"
+        "\\title{Test Paper}\n"
+        "\\author{Test Author}\n"
+        "\\newcommand{\\R}{\\mathbb{R}}\n"
+        "\\begin{document}\n"
+        "\\begin{abstract}\n"
+        "We study things.\n"
+        "\\end{abstract}\n"
+        "\\section{Introduction}\n"
+        "See \\cite{knuth1984}.\n"
+        "\\begin{theorem}[Main Result]\n"
+        "\\label{thm:main}\n"
+        "Statement.\n"
+        "\\end{theorem}\n"
+        "\\begin{equation}\n"
+        "\\label{eq:euler}\n"
+        "e^{i\\pi}+1=0\n"
+        "\\end{equation}\n"
+        "\\end{document}\n"
+    )
+    bib_file = tmp_path / "refs.bib"
+    bib_file.write_text(
+        "@article{knuth1984,\n"
+        "  author = {Donald Knuth},\n"
+        "  title = {Literate Programming},\n"
+        "  year = {1984},\n"
+        "}\n"
+        "@book{unused2020,\n"
+        "  author = {Nobody},\n"
+        "  title = {Unused},\n"
+        "  year = {2020},\n"
+        "}\n"
+    )
+    return Config(
+        main="main.tex",
+        watch=["*.tex"],
+        ignore=[],
+        compiler="latexmk",
+        port=0,
+        config_path=tmp_path / ".texwatch.yaml",
+    )
+
+
+@pytest.fixture
+def rich_server(rich_config):
+    return TexWatchServer(rich_config)
+
+
+@pytest.fixture
+async def rich_client(rich_server):
+    async with TestClient(TestServer(rich_server.app)) as client:
+        yield client
+
+
+class TestBibliographyEndpoint:
+    """Tests for GET /bibliography endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_bibliography_returns_entries(self, rich_client):
+        resp = await rich_client.get("/bibliography")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "entries" in data
+        assert "citations" in data
+        assert "uncited_keys" in data
+        assert "undefined_keys" in data
+        keys = {e["key"] for e in data["entries"]}
+        assert "knuth1984" in keys
+
+    @pytest.mark.asyncio
+    async def test_bibliography_uncited(self, rich_client):
+        resp = await rich_client.get("/bibliography")
+        data = await resp.json()
+        assert "unused2020" in data["uncited_keys"]
+
+    @pytest.mark.asyncio
+    async def test_bibliography_citations(self, rich_client):
+        resp = await rich_client.get("/bibliography")
+        data = await resp.json()
+        cited_keys = []
+        for c in data["citations"]:
+            cited_keys.extend(c["keys"])
+        assert "knuth1984" in cited_keys
+
+    @pytest.mark.asyncio
+    async def test_bibliography_empty(self, client):
+        """Empty project returns empty lists."""
+        resp = await client.get("/bibliography")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["entries"] == []
+
+
+class TestEnvironmentsEndpoint:
+    """Tests for GET /environments endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_environments_returns_list(self, rich_client):
+        resp = await rich_client.get("/environments")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "environments" in data
+        types = {e["env_type"] for e in data["environments"]}
+        assert "theorem" in types
+        assert "equation" in types
+
+    @pytest.mark.asyncio
+    async def test_environments_have_labels(self, rich_client):
+        resp = await rich_client.get("/environments")
+        data = await resp.json()
+        labels = {e["label"] for e in data["environments"] if e["label"]}
+        assert "thm:main" in labels
+        assert "eq:euler" in labels
+
+    @pytest.mark.asyncio
+    async def test_environments_have_names(self, rich_client):
+        resp = await rich_client.get("/environments")
+        data = await resp.json()
+        thm = [e for e in data["environments"] if e["env_type"] == "theorem"][0]
+        assert thm["name"] == "Main Result"
+
+    @pytest.mark.asyncio
+    async def test_environments_empty(self, client):
+        resp = await client.get("/environments")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["environments"] == []
+
+
+class TestDigestEndpoint:
+    """Tests for GET /digest endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_digest_returns_metadata(self, rich_client):
+        resp = await rich_client.get("/digest")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["documentclass"] == "article"
+        assert data["title"] == "Test Paper"
+        assert data["author"] == "Test Author"
+
+    @pytest.mark.asyncio
+    async def test_digest_class_options(self, rich_client):
+        resp = await rich_client.get("/digest")
+        data = await resp.json()
+        assert "12pt" in data["class_options"]
+
+    @pytest.mark.asyncio
+    async def test_digest_packages(self, rich_client):
+        resp = await rich_client.get("/digest")
+        data = await resp.json()
+        names = [p["name"] for p in data["packages"]]
+        assert "amsmath" in names
+
+    @pytest.mark.asyncio
+    async def test_digest_commands(self, rich_client):
+        resp = await rich_client.get("/digest")
+        data = await resp.json()
+        assert len(data["commands"]) >= 1
+        cmd_names = [c["name"] for c in data["commands"]]
+        assert "\\R" in cmd_names
+
+    @pytest.mark.asyncio
+    async def test_digest_abstract(self, rich_client):
+        resp = await rich_client.get("/digest")
+        data = await resp.json()
+        assert data["abstract"] is not None
+        assert "We study" in data["abstract"]
+
+    @pytest.mark.asyncio
+    async def test_digest_empty(self, client):
+        resp = await client.get("/digest")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["documentclass"] == "article"
+
+
+class TestStructureEndpointExtended:
+    """Tests for extended structure response with section_stats and summary."""
+
+    @pytest.mark.asyncio
+    async def test_structure_includes_section_stats(self, rich_client):
+        resp = await rich_client.get("/structure")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "section_stats" in data
+        assert "summary" in data
+
+    @pytest.mark.asyncio
+    async def test_structure_summary_fields(self, rich_client):
+        resp = await rich_client.get("/structure")
+        data = await resp.json()
+        summary = data["summary"]
+        assert "total_figures" in summary
+        assert "total_tables" in summary
+        assert "total_equations" in summary
+        assert "total_citations" in summary
+        assert "total_todos" in summary
+
+
+# ---------------------------------------------------------------------------
+# Phase 3B: Coverage gap tests
+# ---------------------------------------------------------------------------
+
+
+class TestBibliographyParseFailure:
+    """Tests for bibliography endpoint exception handling."""
+
+    @pytest.mark.asyncio
+    async def test_bibliography_parse_exception(self, client):
+        """Test /bibliography returns empty lists when parse raises."""
+        with patch("texwatch.server.parse_bibliography", side_effect=RuntimeError("parse error")):
+            resp = await client.get("/bibliography")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["entries"] == []
+        assert data["citations"] == []
+        assert data["uncited_keys"] == []
+        assert data["undefined_keys"] == []
+
+
+class TestEnvironmentsParseFailure:
+    """Tests for environments endpoint exception handling."""
+
+    @pytest.mark.asyncio
+    async def test_environments_parse_exception(self, client):
+        """Test /environments returns empty list when parse raises."""
+        with patch("texwatch.server.parse_environments", side_effect=RuntimeError("parse error")):
+            resp = await client.get("/environments")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["environments"] == []
+
+
+class TestDigestParseFailure:
+    """Tests for digest endpoint exception handling."""
+
+    @pytest.mark.asyncio
+    async def test_digest_parse_exception(self, client):
+        """Test /digest returns default digest when parse raises."""
+        with patch("texwatch.server.parse_digest", side_effect=RuntimeError("parse error")):
+            resp = await client.get("/digest")
+        assert resp.status == 200
+        data = await resp.json()
+        # Should return default Digest() fields
+        assert data["documentclass"] is None
+        assert data["title"] is None
+
+
+class TestActivityInvalidLimit:
+    """Tests for /activity with invalid limit parameter."""
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        main_file = tmp_path / "main.tex"
+        main_file.write_text(
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n"
+        )
+        return Config(
+            main="main.tex", watch=["*.tex"], ignore=[],
+            compiler="latexmk", port=0,
+            config_path=tmp_path / ".texwatch.yaml",
+        )
+
+    @pytest.fixture
+    def server(self, config):
+        return TexWatchServer(config)
+
+    @pytest.fixture
+    async def client(self, server):
+        async with TestClient(TestServer(server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_activity_invalid_limit_uses_default(self, client, server):
+        """Test /activity with non-numeric limit falls back to default 50."""
+        # Log some events so we can verify results
+        server._single.log_event("test", data="hello")
+        resp = await client.get("/activity?limit=abc")
+        assert resp.status == 200
+        data = await resp.json()
+        # Should still return events (not error)
+        assert "events" in data
+        assert len(data["events"]) >= 1
+
+
+class TestClickHandlerEdgeCases:
+    """Tests for click WebSocket message edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_click_no_synctex_data(self, client, server):
+        """Test click message when no synctex data logs skip message."""
+        server._synctex_data = None
+
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+            await ws.send_json({
+                "type": "click",
+                "page": 1,
+                "x": 100.0,
+                "y": 500.0,
+            })
+            # Give server time to process
+            import asyncio
+            await asyncio.sleep(0.1)
+
+        # Verify event was logged
+        click_events = [e for e in server._single.events if e["type"] == "click"]
+        assert len(click_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_click_synctex_miss(self, client, server):
+        """Test click message when synctex data exists but page_to_source returns None."""
+        from texwatch.synctex import SyncTeXData
+
+        server._synctex_data = SyncTeXData(
+            pdf_to_source={},  # empty - page_to_source will return None
+            source_to_pdf={},
+            input_files={},
+        )
+
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+            await ws.send_json({
+                "type": "click",
+                "page": 1,
+                "x": 100.0,
+                "y": 500.0,
+            })
+            import asyncio
+            await asyncio.sleep(0.1)
+
+        # Event was logged even when synctex missed
+        click_events = [e for e in server._single.events if e["type"] == "click"]
+        assert len(click_events) == 1
+
+
+class TestCaptureEmptyPdf:
+    """Tests for capture with empty PDF (0 pages)."""
+
+    @pytest.mark.asyncio
+    async def test_capture_empty_pdf(self, client, config):
+        """Test capture returns error for PDF with 0 pages."""
+        import pymupdf as _pymupdf
+
+        # Create a real 1-page PDF so the file exists (pymupdf can't save 0-page PDFs)
+        pdf_path = config.config_path.parent / "main.pdf"
+        doc = _pymupdf.open()
+        doc.new_page()
+        doc.save(str(pdf_path))
+        doc.close()
+
+        # Mock pymupdf.open to return a document with len() == 0
+        mock_doc = MagicMock()
+        mock_doc.__len__ = MagicMock(return_value=0)
+
+        with patch("pymupdf.open", return_value=mock_doc):
+            resp = await client.get("/capture")
+        assert resp.status == 400
+        data = await resp.json()
+        assert "no pages" in data["error"].lower()
+        mock_doc.close.assert_called_once()
+
+
+class TestPostSourceInvalidJson:
+    """Tests for POST /source with invalid JSON."""
+
+    @pytest.mark.asyncio
+    async def test_post_source_invalid_json(self, client):
+        """Test POST /source with non-JSON body returns 400."""
+        resp = await client.post(
+            "/source",
+            data=b"not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 400
+        data = await resp.json()
+        assert "Invalid JSON" in data["error"]
+
+
+class TestSetCurrentInvalidJson:
+    """Tests for POST /current with invalid JSON."""
+
+    @pytest.fixture
+    def multi_config(self, tmp_path):
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("\\documentclass{article}\n\\begin{document}\nA\n\\end{document}\n")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("\\documentclass{article}\n\\begin{document}\nB\n\\end{document}\n")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+        return [("a", config_a), ("b", config_b)]
+
+    @pytest.fixture
+    def multi_server(self, multi_config):
+        return TexWatchServer(projects=multi_config)
+
+    @pytest.fixture
+    async def multi_client(self, multi_server):
+        async with TestClient(TestServer(multi_server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_post_current_invalid_json(self, multi_client):
+        """Test POST /current with non-JSON body returns 400."""
+        resp = await multi_client.post(
+            "/current",
+            data=b"not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 400
+        data = await resp.json()
+        assert "Invalid JSON" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_post_current_missing_project(self, multi_client):
+        """Test POST /current without project field returns 400."""
+        resp = await multi_client.post("/current", json={})
+        assert resp.status == 400
+        data = await resp.json()
+        assert "Unknown project" in data["error"]
+
+
+class TestMultiProjectHistoryError:
+    """Tests for /history on multi-project server without current."""
+
+    @pytest.fixture
+    def multi_config(self, tmp_path):
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("A\n")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("B\n")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+        return [("a", config_a), ("b", config_b)]
+
+    @pytest.fixture
+    def multi_server(self, multi_config):
+        return TexWatchServer(projects=multi_config)
+
+    @pytest.fixture
+    async def multi_client(self, multi_server):
+        async with TestClient(TestServer(multi_server.app)) as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_history_multi_project_no_current(self, multi_client):
+        """Test /history/{file} on multi-project server without current returns 400."""
+        resp = await multi_client.get("/history/main.tex")
+        assert resp.status == 400
+        data = await resp.json()
+        assert "projects" in data
+
+
+class TestMultiProjectConvenienceProxies:
+    """Tests for multi-project convenience proxy no-ops."""
+
+    def test_multi_last_result_is_none(self, tmp_path):
+        """Test _last_result returns None for multi-project."""
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("hi")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("hi")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+        server = TexWatchServer(projects=[("a", config_a), ("b", config_b)])
+        assert server._last_result is None
+        assert server._synctex_data is None
+        assert server._editor_state == {"file": None, "line": None}
+        assert server._viewer_state == {"page": 1, "total_pages": 0, "visible_lines": None}
+        assert server._watcher is None
+
+    def test_multi_setters_are_noop(self, tmp_path):
+        """Test setters on multi-project server are no-ops."""
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("hi")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("hi")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+        server = TexWatchServer(projects=[("a", config_a), ("b", config_b)])
+
+        # These should not raise (they're no-ops on multi-project)
+        server._compiling = True
+        server._last_result = None
+        server._synctex_data = None
+        server._viewer_state = {"page": 5}
+        server._editor_state = {"file": "x.tex", "line": 1}
+        server._watcher = None
+
+    @pytest.mark.asyncio
+    async def test_multi_broadcast_noop(self, tmp_path):
+        """Test _broadcast is a no-op on multi-project server."""
+        dir_a = tmp_path / "pa"
+        dir_a.mkdir()
+        (dir_a / "main.tex").write_text("hi")
+        config_a = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_a / ".texwatch.yaml")
+        dir_b = tmp_path / "pb"
+        dir_b.mkdir()
+        (dir_b / "main.tex").write_text("hi")
+        config_b = Config(main="main.tex", watch=["*.tex"], ignore=[], compiler="latexmk",
+                          port=0, config_path=dir_b / ".texwatch.yaml")
+        server = TexWatchServer(projects=[("a", config_a), ("b", config_b)])
+        # Should not raise
+        await server._broadcast({"type": "test"})
+        await server._do_compile()
+        await server._on_file_change("/tmp/test.tex")
+        await server._send_state(MagicMock())
+
+
+class TestServerNoConfigOrProjects:
+    """Test server constructor validation."""
+
+    def test_server_requires_config_or_projects(self):
+        """Test that TexWatchServer raises ValueError without config or projects."""
+        with pytest.raises(ValueError, match="Must provide config or projects"):
+            TexWatchServer()

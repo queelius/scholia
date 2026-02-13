@@ -1,20 +1,28 @@
 """aiohttp web server with HTTP API and WebSocket support.
 
-Supports both single-project (legacy) and multi-project mode.
-In multi-project mode, each project is served under /p/{name}/.
+Each project is served under /p/{name}/.  Unprefixed routes (``/status``,
+``/compile``, etc.) resolve to the single project when only one is loaded,
+or aggregate across all projects when multiple are loaded.
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
+from collections import deque
+from datetime import datetime, timezone
+from html import escape as html_escape
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from aiohttp import web, WSMsgType
 
+from .bibliography import parse_bibliography
 from .compiler import CompileMessage, CompileResult, compile_tex
 from .config import Config, get_main_file, get_watch_dir
-from .structure import parse_structure
+from .digest import Digest, parse_digest
+from .environments import parse_environments
+from .structure import DocumentStructure, parse_structure
 from .synctex import (
     SyncTeXData,
     find_synctex_file,
@@ -35,7 +43,12 @@ logger = logging.getLogger(__name__)
 class ProjectInstance:
     """Per-project runtime state."""
 
-    def __init__(self, config: Config, name: str = ""):
+    def __init__(
+        self,
+        config: Config,
+        name: str = "",
+        on_event: Callable[[dict], None] | None = None,
+    ):
         self.config = config
         self.name = name
         self.compiling = False
@@ -52,6 +65,30 @@ class ProjectInstance:
         }
         self.websockets: set[web.WebSocketResponse] = set()
         self.watcher: TexWatcher | None = None
+
+        # Event log (ring buffer)
+        self.events: deque[dict] = deque(maxlen=200)
+        self._on_event: Callable[[dict], None] | None = on_event
+
+        # Deduplication state for noisy events
+        self._last_page_view: dict[str, Any] = {}
+        self._last_file_edit: dict[str, Any] = {}
+
+        # File snapshots (ring buffer) — stash old content before source_write
+        self.file_snapshots: deque[dict] = deque(maxlen=20)
+
+    def log_event(self, event_type: str, **data: Any) -> dict:
+        """Record an event in the per-project ring buffer."""
+        event = {
+            "type": event_type,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "project": self.name,
+            **data,
+        }
+        self.events.append(event)
+        if self._on_event:
+            self._on_event(event)
+        return event
 
     async def broadcast(self, message: dict) -> None:
         """Broadcast message to all WebSocket clients for this project."""
@@ -78,6 +115,8 @@ class ProjectInstance:
         """Run compilation for this project."""
         self.compiling = True
         await self.broadcast({"type": "compiling", "status": True})
+        self.log_event("compile_start")
+        _compile_start = datetime.now(timezone.utc)
 
         try:
             main_file = get_main_file(self.config)
@@ -120,8 +159,20 @@ class ProjectInstance:
                 f"in {self.last_result.duration_seconds:.2f}s"
             )
 
+            # Adapt debounce based on compilation speed
+            if self.watcher and self.watcher._handler and self.last_result:
+                self.watcher._handler.update_debounce(self.last_result.duration_seconds)
+
         finally:
             self.compiling = False
+            _duration = (datetime.now(timezone.utc) - _compile_start).total_seconds()
+            self.log_event(
+                "compile_finish",
+                success=self.last_result.success if self.last_result else False,
+                duration=round(_duration, 3),
+                errors=len(self.last_result.errors) if self.last_result else 0,
+                warnings=len(self.last_result.warnings) if self.last_result else 0,
+            )
             await self.broadcast({"type": "compiling", "status": False})
             msg = {
                 "type": "compiled",
@@ -208,9 +259,8 @@ def _count_source_lines(path: Path) -> int:
 class TexWatchServer:
     """Web server for texwatch.
 
-    Supports two modes:
-    - Single-project (legacy): constructed with a Config
-    - Multi-project: constructed with a list of (name, Config) pairs
+    Constructed with either a single ``Config`` (singleton project) or a
+    list of ``(name, Config)`` pairs for multi-project serving.
     """
 
     def __init__(
@@ -221,35 +271,71 @@ class TexWatchServer:
     ):
         """Initialize server.
 
-        Provide either ``config`` (single-project, backwards-compatible)
-        or ``projects`` (multi-project).
+        Provide either ``config`` (single project) or ``projects``
+        (multiple projects).
         """
+        self._current_project_name: str | None = None
+        self._global_events: deque[dict] = deque(maxlen=500)
+
         self.app = web.Application()
         self._projects: dict[str, ProjectInstance] = {}
 
         if projects is not None:
             for name, cfg in projects:
-                self._projects[name] = ProjectInstance(cfg, name=name)
+                self._projects[name] = ProjectInstance(
+                    cfg, name=name, on_event=self._on_project_event,
+                )
             # Use port from first project or default
             self.config = Config(main="", port=8800)
         elif config is not None:
             self.config = config
             name = Path(config.main).stem if config.main else "default"
-            self._projects[name] = ProjectInstance(config, name=name)
+            self._projects[name] = ProjectInstance(
+                config, name=name, on_event=self._on_project_event,
+            )
         else:
             raise ValueError("Must provide config or projects")
 
+        # Middleware to track current project from /p/{name}/... requests
+        @web.middleware
+        async def track_current(request: web.Request, handler: Any) -> web.StreamResponse:
+            name = request.match_info.get("name")
+            if name and name in self._projects:
+                self._current_project_name = name
+            return await handler(request)
+
+        self.app.middlewares.append(track_current)
+
         self._setup_routes()
 
-        # Legacy compatibility: expose state from the single project instance
-        # (used by existing tests that access server._compiling etc.)
+        # Convenience shortcut for the single-project case.
+        # Tests and property proxies use this to access state directly.
         self._single: ProjectInstance | None
         if len(self._projects) == 1:
             self._single = next(iter(self._projects.values()))
         else:
             self._single = None
 
-    # --- Legacy property proxies for single-project tests ---
+    def _on_project_event(self, event: dict) -> None:
+        """Callback for per-project events — appends to global ring buffer."""
+        self._global_events.append(event)
+
+    def _get_effective_project(self) -> tuple[ProjectInstance | None, bool]:
+        """Resolve a project for unprefixed single-project-only endpoints.
+
+        Resolution order: _single > len==1 > _current_project_name > None.
+        Returns (project, auto_selected) where auto_selected is True when
+        the project was inferred from the current-project pointer.
+        """
+        if self._single:
+            return self._single, False
+        if len(self._projects) == 1:
+            return next(iter(self._projects.values())), False
+        if self._current_project_name and self._current_project_name in self._projects:
+            return self._projects[self._current_project_name], True
+        return None, False
+
+    # --- Property proxies (single-project convenience) ---
 
     @property
     def _compiling(self) -> bool:
@@ -355,21 +441,33 @@ class TexWatchServer:
         self.app.router.add_get(r"/p/{name:.+}/errors", self._handle_project_errors)
         self.app.router.add_get(r"/p/{name:.+}/context", self._handle_project_context)
         self.app.router.add_get(r"/p/{name:.+}/structure", self._handle_project_structure)
+        self.app.router.add_get(r"/p/{name:.+}/bibliography", self._handle_project_bibliography)
+        self.app.router.add_get(r"/p/{name:.+}/environments", self._handle_project_environments)
+        self.app.router.add_get(r"/p/{name:.+}/digest", self._handle_project_digest)
+        self.app.router.add_get(r"/p/{name:.+}/activity", self._handle_project_activity)
+        self.app.router.add_get(r"/p/{name}/history/{file:.+}", self._handle_project_history)
 
-        # Legacy unprefixed routes (single-project backwards compat)
-        self.app.router.add_get("/ws", self._handle_legacy_ws)
-        self.app.router.add_get("/status", self._handle_legacy_status)
-        self.app.router.add_post("/goto", self._handle_legacy_goto)
-        self.app.router.add_post("/compile", self._handle_legacy_compile)
-        self.app.router.add_get("/capture", self._handle_legacy_capture)
-        self.app.router.add_get("/config", self._handle_legacy_config)
-        self.app.router.add_get("/source", self._handle_legacy_get_source)
-        self.app.router.add_post("/source", self._handle_legacy_post_source)
-        self.app.router.add_get("/pdf", self._handle_legacy_pdf)
-        self.app.router.add_get("/files", self._handle_legacy_files)
-        self.app.router.add_get("/errors", self._handle_legacy_errors)
-        self.app.router.add_get("/context", self._handle_legacy_context)
-        self.app.router.add_get("/structure", self._handle_legacy_structure)
+        # Unprefixed routes (resolve to single project or aggregate)
+        self.app.router.add_get("/ws", self._handle_root_ws)
+        self.app.router.add_get("/status", self._handle_root_status)
+        self.app.router.add_post("/goto", self._handle_root_goto)
+        self.app.router.add_post("/compile", self._handle_root_compile)
+        self.app.router.add_get("/capture", self._handle_root_capture)
+        self.app.router.add_get("/config", self._handle_root_config)
+        self.app.router.add_get("/source", self._handle_root_get_source)
+        self.app.router.add_post("/source", self._handle_root_post_source)
+        self.app.router.add_get("/pdf", self._handle_root_pdf)
+        self.app.router.add_get("/files", self._handle_root_files)
+        self.app.router.add_get("/errors", self._handle_root_errors)
+        self.app.router.add_get("/context", self._handle_root_context)
+        self.app.router.add_get("/structure", self._handle_root_structure)
+        self.app.router.add_get("/bibliography", self._handle_root_bibliography)
+        self.app.router.add_get("/environments", self._handle_root_environments)
+        self.app.router.add_get("/digest", self._handle_root_digest)
+        self.app.router.add_get("/activity", self._handle_root_activity)
+        self.app.router.add_get(r"/history/{file:.+}", self._handle_root_history)
+        self.app.router.add_get("/current", self._handle_get_current)
+        self.app.router.add_post("/current", self._handle_set_current)
 
     def _get_project(self, request: web.Request) -> ProjectInstance | None:
         """Extract project instance from URL path parameter."""
@@ -377,13 +475,42 @@ class TexWatchServer:
         return self._projects.get(name)
 
     def _get_single_project(self) -> ProjectInstance | None:
-        """Get the single project for legacy routes."""
+        """Get the single project for unprefixed routes.
+
+        Returns None when multiple projects are loaded, signalling that
+        the route should aggregate or reject.
+        """
         if self._single:
             return self._single
-        # Fallback: if there's exactly one project, use it
         if len(self._projects) == 1:
             return next(iter(self._projects.values()))
         return None
+
+    def _multi_project_error(self, endpoint: str) -> web.Response:
+        """Return 400 with available project names for single-project-only endpoints."""
+        return web.json_response(
+            {
+                "error": "Multi-project server: specify a project",
+                "hint": f"Use /p/{{name}}/{endpoint}",
+                "projects": list(self._projects.keys()),
+            },
+            status=400,
+        )
+
+    def _aggregate_response(
+        self, builder: str,
+    ) -> web.Response:
+        """Aggregate a per-project response across all projects.
+
+        Calls the named ``_build_*_response`` method on each project and
+        collects the results into ``{name: data}`` keyed by project name.
+        """
+        build_fn = getattr(self, builder)
+        result = {}
+        for name, proj in self._projects.items():
+            resp = build_fn(proj)
+            result[name] = json.loads(resp.body)  # type: ignore[arg-type]
+        return web.json_response(result)
 
     def _require_project(self, request: web.Request) -> ProjectInstance:
         """Get project from request or raise 404."""
@@ -398,7 +525,7 @@ class TexWatchServer:
     async def _handle_root(self, request: web.Request) -> web.Response:
         """Handle GET / — dashboard or redirect to single project."""
         if len(self._projects) == 1:
-            # For single-project, serve index.html directly (legacy compat)
+            # Single project: serve index.html directly
             return self._serve_index_html("")
         return self._serve_dashboard_html()
 
@@ -468,85 +595,196 @@ class TexWatchServer:
         proj = self._require_project(request)
         return self._build_structure_response(proj)
 
-    # --- Legacy single-project routes ---
+    async def _handle_project_bibliography(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_bibliography_response(proj)
 
-    async def _handle_legacy_ws(self, request: web.Request) -> web.WebSocketResponse:
-        proj = self._get_single_project()
+    async def _handle_project_environments(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_environments_response(proj)
+
+    async def _handle_project_digest(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_digest_response(proj)
+
+    async def _handle_project_activity(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_activity_response(proj.events, request)
+
+    async def _handle_project_history(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        file_param = request.match_info.get("file", "")
+        snapshots = [s for s in reversed(proj.file_snapshots) if s["file"] == file_param]
+        return web.json_response({"file": file_param, "snapshots": snapshots})
+
+    # --- Unprefixed routes (single-project or aggregate) ---
+
+    def _auto_selected_response(
+        self, response: web.Response, proj: ProjectInstance, auto: bool,
+    ) -> web.Response:
+        """Add X-Texwatch-Project header when project was auto-selected."""
+        if auto:
+            response.headers["X-Texwatch-Project"] = proj.name
+        return response
+
+    async def _handle_root_ws(self, request: web.Request) -> web.WebSocketResponse:
+        proj, auto = self._get_effective_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/ws")
+            raise web.HTTPBadRequest(
+                text=json.dumps({
+                    "error": "Multi-project server: specify a project",
+                    "hint": "Use /p/{name}/ws",
+                    "projects": list(self._projects.keys()),
+                }),
+                content_type="application/json",
+            )
         return await self._handle_websocket(request, proj)
 
-    async def _handle_legacy_status(self, request: web.Request) -> web.Response:
+    async def _handle_root_status(self, request: web.Request) -> web.Response:
         proj = self._get_single_project()
         if proj is None:
             return await self._handle_projects(request)
         return self._build_status_response(proj)
 
-    async def _handle_legacy_goto(self, request: web.Request) -> web.Response:
-        proj = self._get_single_project()
+    async def _handle_root_goto(self, request: web.Request) -> web.Response:
+        proj, auto = self._get_effective_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/goto")
-        return await self._handle_goto(request, proj)
+            return self._multi_project_error("goto")
+        resp = await self._handle_goto(request, proj)
+        return self._auto_selected_response(resp, proj, auto)
 
-    async def _handle_legacy_compile(self, request: web.Request) -> web.Response:
+    async def _handle_root_compile(self, request: web.Request) -> web.Response:
         proj = self._get_single_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/compile")
+            await asyncio.gather(*(p.do_compile() for p in self._projects.values()))
+            results = {
+                name: _result_to_dict(p.last_result) if p.last_result else None
+                for name, p in self._projects.items()
+            }
+            return web.json_response({"projects": results})
         return await self._handle_compile(request, proj)
 
-    async def _handle_legacy_capture(self, request: web.Request) -> web.Response:
-        proj = self._get_single_project()
+    async def _handle_root_capture(self, request: web.Request) -> web.Response:
+        proj, auto = self._get_effective_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/capture")
-        return await self._handle_capture(request, proj)
+            return self._multi_project_error("capture")
+        resp = await self._handle_capture(request, proj)
+        return self._auto_selected_response(resp, proj, auto)
 
-    async def _handle_legacy_config(self, request: web.Request) -> web.Response:
-        proj = self._get_single_project()
+    async def _handle_root_config(self, request: web.Request) -> web.Response:
+        proj, auto = self._get_effective_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/config")
-        return web.json_response(proj.config.to_dict())
+            return self._multi_project_error("config")
+        resp = web.json_response(proj.config.to_dict())
+        return self._auto_selected_response(resp, proj, auto)
 
-    async def _handle_legacy_get_source(self, request: web.Request) -> web.Response:
-        proj = self._get_single_project()
+    async def _handle_root_get_source(self, request: web.Request) -> web.Response:
+        proj, auto = self._get_effective_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/source")
-        return self._handle_get_source(request, proj)
+            return self._multi_project_error("source")
+        resp = self._handle_get_source(request, proj)
+        return self._auto_selected_response(resp, proj, auto)
 
-    async def _handle_legacy_post_source(self, request: web.Request) -> web.Response:
-        proj = self._get_single_project()
+    async def _handle_root_post_source(self, request: web.Request) -> web.Response:
+        proj, auto = self._get_effective_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/source")
-        return await self._handle_post_source_impl(request, proj)
+            return self._multi_project_error("source")
+        resp = await self._handle_post_source_impl(request, proj)
+        return self._auto_selected_response(resp, proj, auto)
 
-    async def _handle_legacy_pdf(self, request: web.Request) -> web.Response:
-        proj = self._get_single_project()
+    async def _handle_root_pdf(self, request: web.Request) -> web.Response:
+        proj, auto = self._get_effective_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/pdf")
-        return self._serve_pdf(proj)
+            return self._multi_project_error("pdf")
+        resp = self._serve_pdf(proj)
+        return self._auto_selected_response(resp, proj, auto)
 
-    async def _handle_legacy_files(self, request: web.Request) -> web.Response:
+    def _single_or_aggregate(self, builder: str) -> web.Response:
+        """Return single-project response or aggregate across all projects."""
         proj = self._get_single_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/files")
-        return self._build_files_response(proj)
+            return self._aggregate_response(builder)
+        return getattr(self, builder)(proj)
 
-    async def _handle_legacy_errors(self, request: web.Request) -> web.Response:
-        proj = self._get_single_project()
-        if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/errors")
-        return self._build_errors_response(proj)
+    async def _handle_root_files(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_files_response")
 
-    async def _handle_legacy_context(self, request: web.Request) -> web.Response:
-        proj = self._get_single_project()
-        if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/context")
-        return self._build_context_response(proj)
+    async def _handle_root_errors(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_errors_response")
 
-    async def _handle_legacy_structure(self, request: web.Request) -> web.Response:
-        proj = self._get_single_project()
+    async def _handle_root_context(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_context_response")
+
+    async def _handle_root_structure(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_structure_response")
+
+    async def _handle_root_bibliography(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_bibliography_response")
+
+    async def _handle_root_environments(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_environments_response")
+
+    async def _handle_root_digest(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_digest_response")
+
+    async def _handle_root_activity(self, request: web.Request) -> web.Response:
+        """Handle GET /activity — global activity log."""
+        return self._build_activity_response(self._global_events, request)
+
+    async def _handle_root_history(self, request: web.Request) -> web.Response:
+        """Handle GET /history/{file} — resolve to effective project."""
+        proj, auto = self._get_effective_project()
         if proj is None:
-            raise web.HTTPBadRequest(text="Multi-project server: use /p/{name}/structure")
-        return self._build_structure_response(proj)
+            return self._multi_project_error("history/{file}")
+        file_param = request.match_info.get("file", "")
+        snapshots = [s for s in reversed(proj.file_snapshots) if s["file"] == file_param]
+        resp = web.json_response({"file": file_param, "snapshots": snapshots})
+        return self._auto_selected_response(resp, proj, auto)
+
+    async def _handle_get_current(self, request: web.Request) -> web.Response:
+        """Handle GET /current — return current project name."""
+        name = self._current_project_name
+        if name and name in self._projects:
+            return web.json_response({"current": name})
+        return web.json_response({
+            "current": None,
+            "projects": list(self._projects.keys()),
+        })
+
+    async def _handle_set_current(self, request: web.Request) -> web.Response:
+        """Handle POST /current — switch current project."""
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        name = data.get("project")
+        if not name or name not in self._projects:
+            return web.json_response({
+                "error": f"Unknown project: {name}",
+                "projects": list(self._projects.keys()),
+            }, status=400)
+
+        self._current_project_name = name
+        return web.json_response({"current": name})
+
+    def _build_activity_response(
+        self, events: deque[dict], request: web.Request,
+    ) -> web.Response:
+        """Build activity response with optional limit and type filters."""
+        limit_str = request.query.get("limit", "50")
+        try:
+            limit = int(limit_str)
+        except ValueError:
+            limit = 50
+        limit = max(1, min(limit, 500))
+
+        type_filter = request.query.get("type")
+        items = list(reversed(events))  # newest first
+        if type_filter:
+            items = [e for e in items if e.get("type") == type_filter]
+        items = items[:limit]
+        return web.json_response({"events": items})
 
     # --- Shared handler implementations ---
 
@@ -577,7 +815,8 @@ class TexWatchServer:
 
         # Fallback inline dashboard
         project_links = "".join(
-            f'<li><a href="/p/{name}/">{name}</a> — {p.config.main}</li>\n'
+            f'<li><a href="/p/{html_escape(name)}/">{html_escape(name)}</a>'
+            f' — {html_escape(p.config.main)}</li>\n'
             for name, p in self._projects.items()
         )
         html = f"""<!DOCTYPE html>
@@ -622,22 +861,38 @@ class TexWatchServer:
     ) -> None:
         """Handle incoming WebSocket message."""
         msg_type = data.get("type")
+        # Update current project on any WS message
+        self._current_project_name = proj.name
 
         if msg_type == "viewer_state":
             proj.viewer_state.update(data.get("state", {}))
             if proj.synctex_data:
                 page = proj.viewer_state.get("page", 1)
                 proj.viewer_state["visible_lines"] = get_visible_lines(proj.synctex_data, page)
+            # Deduplicated page_view event
+            page = proj.viewer_state.get("page")
+            total = proj.viewer_state.get("total_pages")
+            if page is not None and {"page": page} != proj._last_page_view:
+                proj._last_page_view = {"page": page}
+                proj.log_event("page_view", page=page, total_pages=total)
             logger.debug(f"[{proj.name}] Viewer state updated: {proj.viewer_state}")
 
         elif msg_type == "editor_state":
             proj.editor_state.update(data.get("state", {}))
+            # Deduplicated file_edit event
+            file = proj.editor_state.get("file")
+            line = proj.editor_state.get("line")
+            cur = {"file": file, "line": line}
+            if cur != proj._last_file_edit:
+                proj._last_file_edit = cur
+                proj.log_event("file_edit", file=file, line=line)
             logger.debug(f"[{proj.name}] Editor state updated: {proj.editor_state}")
 
         elif msg_type == "click":
             page = data.get("page")
             x = data.get("x")
             y = data.get("y")
+            proj.log_event("click", page=page, x=x, y=y)
             logger.debug(
                 "reverse-sync: click page=%s x=%s y=%s, synctex_data=%s",
                 page, x, y, "loaded" if proj.synctex_data else "None",
@@ -758,29 +1013,84 @@ class TexWatchServer:
             structure = parse_structure(main_file, watch_dir)
         except Exception:
             logger.debug("structure endpoint: parse_structure failed", exc_info=True)
+            structure = DocumentStructure()
+
+        return web.json_response(dataclasses.asdict(structure))
+
+    def _build_bibliography_response(self, proj: ProjectInstance) -> web.Response:
+        """Build GET /bibliography response for a project."""
+        main_file = get_main_file(proj.config)
+        watch_dir = get_watch_dir(proj.config)
+
+        try:
+            bib = parse_bibliography(main_file, watch_dir)
+        except Exception:
+            logger.debug("bibliography endpoint: parse failed", exc_info=True)
             return web.json_response({
-                "sections": [],
-                "todos": [],
-                "inputs": [],
-                "word_count": None,
+                "entries": [], "citations": [],
+                "uncited_keys": [], "undefined_keys": [],
             })
 
-        response: dict[str, Any] = {
-            "sections": [
-                {"level": s.level, "title": s.title, "file": s.file, "line": s.line}
-                for s in structure.sections
-            ],
-            "todos": [
-                {"text": t.text, "file": t.file, "line": t.line, "tag": t.tag}
-                for t in structure.todos
-            ],
-            "inputs": [
-                {"path": i.path, "file": i.file, "line": i.line}
-                for i in structure.inputs
-            ],
-            "word_count": structure.word_count,
-        }
-        return web.json_response(response)
+        return web.json_response(dataclasses.asdict(bib))
+
+    def _build_environments_response(self, proj: ProjectInstance) -> web.Response:
+        """Build GET /environments response for a project."""
+        main_file = get_main_file(proj.config)
+        watch_dir = get_watch_dir(proj.config)
+
+        try:
+            envs = parse_environments(main_file, watch_dir)
+        except Exception:
+            logger.debug("environments endpoint: parse failed", exc_info=True)
+            return web.json_response({"environments": []})
+
+        return web.json_response({
+            "environments": [dataclasses.asdict(e) for e in envs],
+        })
+
+    def _build_digest_response(self, proj: ProjectInstance) -> web.Response:
+        """Build GET /digest response for a project."""
+        main_file = get_main_file(proj.config)
+        watch_dir = get_watch_dir(proj.config)
+
+        try:
+            digest = parse_digest(main_file, watch_dir)
+        except Exception:
+            logger.debug("digest endpoint: parse failed", exc_info=True)
+            digest = Digest()
+
+        return web.json_response(dataclasses.asdict(digest))
+
+    async def _goto_estimated_page(
+        self,
+        proj: ProjectInstance,
+        source_line: int,
+        main_file: Path,
+        extra: dict[str, Any] | None = None,
+    ) -> web.Response:
+        """Estimate a PDF page from a source line and broadcast goto.
+
+        Used as fallback when SyncTeX data is unavailable or misses.
+        """
+        response_extra = extra or {}
+        total_pages = proj.viewer_state.get("total_pages", 0)
+        if total_pages > 0:
+            total_lines = _count_source_lines(main_file)
+            if total_lines > 0:
+                estimated_page = round(source_line / total_lines * total_pages)
+                estimated_page = max(1, min(estimated_page, total_pages))
+            else:
+                estimated_page = max(1, min(source_line, total_pages))
+            await proj.broadcast({"type": "goto", "page": estimated_page})
+            return web.json_response({
+                "success": True,
+                "page": estimated_page,
+                "estimated": True,
+                **response_extra,
+            })
+
+        await proj.broadcast({"type": "goto", "page": 1})
+        return web.json_response({"success": True, "estimated": True, **response_extra})
 
     async def _handle_goto(self, request: web.Request, proj: ProjectInstance) -> web.Response:
         """Handle POST /goto for a project."""
@@ -797,6 +1107,7 @@ class TexWatchServer:
                 )
             line = data["line"]
             file_name = data.get("file") or proj.editor_state.get("file") or str(main_file.name)
+            proj.log_event("goto", target_type="line", value=line)
             logger.debug(
                 "goto: line=%d, file=%s, synctex_data=%s",
                 line, file_name, "loaded" if proj.synctex_data else "None",
@@ -819,30 +1130,16 @@ class TexWatchServer:
                     return web.json_response({"success": True, "page": pos.page})
 
             logger.debug("goto: synctex miss for line=%d, falling back to page estimation", line)
-            total_pages = proj.viewer_state.get("total_pages", 0)
-            if total_pages > 0:
-                total_lines = _count_source_lines(main_file)
-                if total_lines > 0:
-                    estimated_page = round(line / total_lines * total_pages)
-                    estimated_page = max(1, min(estimated_page, total_pages))
-                else:
-                    estimated_page = max(1, min(line, total_pages))
-                await proj.broadcast({"type": "goto", "page": estimated_page})
-                return web.json_response({
-                    "success": True,
-                    "page": estimated_page,
-                    "estimated": True,
-                })
-
-            await proj.broadcast({"type": "goto", "page": 1})
-            return web.json_response({"success": True, "estimated": True})
+            return await self._goto_estimated_page(proj, line, main_file)
 
         if "page" in data:
             page = data["page"]
+            proj.log_event("goto", target_type="page", value=page)
             await proj.broadcast({"type": "goto", "page": page})
             return web.json_response({"success": True, "page": page})
 
         if "section" in data:
+            proj.log_event("goto", target_type="section", value=data["section"])
             query = data["section"]
             main_file = get_main_file(proj.config)
             watch_dir = get_watch_dir(proj.config)
@@ -903,30 +1200,10 @@ class TexWatchServer:
                         "section": matched.title,
                     })
 
-            # Fallback: estimate page from line position
             logger.debug("goto section: synctex miss, falling back to page estimation")
-            total_pages = proj.viewer_state.get("total_pages", 0)
-            if total_pages > 0:
-                total_lines = _count_source_lines(main_file)
-                if total_lines > 0:
-                    estimated_page = round(matched.line / total_lines * total_pages)
-                    estimated_page = max(1, min(estimated_page, total_pages))
-                else:
-                    estimated_page = max(1, min(matched.line, total_pages))
-                await proj.broadcast({"type": "goto", "page": estimated_page})
-                return web.json_response({
-                    "success": True,
-                    "page": estimated_page,
-                    "section": matched.title,
-                    "estimated": True,
-                })
-
-            await proj.broadcast({"type": "goto", "page": 1})
-            return web.json_response({
-                "success": True,
-                "section": matched.title,
-                "estimated": True,
-            })
+            return await self._goto_estimated_page(
+                proj, matched.line, main_file, extra={"section": matched.title},
+            )
 
         return web.json_response({"error": "Must specify line, page, or section"}, status=400)
 
@@ -937,10 +1214,9 @@ class TexWatchServer:
 
         await proj.do_compile()
 
-        if proj.last_result:
-            return web.json_response(_result_to_dict(proj.last_result))
-        else:
+        if not proj.last_result:
             return web.json_response({"error": "Compilation failed"}, status=500)
+        return web.json_response(_result_to_dict(proj.last_result))
 
     async def _handle_capture(self, request: web.Request, proj: ProjectInstance) -> web.Response:
         """Handle GET /capture for a project."""
@@ -1005,6 +1281,7 @@ class TexWatchServer:
         finally:
             doc.close()
 
+        proj.log_event("capture", page=page_num, dpi=dpi)
         return web.Response(body=png_data, content_type="image/png")
 
     def _handle_get_source(self, request: web.Request, proj: ProjectInstance) -> web.Response:
@@ -1029,6 +1306,7 @@ class TexWatchServer:
 
         content = file_path.read_text(encoding="utf-8", errors="replace")
         mtime_ns = str(file_path.stat().st_mtime_ns)
+        proj.log_event("source_read", file=file_param)
         return web.json_response({"file": file_param, "content": content, "mtime_ns": mtime_ns})
 
     async def _handle_post_source_impl(
@@ -1071,8 +1349,22 @@ class TexWatchServer:
                     status=409,
                 )
 
+        # Stash old content as a snapshot before overwriting
+        try:
+            old_content = file_path.read_text(encoding="utf-8", errors="replace")
+            old_mtime_ns = str(file_path.stat().st_mtime_ns)
+            proj.file_snapshots.append({
+                "file": file_param,
+                "content": old_content,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "mtime_ns": old_mtime_ns,
+            })
+        except OSError:
+            pass
+
         file_path.write_text(content, encoding="utf-8")
         new_mtime_ns = str(file_path.stat().st_mtime_ns)
+        proj.log_event("source_write", file=file_param)
         return web.json_response({"success": True, "mtime_ns": new_mtime_ns})
 
     def _serve_pdf(self, proj: ProjectInstance) -> web.Response:
@@ -1080,20 +1372,30 @@ class TexWatchServer:
         main_file = get_main_file(proj.config)
         pdf_path = main_file.with_suffix(".pdf")
 
-        if pdf_path.exists():
-            # FileResponse is a StreamResponse subclass, but type stubs are imprecise
-            return web.FileResponse(  # type: ignore[return-value]
-                pdf_path,
-                headers={"Content-Type": "application/pdf"},
-            )
-        else:
+        if not pdf_path.exists():
             return web.json_response({"error": "PDF not found"}, status=404)
+
+        # FileResponse is a StreamResponse subclass, but type stubs are imprecise
+        return web.FileResponse(  # type: ignore[return-value]
+            pdf_path,
+            headers={"Content-Type": "application/pdf"},
+        )
 
     def _build_files_response(self, proj: ProjectInstance) -> web.Response:
         """Build GET /files response for a project."""
         watch_dir = get_watch_dir(proj.config)
         tree = self._build_file_tree(watch_dir, watch_dir)
         return web.json_response({"root": watch_dir.name, "children": tree})
+
+    @staticmethod
+    def _is_symlink_escape(item: Path, base_dir: Path) -> bool:
+        """Return True if *item* is a symlink pointing outside *base_dir*."""
+        if not item.is_symlink():
+            return False
+        try:
+            return not item.resolve().is_relative_to(base_dir.resolve())
+        except (OSError, ValueError):
+            return True
 
     def _build_file_tree(self, directory: Path, base_dir: Path) -> list[dict]:
         """Build a recursive file tree of relevant project files."""
@@ -1113,45 +1415,30 @@ class TexWatchServer:
         for item in items:
             if item.name.startswith("."):
                 continue
+            if self._is_symlink_escape(item, base_dir):
+                continue
 
             if item.is_dir():
                 if item.name in SKIP_DIRS:
                     continue
-                if item.is_symlink():
-                    try:
-                        resolved = item.resolve()
-                        if not resolved.is_relative_to(base_dir.resolve()):
-                            continue
-                    except (OSError, ValueError):
-                        continue
                 children = self._build_file_tree(item, base_dir)
                 if children:
-                    rel_path = str(item.relative_to(base_dir))
                     entries.append({
                         "name": item.name,
-                        "path": rel_path,
+                        "path": str(item.relative_to(base_dir)),
                         "type": "directory",
                         "children": children,
                     })
-            elif item.is_file():
-                if item.is_symlink():
-                    try:
-                        resolved = item.resolve()
-                        if not resolved.is_relative_to(base_dir.resolve()):
-                            continue
-                    except (OSError, ValueError):
-                        continue
-                if item.suffix.lower() in RELEVANT_EXTENSIONS:
-                    rel_path = str(item.relative_to(base_dir))
-                    entries.append({
-                        "name": item.name,
-                        "path": rel_path,
-                        "type": "file",
-                    })
+            elif item.is_file() and item.suffix.lower() in RELEVANT_EXTENSIONS:
+                entries.append({
+                    "name": item.name,
+                    "path": str(item.relative_to(base_dir)),
+                    "type": "file",
+                })
 
         return entries
 
-    # --- Legacy helper methods (kept for test compat) ---
+    # --- Single-project convenience methods (used by tests) ---
 
     def _result_to_dict(self, result: CompileResult) -> dict[str, Any]:
         return _result_to_dict(result)
@@ -1163,22 +1450,22 @@ class TexWatchServer:
         return _count_source_lines(path)
 
     async def _send_state(self, ws: web.WebSocketResponse) -> None:
-        """Legacy: send state from single project."""
+        """Send state from the single project."""
         if self._single:
             await self._single.send_state(ws)
 
     async def _broadcast(self, message: dict) -> None:
-        """Legacy: broadcast to single project."""
+        """Broadcast to the single project."""
         if self._single:
             await self._single.broadcast(message)
 
     async def _do_compile(self) -> None:
-        """Legacy: compile single project."""
+        """Compile the single project."""
         if self._single:
             await self._single.do_compile()
 
     async def _on_file_change(self, changed_path: str) -> None:
-        """Legacy: handle file change for single project."""
+        """Handle file change for the single project."""
         if self._single:
             await self._single.on_file_change(changed_path)
 
@@ -1197,7 +1484,9 @@ class TexWatchServer:
                 on_change=proj.on_file_change,
             )
             proj.watcher.start(loop)
-            await proj.do_compile()
+
+        # Compile all projects in parallel
+        await asyncio.gather(*(proj.do_compile() for proj in self._projects.values()))
 
     async def stop(self) -> None:
         """Stop all watchers and close all WebSocket connections."""
