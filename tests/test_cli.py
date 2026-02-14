@@ -2192,8 +2192,24 @@ class TestAutoProjectHeader:
 # ---------------------------------------------------------------------------
 
 
+def _dashboard_data(**overrides: object) -> dict:
+    """Build minimal dashboard response data with overrides."""
+    base: dict = {
+        "health": {"title": "Test", "compile_status": "none", "word_count": 0,
+                    "page_count": 0, "page_limit": None, "documentclass": "article",
+                    "error_count": 0, "warning_count": 0, "last_compile": None,
+                    "author": None, "date": None},
+        "sections": [], "issues": [], "bibliography": {"defined": 0, "cited": 0,
+                    "undefined_keys": [], "uncited_keys": []},
+        "changes": [], "environments": {"items": []},
+        "context": {"editor": {}, "viewer": {}}, "files": [], "activity": [],
+    }
+    base.update(overrides)
+    return base
+
+
 class TestCmdBibliography:
-    """Tests for bibliography command."""
+    """Tests for bibliography command (redirects through dashboard)."""
 
     def test_subcommand_parsed(self):
         parser = build_parser()
@@ -2204,12 +2220,9 @@ class TestCmdBibliography:
         assert "bibliography" in _DISPATCH
 
     def test_json_output(self, capsys):
-        mock_data = {
-            "entries": [{"key": "k1", "entry_type": "article", "fields": {"author": "A", "year": "2020", "title": "T"}, "file": "r.bib", "line": 1}],
-            "citations": [{"command": "cite", "keys": ["k1"], "file": "main.tex", "line": 5}],
-            "uncited_keys": [],
-            "undefined_keys": [],
-        }
+        mock_data = _dashboard_data(bibliography={
+            "defined": 5, "cited": 3, "undefined_keys": [], "uncited_keys": ["k1"],
+        })
         with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=mock_data)):
             parser = build_parser()
             args = parser.parse_args(["bibliography", "--json"])
@@ -2218,15 +2231,15 @@ class TestCmdBibliography:
         assert result == EXIT_OK
         output = capsys.readouterr().out
         parsed = json.loads(output)
-        assert "entries" in parsed
+        assert "bibliography" in parsed
+        assert parsed["bibliography"]["defined"] == 5
 
     def test_human_output(self, capsys):
-        mock_data = {
-            "entries": [{"key": "k1", "entry_type": "article", "fields": {"author": "Smith", "year": "2020", "title": "Paper"}, "file": "r.bib", "line": 1}],
-            "citations": [],
-            "uncited_keys": ["k1"],
+        mock_data = _dashboard_data(bibliography={
+            "defined": 10, "cited": 8,
             "undefined_keys": ["missing"],
-        }
+            "uncited_keys": ["unused"],
+        })
         with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=mock_data)):
             parser = build_parser()
             args = parser.parse_args(["bibliography"])
@@ -2234,9 +2247,9 @@ class TestCmdBibliography:
 
         assert result == EXIT_OK
         output = capsys.readouterr().out
-        assert "Smith" in output
-        assert "Uncited entries" in output
-        assert "Undefined citations" in output
+        assert "10 defined" in output
+        assert "Uncited" in output
+        assert "Undefined" in output
 
     def test_server_down(self, capsys):
         with patch("texwatch.cli._api_get", return_value=APIResponse(status=0, server_down=True)):
@@ -2248,7 +2261,7 @@ class TestCmdBibliography:
 
 
 class TestCmdEnvironments:
-    """Tests for environments command."""
+    """Tests for environments command (redirects through dashboard)."""
 
     def test_subcommand_parsed(self):
         parser = build_parser()
@@ -2259,11 +2272,11 @@ class TestCmdEnvironments:
         assert "environments" in _DISPATCH
 
     def test_json_output(self, capsys):
-        mock_data = {
-            "environments": [
-                {"env_type": "theorem", "label": "thm:1", "name": "Main", "caption": None, "file": "main.tex", "start_line": 5, "end_line": 10},
-            ],
-        }
+        mock_data = _dashboard_data(environments={
+            "theorem": 1,
+            "items": [{"env_type": "theorem", "label": "thm:1", "name": "Main",
+                        "caption": None, "file": "main.tex", "start_line": 5, "end_line": 10}],
+        })
         with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=mock_data)):
             parser = build_parser()
             args = parser.parse_args(["environments", "--json"])
@@ -2275,12 +2288,15 @@ class TestCmdEnvironments:
         assert "environments" in parsed
 
     def test_human_output(self, capsys):
-        mock_data = {
-            "environments": [
-                {"env_type": "theorem", "label": "thm:1", "name": "Main", "caption": None, "file": "main.tex", "start_line": 5, "end_line": 10},
-                {"env_type": "figure", "label": "fig:1", "name": None, "caption": "A figure", "file": "main.tex", "start_line": 15, "end_line": 20},
+        mock_data = _dashboard_data(environments={
+            "theorem": 1, "figure": 1,
+            "items": [
+                {"env_type": "theorem", "label": "thm:1", "name": "Main",
+                 "caption": None, "file": "main.tex", "start_line": 5, "end_line": 10},
+                {"env_type": "figure", "label": "fig:1", "name": None,
+                 "caption": "A figure", "file": "main.tex", "start_line": 15, "end_line": 20},
             ],
-        }
+        })
         with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=mock_data)):
             parser = build_parser()
             args = parser.parse_args(["environments"])
@@ -2288,12 +2304,11 @@ class TestCmdEnvironments:
 
         assert result == EXIT_OK
         output = capsys.readouterr().out
-        assert "theorem" in output
-        assert "Main" in output
-        assert "figure" in output
+        assert "theorem" in output.lower()
+        assert "figure" in output.lower()
 
     def test_empty_environments(self, capsys):
-        mock_data = {"environments": []}
+        mock_data = _dashboard_data(environments={"items": []})
         with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=mock_data)):
             parser = build_parser()
             args = parser.parse_args(["environments"])
@@ -2301,11 +2316,11 @@ class TestCmdEnvironments:
 
         assert result == EXIT_OK
         output = capsys.readouterr().out
-        assert "No tracked environments" in output
+        assert "No tracked environments found" in output
 
 
 class TestCmdDigest:
-    """Tests for digest command."""
+    """Tests for digest command (redirects through dashboard as health)."""
 
     def test_subcommand_parsed(self):
         parser = build_parser()
@@ -2316,16 +2331,12 @@ class TestCmdDigest:
         assert "digest" in _DISPATCH
 
     def test_json_output(self, capsys):
-        mock_data = {
-            "documentclass": "article",
-            "class_options": ["12pt"],
-            "title": "Test",
-            "author": "Author",
-            "date": "2024",
-            "abstract": "Abstract text.",
-            "packages": [{"name": "amsmath", "options": ""}],
-            "commands": [{"command_type": "newcommand", "name": "\\R", "definition": "\\mathbb{R}", "args": None}],
-        }
+        mock_data = _dashboard_data(health={
+            "title": "Test", "compile_status": "success", "word_count": 1000,
+            "page_count": 5, "page_limit": 8, "documentclass": "article",
+            "error_count": 0, "warning_count": 0, "last_compile": None,
+            "author": "Author", "date": "2024",
+        })
         with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=mock_data)):
             parser = build_parser()
             args = parser.parse_args(["digest", "--json"])
@@ -2334,19 +2345,16 @@ class TestCmdDigest:
         assert result == EXIT_OK
         output = capsys.readouterr().out
         parsed = json.loads(output)
-        assert parsed["documentclass"] == "article"
+        assert "health" in parsed
+        assert parsed["health"]["documentclass"] == "article"
 
     def test_human_output(self, capsys):
-        mock_data = {
-            "documentclass": "article",
-            "class_options": ["11pt", "a4paper"],
-            "title": "My Paper",
-            "author": "Jane Doe",
-            "date": "2024",
-            "abstract": "We study important things in this paper.",
-            "packages": [{"name": "amsmath", "options": ""}],
-            "commands": [{"command_type": "newcommand", "name": "\\R", "definition": "\\mathbb{R}", "args": 0}],
-        }
+        mock_data = _dashboard_data(health={
+            "title": "My Paper", "compile_status": "success", "word_count": 5000,
+            "page_count": 10, "page_limit": 12, "documentclass": "article",
+            "error_count": 0, "warning_count": 0, "last_compile": None,
+            "author": "Jane Doe", "date": "2024",
+        })
         with patch("texwatch.cli._api_get", return_value=APIResponse(status=200, data=mock_data)):
             parser = build_parser()
             args = parser.parse_args(["digest"])
@@ -2356,8 +2364,6 @@ class TestCmdDigest:
         output = capsys.readouterr().out
         assert "article" in output
         assert "My Paper" in output
-        assert "Jane Doe" in output
-        assert "amsmath" in output
 
     def test_server_down(self, capsys):
         with patch("texwatch.cli._api_get", return_value=APIResponse(status=0, server_down=True)):
@@ -3394,14 +3400,15 @@ class TestCmdCurrent:
 
 
 class _FallbackHandler(_CurrentAwareHandler):
-    """Handler adding /p/alpha/environments to the base multi-project routes."""
+    """Handler adding /p/alpha/dashboard to the base multi-project routes."""
 
     def handle_get_extra(self) -> bool:
-        if self.path == "/p/alpha/environments":
-            self._json_response({"environments": [
-                {"env_type": "figure", "file": "main.tex",
-                 "start_line": 10, "end_line": 15},
-            ]})
+        if self.path == "/p/alpha/dashboard":
+            self._json_response(_dashboard_data(environments={
+                "figure": 1,
+                "items": [{"env_type": "figure", "file": "main.tex",
+                           "start_line": 10, "end_line": 15}],
+            }))
             return True
         return False
 
@@ -3424,7 +3431,7 @@ class TestMultiProjectCurrentFallback:
         result = main(["environments", "--port", str(server)])
         assert result == EXIT_FAIL
         captured = capsys.readouterr()
-        assert "requires --project" in captured.out
+        assert "environments requires --project" in captured.out
         assert "texwatch current" in captured.out
 
     def test_current_set_auto_resolves(self, server, handler_class, capsys):

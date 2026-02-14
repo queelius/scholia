@@ -994,106 +994,24 @@ def _fetch_endpoint(
 
 
 def cmd_bibliography(args: argparse.Namespace) -> int:
-    """Handle bibliography command — show bibliography analysis."""
-    result = _fetch_endpoint("/bibliography", "bibliography", args)
-    if isinstance(result, int):
-        return result
-    data, _ = result
-
-    entries = data.get("entries", [])
-    citations = data.get("citations", [])
-    uncited = data.get("uncited_keys", [])
-    undefined = data.get("undefined_keys", [])
-
-    print(f"Bibliography entries: {len(entries)}")
-    for e in entries:
-        fields = e.get("fields", {})
-        author = fields.get("author", "")
-        year = fields.get("year", "")
-        title = fields.get("title", "")
-        print(f"  [{e['key']}] {author} ({year}) {title}")
-
-    print(f"\nCitations: {len(citations)}")
-
-    if uncited:
-        print(f"\nUncited entries ({len(uncited)}):")
-        for key in uncited:
-            print(f"  {key}")
-
-    if undefined:
-        print(f"\nUndefined citations ({len(undefined)}):")
-        for key in undefined:
-            print(f"  {key}")
-
-    return EXIT_OK
+    """Handle bibliography command — redirects through dashboard."""
+    args.section = "bibliography"
+    args.redirect_label = "bibliography"
+    return cmd_dashboard(args)
 
 
 def cmd_environments(args: argparse.Namespace) -> int:
-    """Handle environments command — list LaTeX environments."""
-    result = _fetch_endpoint("/environments", "environments", args)
-    if isinstance(result, int):
-        return result
-    data, _ = result
-
-    envs = data.get("environments", [])
-
-    if not envs:
-        print("No tracked environments found")
-        return EXIT_OK
-
-    print(f"Environments ({len(envs)}):")
-    for e in envs:
-        label_str = f" [{e['label']}]" if e.get("label") else ""
-        name_str = f" \"{e['name']}\"" if e.get("name") else ""
-        caption_str = f" — {e['caption']}" if e.get("caption") else ""
-        lines_str = f"{e['start_line']}"
-        if e.get("end_line"):
-            lines_str += f"-{e['end_line']}"
-        print(f"  {e['env_type']}{name_str}{label_str}{caption_str}  ({e['file']}:{lines_str})")
-
-    return EXIT_OK
+    """Handle environments command — redirects through dashboard."""
+    args.section = "environments"
+    args.redirect_label = "environments"
+    return cmd_dashboard(args)
 
 
 def cmd_digest(args: argparse.Namespace) -> int:
-    """Handle digest command — show document metadata."""
-    result = _fetch_endpoint("/digest", "digest", args)
-    if isinstance(result, int):
-        return result
-    data, _ = result
-
-    if data.get("documentclass"):
-        opts = ", ".join(data.get("class_options", []))
-        opts_str = f"[{opts}]" if opts else ""
-        print(f"Document class: {data['documentclass']}{opts_str}")
-
-    if data.get("title"):
-        print(f"Title: {data['title']}")
-    if data.get("author"):
-        print(f"Author: {data['author']}")
-    if data.get("date"):
-        print(f"Date: {data['date']}")
-
-    packages = data.get("packages", [])
-    if packages:
-        print(f"\nPackages ({len(packages)}):")
-        for p in packages:
-            opts_str = f"[{p['options']}]" if p.get("options") else ""
-            print(f"  {p['name']}{opts_str}")
-
-    commands = data.get("commands", [])
-    if commands:
-        print(f"\nCustom commands ({len(commands)}):")
-        for c in commands:
-            args_str = f"[{c['args']}]" if c.get("args") is not None else ""
-            print(f"  {c['name']}{args_str} = {c['definition']}")
-
-    if data.get("abstract"):
-        abstract = data["abstract"]
-        if len(abstract) > 200:
-            abstract = abstract[:200] + "..."
-        print(f"\nAbstract: {abstract}")
-
-    return EXIT_OK
+    """Handle digest command — redirects through dashboard."""
+    args.section = "health"
+    args.redirect_label = "digest"
+    return cmd_dashboard(args)
 
 
 def _print_dashboard_health(data: dict) -> None:
@@ -1208,26 +1126,29 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     """Handle dashboard command — show unified paper state."""
     section = getattr(args, "section", None)
 
-    # When --section is combined with --json, suppress _fetch_endpoint's JSON
-    # handling so we can filter the output to the requested section.
-    json_mode = getattr(args, "json", False)
-    if section and json_mode:
-        args.json = False
-        try:
-            result = _fetch_endpoint("/dashboard", "dashboard", args)
-        finally:
-            args.json = True
+    if section:
+        # Bypass _fetch_endpoint so args.json stays intact for error paths.
+        label = getattr(args, "redirect_label", section)
+        rejected = _reject_if_multi_project(label, args)
+        if rejected is not None:
+            return rejected
+        project = _get_project(args)
+        resp = _api_get("/dashboard", port=args.port, project=project)
+        failed = _check_resp(resp, args, f"Failed to get {label}")
+        if failed is not None:
+            return failed
+        data = resp.data
+        if not isinstance(data, dict):
+            return EXIT_FAIL
+        if getattr(args, "json", False):
+            print(json.dumps({section: data.get(section, {})}))
+            return EXIT_OK
+        _print_auto_project(resp)
     else:
         result = _fetch_endpoint("/dashboard", "dashboard", args)
-
-    if isinstance(result, int):
-        return result
-    data, _ = result
-
-    # JSON mode with section filter
-    if json_mode and section:
-        print(json.dumps({section: data.get(section, {})}))
-        return EXIT_OK
+        if isinstance(result, int):
+            return result
+        data, _ = result
 
     # Human-readable mode: print selected section(s)
     if not section or section == "health":
@@ -1242,6 +1163,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         _print_dashboard_bibliography(data)
     if not section or section == "environments":
         _print_dashboard_environments(data)
+
+    # When a specific section was requested and nothing was printed, show
+    # an empty-state message so the user knows the command succeeded.
+    if section == "environments" and not data.get("environments", {}).get("items"):
+        print("No tracked environments found")
 
     return EXIT_OK
 
