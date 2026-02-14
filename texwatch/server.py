@@ -1233,6 +1233,32 @@ class TexWatchServer:
             "items": [dataclasses.asdict(e) for e in envs],
         }
 
+        # Context — editor/viewer state + current section
+        current_section: str | None = None
+        if structure and structure.sections:
+            editor_file = proj.editor_state.get("file")
+            editor_line = proj.editor_state.get("line")
+            if editor_file and editor_line is not None:
+                best: str | None = None
+                best_line = -1
+                for sec in structure.sections:
+                    if sec.file == editor_file and sec.line <= editor_line:
+                        if sec.line > best_line:
+                            best = sec.title
+                            best_line = sec.line
+                current_section = best
+
+        context = {
+            "editor": {**proj.editor_state, "section": current_section},
+            "viewer": proj.viewer_state,
+        }
+
+        # Files — project file tree
+        files_tree = self._build_file_tree(watch_dir, watch_dir)
+
+        # Activity — last 10 events (newest first)
+        activity = list(reversed(proj.events))[:10]
+
         return web.json_response({
             "health": health,
             "sections": sections_list,
@@ -1240,6 +1266,9 @@ class TexWatchServer:
             "bibliography": bibliography,
             "changes": changes,
             "environments": environments,
+            "context": context,
+            "files": files_tree,
+            "activity": activity,
         })
 
     async def _goto_estimated_page(

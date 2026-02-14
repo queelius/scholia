@@ -3544,7 +3544,8 @@ class TestDashboardEndpoint:
         resp = await client.get("/dashboard")
         assert resp.status == 200
         data = await resp.json()
-        for key in ("health", "sections", "issues", "bibliography", "changes", "environments"):
+        for key in ("health", "sections", "issues", "bibliography", "changes",
+                    "environments", "context", "files", "activity"):
             assert key in data
 
     @pytest.mark.asyncio
@@ -3618,6 +3619,46 @@ class TestDashboardEndpoint:
         assert "defined" in bib
         assert "cited" in bib
         assert "undefined_keys" in bib
+
+    @pytest.mark.asyncio
+    async def test_dashboard_includes_context(self, client, config):
+        """Dashboard response includes editor/viewer context with defaults."""
+        project_dir = config.config_path.parent
+        main = project_dir / "main.tex"
+        main.write_text("\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n")
+        resp = await client.get("/dashboard")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "context" in data
+        ctx = data["context"]
+        assert "editor" in ctx
+        assert "viewer" in ctx
+        # No editor state set — section should be None
+        assert ctx["editor"]["section"] is None
+
+    @pytest.mark.asyncio
+    async def test_dashboard_includes_files(self, client, config):
+        """Dashboard response includes file tree with project files."""
+        project_dir = config.config_path.parent
+        main = project_dir / "main.tex"
+        main.write_text("\\documentclass{article}\n\\begin{document}\n\\end{document}\n")
+        resp = await client.get("/dashboard")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "files" in data
+        assert isinstance(data["files"], list)
+        # main.tex should appear in the file tree
+        names = [f["name"] for f in data["files"] if f.get("type") == "file"]
+        assert "main.tex" in names
+
+    @pytest.mark.asyncio
+    async def test_dashboard_includes_activity(self, client, config):
+        """Dashboard response includes recent activity events."""
+        resp = await client.get("/dashboard")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "activity" in data
+        assert isinstance(data["activity"], list)
 
 
 class TestCurrentEndpointUnset:
