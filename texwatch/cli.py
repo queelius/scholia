@@ -228,15 +228,21 @@ def _get_project(args: argparse.Namespace) -> str | None:
     return getattr(args, "project", None) or None
 
 
-def _detect_multi_project(args: argparse.Namespace) -> list[str] | None:
-    """Probe /projects. Return project names if multi-project, else None."""
+def _detect_multi_project(
+    args: argparse.Namespace,
+) -> tuple[list[str], dict] | None:
+    """Probe /projects. Return ``(names, data)`` if multi-project, else None.
+
+    ``data`` is the raw ``/projects`` response dict so callers that need to
+    render an aggregate view can reuse it without a second HTTP call.
+    """
     probe = _api_get("/projects", port=args.port)
     if probe.server_down or not isinstance(probe.data, dict):
         return None
     projects = probe.data.get("projects", [])
     if len(projects) <= 1:
         return None
-    return [p["name"] for p in projects]
+    return [p["name"] for p in projects], probe.data
 
 
 def _print_multi_project_required(command: str, project_names: list[str]) -> None:
@@ -261,30 +267,35 @@ def _probe_and_inject_current(args: argparse.Namespace) -> bool:
     return False
 
 
-def _should_aggregate(args: argparse.Namespace) -> list[str] | None:
+def _should_aggregate(
+    args: argparse.Namespace,
+) -> tuple[list[str], dict] | None:
     """Decide whether an aggregate command should show all projects.
 
-    Returns a list of project names when the command should aggregate,
-    or None when it should operate on a single project (``args.project``
-    may have been injected with the current project).
+    Returns ``(project_names, projects_data)`` when the command should
+    aggregate, or ``None`` when it should operate on a single project
+    (``args.project`` may have been injected with the current project).
+    ``projects_data`` is the raw ``/projects`` response dict, allowing
+    callers to render aggregates without a redundant HTTP call.
 
     Resolution order:
     1. ``--project`` set → single project (None)
     2. Single-project server → single project (None)
-    3. ``--all`` flag → aggregate (project names)
+    3. ``--all`` flag → aggregate (names, data)
     4. Current project set → inject and single project (None)
-    5. No current → aggregate (project names)
+    5. No current → aggregate (names, data)
     """
     if _get_project(args):
         return None
-    project_names = _detect_multi_project(args)
-    if project_names is None:
+    result = _detect_multi_project(args)
+    if result is None:
         return None
+    project_names, projects_data = result
     if getattr(args, "all", False):
-        return project_names
+        return project_names, projects_data
     if _probe_and_inject_current(args):
         return None
-    return project_names
+    return project_names, projects_data
 
 
 def _reject_if_multi_project(
@@ -298,9 +309,10 @@ def _reject_if_multi_project(
     """
     if _get_project(args):
         return None
-    project_names = _detect_multi_project(args)
-    if project_names is None:
+    result = _detect_multi_project(args)
+    if result is None:
         return None
+    project_names, _ = result
     if _probe_and_inject_current(args):
         return None
 
@@ -317,11 +329,10 @@ def _reject_if_multi_project(
 
 def cmd_status(args: argparse.Namespace) -> int:
     """Handle status command."""
-    project_names = _should_aggregate(args)
-    if project_names is not None:
-        resp = _api_get("/projects", port=args.port)
-        if not resp.server_down and isinstance(resp.data, dict) and "projects" in resp.data:
-            return _print_all_projects_status(resp.data, args)
+    agg = _should_aggregate(args)
+    if agg is not None:
+        _, projects_data = agg
+        return _print_all_projects_status(projects_data, args)
 
     project = _get_project(args)
 
@@ -417,8 +428,9 @@ def _print_all_projects_status(data: dict, args: argparse.Namespace) -> int:
 
 def cmd_view(args: argparse.Namespace) -> int:
     """Handle view command."""
-    project_names = _should_aggregate(args)
-    if project_names is not None:
+    agg = _should_aggregate(args)
+    if agg is not None:
+        project_names, _ = agg
         return _view_all_projects(project_names, args)
 
     project = _get_project(args)
@@ -600,8 +612,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 def cmd_compile(args: argparse.Namespace) -> int:
     """Handle compile command."""
-    project_names = _should_aggregate(args)
-    if project_names is not None:
+    if _should_aggregate(args) is not None:
         return _compile_all_projects(args)
 
     project = _get_project(args)
@@ -864,11 +875,10 @@ def _files_all_projects(data: dict, args: argparse.Namespace) -> int:
 
 def cmd_files(args: argparse.Namespace) -> int:
     """Handle files command."""
-    project_names = _should_aggregate(args)
-    if project_names is not None:
-        probe = _api_get("/projects", port=args.port)
-        if not probe.server_down and isinstance(probe.data, dict) and "projects" in probe.data:
-            return _files_all_projects(probe.data, args)
+    agg = _should_aggregate(args)
+    if agg is not None:
+        _, projects_data = agg
+        return _files_all_projects(projects_data, args)
 
     project = _get_project(args)
     resp = _api_get("/files", port=args.port, project=project)
@@ -905,7 +915,10 @@ def cmd_files(args: argparse.Namespace) -> int:
 
 def cmd_activity(args: argparse.Namespace) -> int:
     """Handle activity command — show recent events."""
-    # Resolve project scope: current project if set, else global
+    # Resolve project scope.  _should_aggregate may inject args.project
+    # (scoping to /p/{name}/activity) or leave it None (global /activity).
+    # Unlike other aggregate commands there is no separate multi-project
+    # rendering path — _fetch_endpoint handles the routing either way.
     _should_aggregate(args)
 
     params = []
@@ -964,19 +977,9 @@ def _fetch_endpoint(
     project = _get_project(args)
     resp = _api_get(endpoint, port=args.port, project=project)
 
-    if resp.server_down:
-        if getattr(args, "json", False):
-            print(json.dumps({"error": "server not running", "port": args.port}))
-        else:
-            _print_server_down(args.port)
-        return EXIT_SERVER_DOWN
-
-    if resp.error:
-        if getattr(args, "json", False):
-            print(json.dumps({"error": resp.error}))
-        else:
-            print(f"Failed to get {command_name}: {resp.error}")
-        return EXIT_FAIL
+    failed = _check_resp(resp, args, f"Failed to get {command_name}")
+    if failed is not None:
+        return failed
 
     data = resp.data
     if not isinstance(data, dict):
@@ -1191,56 +1194,12 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def cmd_current(args: argparse.Namespace) -> int:
-    """Handle current command — show or switch the current project."""
-    unset = getattr(args, "unset", False)
-    name = getattr(args, "name", None)
+def _check_resp(resp: APIResponse, args: argparse.Namespace, label: str) -> int | None:
+    """Handle server-down and error responses.
 
-    if unset:
-        # Clear the current project
-        resp = _api_post("/current", {"project": None}, port=args.port)
-        if resp.server_down:
-            if getattr(args, "json", False):
-                print(json.dumps({"error": "server not running", "port": args.port}))
-            else:
-                _print_server_down(args.port)
-            return EXIT_SERVER_DOWN
-        if resp.error:
-            if getattr(args, "json", False):
-                print(json.dumps({"error": resp.error}))
-            else:
-                print(f"Failed to clear current project: {resp.error}")
-            return EXIT_FAIL
-        if getattr(args, "json", False):
-            print(json.dumps({"current": None}))
-        else:
-            print("Cleared current project")
-        return EXIT_OK
-
-    if name:
-        # Switch to a named project
-        resp = _api_post("/current", {"project": name}, port=args.port)
-        if resp.server_down:
-            if getattr(args, "json", False):
-                print(json.dumps({"error": "server not running", "port": args.port}))
-            else:
-                _print_server_down(args.port)
-            return EXIT_SERVER_DOWN
-        if resp.error:
-            if getattr(args, "json", False):
-                print(json.dumps({"error": resp.error}))
-            else:
-                print(f"Error: {resp.error}")
-            return EXIT_FAIL
-        data = resp.data if isinstance(resp.data, dict) else {}
-        if getattr(args, "json", False):
-            print(json.dumps(data))
-        else:
-            print(f"Current project: {data.get('current', name)}")
-        return EXIT_OK
-
-    # No args: show the current project
-    resp = _api_get("/current", port=args.port)
+    Returns an exit code when the response indicates a failure, or None
+    when the caller should continue processing the successful response.
+    """
     if resp.server_down:
         if getattr(args, "json", False):
             print(json.dumps({"error": "server not running", "port": args.port}))
@@ -1251,8 +1210,52 @@ def cmd_current(args: argparse.Namespace) -> int:
         if getattr(args, "json", False):
             print(json.dumps({"error": resp.error}))
         else:
-            print(f"Failed to get current project: {resp.error}")
+            print(f"{label}: {resp.error}")
         return EXIT_FAIL
+    return None
+
+
+def cmd_current(args: argparse.Namespace) -> int:
+    """Handle current command — show or switch the current project."""
+    unset = getattr(args, "unset", False)
+    name = getattr(args, "name", None)
+
+    if unset and name:
+        msg = "Cannot use --unset with a project name"
+        if getattr(args, "json", False):
+            print(json.dumps({"error": msg}))
+        else:
+            print(f"Error: {msg}")
+        return EXIT_FAIL
+
+    if unset:
+        resp = _api_post("/current", {"project": None}, port=args.port)
+        failed = _check_resp(resp, args, "Failed to clear current project")
+        if failed is not None:
+            return failed
+        if getattr(args, "json", False):
+            print(json.dumps({"current": None}))
+        else:
+            print("Cleared current project")
+        return EXIT_OK
+
+    if name:
+        resp = _api_post("/current", {"project": name}, port=args.port)
+        failed = _check_resp(resp, args, "Error")
+        if failed is not None:
+            return failed
+        data = resp.data if isinstance(resp.data, dict) else {}
+        if getattr(args, "json", False):
+            print(json.dumps(data))
+        else:
+            print(f"Current project: {data.get('current', name)}")
+        return EXIT_OK
+
+    # No args: show the current project
+    resp = _api_get("/current", port=args.port)
+    failed = _check_resp(resp, args, "Failed to get current project")
+    if failed is not None:
+        return failed
 
     data = resp.data if isinstance(resp.data, dict) else {}
     current = data.get("current")
