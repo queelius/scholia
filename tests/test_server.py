@@ -3734,3 +3734,87 @@ class TestCurrentEndpointUnset:
         await multi_client.post("/current", json={"project": None})
         resp = await multi_client.post("/goto", json={"page": 1})
         assert resp.status == 400
+
+
+class TestMcpRegistration:
+    """Tests for automatic .mcp.json registration."""
+
+    def test_register_mcp_creates_file(self, tmp_path):
+        """_register_mcp creates .mcp.json with texwatch entry."""
+        from texwatch.server import _register_mcp
+        _register_mcp(8765, tmp_path)
+        mcp_file = tmp_path / ".mcp.json"
+        assert mcp_file.exists()
+        data = json.loads(mcp_file.read_text())
+        assert "mcpServers" in data
+        assert "texwatch" in data["mcpServers"]
+        entry = data["mcpServers"]["texwatch"]
+        assert entry["command"] == "texwatch"
+        assert "--port" in entry["args"]
+        assert "8765" in entry["args"]
+
+    def test_register_mcp_preserves_existing(self, tmp_path):
+        """_register_mcp preserves other entries in .mcp.json."""
+        mcp_file = tmp_path / ".mcp.json"
+        mcp_file.write_text(json.dumps({
+            "mcpServers": {"other-tool": {"command": "other"}}
+        }))
+        from texwatch.server import _register_mcp
+        _register_mcp(9000, tmp_path)
+        data = json.loads(mcp_file.read_text())
+        assert "other-tool" in data["mcpServers"]
+        assert "texwatch" in data["mcpServers"]
+
+    def test_register_mcp_updates_port(self, tmp_path):
+        """_register_mcp updates port if .mcp.json already has texwatch."""
+        from texwatch.server import _register_mcp
+        _register_mcp(8765, tmp_path)
+        _register_mcp(9000, tmp_path)
+        data = json.loads((tmp_path / ".mcp.json").read_text())
+        assert "9000" in str(data["mcpServers"]["texwatch"]["args"])
+
+    def test_unregister_mcp_removes_entry(self, tmp_path):
+        """_unregister_mcp removes texwatch from .mcp.json."""
+        from texwatch.server import _register_mcp, _unregister_mcp
+        _register_mcp(8765, tmp_path)
+        _unregister_mcp(tmp_path)
+        data = json.loads((tmp_path / ".mcp.json").read_text())
+        assert "texwatch" not in data["mcpServers"]
+
+    def test_unregister_mcp_preserves_others(self, tmp_path):
+        """_unregister_mcp keeps other entries."""
+        mcp_file = tmp_path / ".mcp.json"
+        mcp_file.write_text(json.dumps({
+            "mcpServers": {
+                "texwatch": {"command": "texwatch", "args": ["mcp"]},
+                "other": {"command": "other"},
+            }
+        }))
+        from texwatch.server import _unregister_mcp
+        _unregister_mcp(tmp_path)
+        data = json.loads(mcp_file.read_text())
+        assert "texwatch" not in data["mcpServers"]
+        assert "other" in data["mcpServers"]
+
+    def test_unregister_mcp_no_file(self, tmp_path):
+        """_unregister_mcp is a no-op if .mcp.json doesn't exist."""
+        from texwatch.server import _unregister_mcp
+        _unregister_mcp(tmp_path)  # should not raise
+
+    def test_register_mcp_handles_corrupt_json(self, tmp_path):
+        """_register_mcp recovers from corrupt .mcp.json."""
+        mcp_file = tmp_path / ".mcp.json"
+        mcp_file.write_text("{invalid json!!")
+        from texwatch.server import _register_mcp
+        _register_mcp(8765, tmp_path)
+        data = json.loads(mcp_file.read_text())
+        assert "texwatch" in data["mcpServers"]
+
+    def test_unregister_mcp_handles_corrupt_json(self, tmp_path):
+        """_unregister_mcp is a no-op on corrupt .mcp.json."""
+        mcp_file = tmp_path / ".mcp.json"
+        mcp_file.write_text("{invalid json!!")
+        from texwatch.server import _unregister_mcp
+        _unregister_mcp(tmp_path)  # should not raise
+        # File content unchanged
+        assert mcp_file.read_text() == "{invalid json!!"

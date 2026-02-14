@@ -37,6 +37,41 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# MCP registration helpers
+# ---------------------------------------------------------------------------
+
+
+def _register_mcp(port: int, project_dir: Path) -> None:
+    """Write texwatch entry into .mcp.json for Claude Code discovery."""
+    mcp_file = project_dir / ".mcp.json"
+    try:
+        data = json.loads(mcp_file.read_text()) if mcp_file.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    data.setdefault("mcpServers", {})
+    data["mcpServers"]["texwatch"] = {
+        "command": "texwatch",
+        "args": ["mcp", "--port", str(port)],
+    }
+    mcp_file.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _unregister_mcp(project_dir: Path) -> None:
+    """Remove texwatch entry from .mcp.json."""
+    mcp_file = project_dir / ".mcp.json"
+    if not mcp_file.exists():
+        return
+    try:
+        data = json.loads(mcp_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+    servers = data.get("mcpServers", {})
+    if "texwatch" in servers:
+        del servers["texwatch"]
+        mcp_file.write_text(json.dumps(data, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------------
 # ProjectInstance — per-project runtime state
 # ---------------------------------------------------------------------------
 
@@ -1706,7 +1741,7 @@ class TexWatchServer:
             for ws in list(proj.websockets):
                 await ws.close()
 
-    def run(self, host: str = "localhost", port: int | None = None) -> None:
+    def run(self, host: str = "localhost", port: int | None = None, register_mcp: bool = True) -> None:
         """Run the server (blocking)."""
         if port is None:
             port = self.config.port
@@ -1729,6 +1764,10 @@ class TexWatchServer:
                     print(f"  {name}: {get_watch_dir(proj.config)} ({proj.config.main})")
             print("Press Ctrl+C to stop")
 
+            project_dir = Path.cwd()
+            if register_mcp:
+                _register_mcp(port, project_dir)
+
             try:
                 while True:
                     await asyncio.sleep(3600)
@@ -1736,6 +1775,8 @@ class TexWatchServer:
                 pass
             finally:
                 await self.stop()
+                if register_mcp:
+                    _unregister_mcp(project_dir)
                 await app_runner.cleanup()
 
         try:

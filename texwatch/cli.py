@@ -1365,7 +1365,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     server = TexWatchServer(projects=project_list)
     try:
-        server.run(port=port)
+        server.run(port=port, register_mcp=not getattr(args, "no_mcp", False))
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else 1
     return EXIT_OK
@@ -1501,6 +1501,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--skip-dirs", type=str, default=None, help="Comma-separated skip patterns (recursive)")
     p_serve.add_argument("-p", "--port", type=int, default=None, help="Server port (default: 8765)")
     p_serve.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p_serve.add_argument("--no-mcp", action="store_true", help="Skip auto-registering MCP server in .mcp.json")
 
     return parser
 
