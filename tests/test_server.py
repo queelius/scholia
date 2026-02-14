@@ -3818,3 +3818,21 @@ class TestMcpRegistration:
         _unregister_mcp(tmp_path)  # should not raise
         # File content unchanged
         assert mcp_file.read_text() == "{invalid json!!"
+
+    def test_register_mcp_write_failure(self, tmp_path):
+        """_register_mcp logs warning on write failure instead of crashing."""
+        from texwatch.server import _register_mcp
+        readonly_dir = tmp_path / "readonly"
+        readonly_dir.mkdir()
+        readonly_dir.chmod(0o444)
+        _register_mcp(8765, readonly_dir)  # should not raise
+        readonly_dir.chmod(0o755)  # cleanup
+
+    def test_unregister_mcp_write_failure(self, tmp_path):
+        """_unregister_mcp logs warning on write failure instead of crashing."""
+        from texwatch.server import _register_mcp, _unregister_mcp
+        _register_mcp(8765, tmp_path)
+        mcp_file = tmp_path / ".mcp.json"
+        mcp_file.chmod(0o444)
+        _unregister_mcp(tmp_path)  # should not raise
+        mcp_file.chmod(0o644)  # cleanup

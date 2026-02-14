@@ -53,7 +53,10 @@ def _register_mcp(port: int, project_dir: Path) -> None:
         "command": "texwatch",
         "args": ["mcp", "--port", str(port)],
     }
-    mcp_file.write_text(json.dumps(data, indent=2) + "\n")
+    try:
+        mcp_file.write_text(json.dumps(data, indent=2) + "\n")
+    except OSError:
+        logger.warning("Could not write %s", mcp_file)
 
 
 def _unregister_mcp(project_dir: Path) -> None:
@@ -68,7 +71,10 @@ def _unregister_mcp(project_dir: Path) -> None:
     servers = data.get("mcpServers", {})
     if "texwatch" in servers:
         del servers["texwatch"]
-        mcp_file.write_text(json.dumps(data, indent=2) + "\n")
+        try:
+            mcp_file.write_text(json.dumps(data, indent=2) + "\n")
+        except OSError:
+            logger.warning("Could not update %s", mcp_file)
 
 
 # ---------------------------------------------------------------------------
@@ -1741,7 +1747,8 @@ class TexWatchServer:
             for ws in list(proj.websockets):
                 await ws.close()
 
-    def run(self, host: str = "localhost", port: int | None = None, register_mcp: bool = True) -> None:
+    def run(self, host: str = "localhost", port: int | None = None,
+            register_mcp: bool = True, project_dir: Path | None = None) -> None:
         """Run the server (blocking)."""
         if port is None:
             port = self.config.port
@@ -1764,9 +1771,9 @@ class TexWatchServer:
                     print(f"  {name}: {get_watch_dir(proj.config)} ({proj.config.main})")
             print("Press Ctrl+C to stop")
 
-            project_dir = Path.cwd()
+            mcp_dir = project_dir or Path.cwd()
             if register_mcp:
-                _register_mcp(port, project_dir)
+                _register_mcp(port, mcp_dir)
 
             try:
                 while True:
@@ -1776,7 +1783,7 @@ class TexWatchServer:
             finally:
                 await self.stop()
                 if register_mcp:
-                    _unregister_mcp(project_dir)
+                    _unregister_mcp(mcp_dir)
                 await app_runner.cleanup()
 
         try:

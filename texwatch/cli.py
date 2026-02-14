@@ -1365,7 +1365,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     server = TexWatchServer(projects=project_list)
     try:
-        server.run(port=port, register_mcp=not getattr(args, "no_mcp", False))
+        server.run(port=port, register_mcp=not getattr(args, "no_mcp", False),
+                   project_dir=serve_dir)
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else 1
     return EXIT_OK
