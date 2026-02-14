@@ -1096,14 +1096,8 @@ def cmd_digest(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def cmd_dashboard(args: argparse.Namespace) -> int:
-    """Handle dashboard command — show unified paper state."""
-    result = _fetch_endpoint("/dashboard", "dashboard", args)
-    if isinstance(result, int):
-        return result
-    data, _ = result
-
-    # Health summary
+def _print_dashboard_health(data: dict) -> None:
+    """Print health summary section."""
     health = data.get("health", {})
     title = health.get("title") or "Untitled"
     docclass = health.get("documentclass") or "?"
@@ -1112,16 +1106,16 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     status = health.get("compile_status", "none")
     last = health.get("last_compile") or ""
     if last and "T" in last:
-        last = last.split("T")[1].split(".")[0]  # HH:MM:SS
-
+        last = last.split("T")[1].split(".")[0]
     page_str = f"{pages} pages"
     if health.get("page_limit"):
         page_str += f" / {health['page_limit']}"
-
     print(f"{title} ({docclass}) -- {words:,} words, {page_str}")
     print(f"Compile: {status} ({last})")
 
-    # Sections
+
+def _print_dashboard_sections(data: dict) -> None:
+    """Print sections list."""
     sections = data.get("sections", [])
     if sections:
         print("\nSections:")
@@ -1132,7 +1126,6 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             cites = sec.get("citation_count", 0)
             todos = sec.get("todo_count", 0)
             figs = sec.get("figure_count", 0)
-
             parts = [f"{wc:>6,} words"]
             if cites:
                 parts.append(f"{cites} cites")
@@ -1140,10 +1133,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 parts.append(f"{todos} TODO")
             if figs:
                 parts.append(f"{figs} figs")
-
             print(f"  {dirty} {name:<25s} {' '.join(parts)}")
 
-    # Issues
+
+def _print_dashboard_issues(data: dict) -> None:
+    """Print issues list."""
     issues = data.get("issues", [])
     if issues:
         print(f"\nIssues ({len(issues)}):")
@@ -1168,7 +1162,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 loc += ")"
             print(f"  {prefix} {itype}: {msg}{loc}")
 
-    # Changes
+
+def _print_dashboard_changes(data: dict) -> None:
+    """Print changes list."""
     changes = data.get("changes", [])
     if changes:
         print("\nChanges since last compile:")
@@ -1182,7 +1178,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 parts.append(f"-{removed} words")
             print(f"  {ch.get('section_title', '?')}: {', '.join(parts)}")
 
-    # Bibliography
+
+def _print_dashboard_bibliography(data: dict) -> None:
+    """Print bibliography summary."""
     bib = data.get("bibliography", {})
     if bib.get("defined") or bib.get("cited"):
         print(f"\nBibliography: {bib.get('defined', 0)} defined, {bib.get('cited', 0)} cited")
@@ -1190,6 +1188,60 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             print(f"  Undefined: {', '.join(bib['undefined_keys'])}")
         if bib.get("uncited_keys"):
             print(f"  Uncited: {', '.join(bib['uncited_keys'])}")
+
+
+def _print_dashboard_environments(data: dict) -> None:
+    """Print environments summary."""
+    envs = data.get("environments", {})
+    items = envs.get("items", [])
+    if items:
+        # Count by type
+        counts: dict[str, int] = {}
+        for item in items:
+            t = item.get("env_type", "unknown")
+            counts[t] = counts.get(t, 0) + 1
+        parts = [f"{count} {etype}" for etype, count in sorted(counts.items())]
+        print(f"\nEnvironments: {', '.join(parts)}")
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Handle dashboard command — show unified paper state."""
+    section = getattr(args, "section", None)
+
+    # When --section is combined with --json, suppress _fetch_endpoint's JSON
+    # handling so we can filter the output to the requested section.
+    json_mode = getattr(args, "json", False)
+    if section and json_mode:
+        args.json = False
+        try:
+            result = _fetch_endpoint("/dashboard", "dashboard", args)
+        finally:
+            args.json = True
+    else:
+        result = _fetch_endpoint("/dashboard", "dashboard", args)
+
+    if isinstance(result, int):
+        return result
+    data, _ = result
+
+    # JSON mode with section filter
+    if json_mode and section:
+        print(json.dumps({section: data.get(section, {})}))
+        return EXIT_OK
+
+    # Human-readable mode: print selected section(s)
+    if not section or section == "health":
+        _print_dashboard_health(data)
+    if not section or section == "sections":
+        _print_dashboard_sections(data)
+    if not section or section == "issues":
+        _print_dashboard_issues(data)
+    if not section or section == "changes":
+        _print_dashboard_changes(data)
+    if not section or section == "bibliography":
+        _print_dashboard_bibliography(data)
+    if not section or section == "environments":
+        _print_dashboard_environments(data)
 
     return EXIT_OK
 
@@ -1494,6 +1546,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- dashboard ---
     p_dashboard = subparsers.add_parser("dashboard", help="Show unified paper dashboard")
+    p_dashboard.add_argument("--section", choices=["health", "sections", "issues",
+                             "bibliography", "changes", "environments"],
+                             default=None, help="Show only this section")
     _add_server_options(p_dashboard)
 
     # --- current ---

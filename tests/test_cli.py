@@ -2457,6 +2457,114 @@ class TestCmdDashboard:
         assert result == EXIT_SERVER_DOWN
 
 
+class TestDashboardSectionFilter:
+    """Tests for texwatch dashboard --section."""
+
+    @pytest.fixture
+    def handler_class(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                data = json.dumps({
+                    "health": {"title": "My Paper", "compile_status": "success",
+                               "word_count": 1000, "page_count": 5,
+                               "page_limit": 8, "documentclass": "article",
+                               "error_count": 0, "warning_count": 0,
+                               "last_compile": None, "author": "Author", "date": None},
+                    "sections": [{"title": "Intro", "word_count": 500,
+                                  "is_dirty": False, "citation_count": 0,
+                                  "todo_count": 0, "figure_count": 0,
+                                  "table_count": 0, "level": "section",
+                                  "file": "main.tex", "line": 1}],
+                    "issues": [],
+                    "bibliography": {"defined": 10, "cited": 8,
+                                     "undefined_keys": [], "uncited_keys": ["foo"]},
+                    "changes": [],
+                    "environments": {"equation": 3, "items": [
+                        {"env_type": "equation", "label": "eq1", "name": None,
+                         "caption": None, "file": "main.tex",
+                         "start_line": 10, "end_line": 12}
+                    ]},
+                    "context": {"editor": {}, "viewer": {}},
+                    "files": [],
+                    "activity": [],
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        return Handler
+
+    @pytest.fixture
+    def server(self, handler_class):
+        srv = HTTPServer(("localhost", 0), handler_class)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever,
+                                  kwargs={"poll_interval": 0.1})
+        thread.daemon = True
+        thread.start()
+        yield port
+        srv.shutdown()
+        thread.join(timeout=2)
+        srv.server_close()
+
+    def test_dashboard_no_section_shows_all(self, server, capsys):
+        """dashboard with no --section shows all sections."""
+        result = main(["dashboard", "--port", str(server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "My Paper" in captured.out
+        assert "Intro" in captured.out
+
+    def test_dashboard_section_health(self, server, capsys):
+        """dashboard --section health shows only health."""
+        result = main(["dashboard", "--section", "health", "--port", str(server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "My Paper" in captured.out
+        assert "Intro" not in captured.out
+        assert "Bibliography" not in captured.out
+
+    def test_dashboard_section_bibliography(self, server, capsys):
+        """dashboard --section bibliography shows only bibliography."""
+        result = main(["dashboard", "--section", "bibliography", "--port", str(server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "Bibliography" in captured.out or "defined" in captured.out
+        assert "My Paper" not in captured.out
+
+    def test_dashboard_section_json(self, server, capsys):
+        """dashboard --section health --json returns only health key."""
+        result = main(["dashboard", "--section", "health", "--json", "--port", str(server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert "health" in data
+        assert "sections" not in data
+
+    def test_dashboard_section_environments(self, server, capsys):
+        """dashboard --section environments shows environments."""
+        result = main(["dashboard", "--section", "environments", "--port", str(server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        assert "equation" in captured.out.lower()
+        assert "My Paper" not in captured.out
+
+    def test_dashboard_json_no_section(self, server, capsys):
+        """dashboard --json with no section returns full data."""
+        result = main(["dashboard", "--json", "--port", str(server)])
+        assert result == EXIT_OK
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert "health" in data
+        assert "sections" in data
+        assert "bibliography" in data
+
+
 # ---------------------------------------------------------------------------
 # Phase 3B: CLI coverage gap tests
 # ---------------------------------------------------------------------------
