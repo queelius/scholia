@@ -3836,3 +3836,16 @@ class TestMcpRegistration:
         mcp_file.chmod(0o444)
         _unregister_mcp(tmp_path)  # should not raise
         mcp_file.chmod(0o644)  # cleanup
+
+
+class TestLabelsEndpoint:
+    @pytest.mark.asyncio
+    async def test_labels_returns_200(self, client):
+        resp = await client.get("/labels")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_labels_returns_list(self, client):
+        resp = await client.get("/labels")
+        data = await resp.json()
+        assert isinstance(data, list)

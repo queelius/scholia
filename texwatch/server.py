@@ -18,6 +18,7 @@ from typing import Any, Callable
 from aiohttp import web, WSMsgType
 
 from .bibliography import parse_bibliography
+from .labels import enrich_labels_with_structure, parse_labels
 from .changes import ChangeLog, compute_changes
 from .compiler import CompileMessage, CompileResult, compile_tex
 from .config import Config, get_main_file, get_watch_dir
@@ -512,6 +513,7 @@ class TexWatchServer:
         self.app.router.add_get(r"/p/{name:.+}/context", self._handle_project_context)
         self.app.router.add_get(r"/p/{name:.+}/structure", self._handle_project_structure)
         self.app.router.add_get(r"/p/{name:.+}/bibliography", self._handle_project_bibliography)
+        self.app.router.add_get(r"/p/{name:.+}/labels", self._handle_project_labels)
         self.app.router.add_get(r"/p/{name:.+}/environments", self._handle_project_environments)
         self.app.router.add_get(r"/p/{name:.+}/digest", self._handle_project_digest)
         self.app.router.add_get(r"/p/{name:.+}/dashboard", self._handle_project_dashboard)
@@ -533,6 +535,7 @@ class TexWatchServer:
         self.app.router.add_get("/context", self._handle_root_context)
         self.app.router.add_get("/structure", self._handle_root_structure)
         self.app.router.add_get("/bibliography", self._handle_root_bibliography)
+        self.app.router.add_get("/labels", self._handle_root_labels)
         self.app.router.add_get("/environments", self._handle_root_environments)
         self.app.router.add_get("/digest", self._handle_root_digest)
         self.app.router.add_get("/dashboard", self._handle_root_dashboard)
@@ -671,6 +674,10 @@ class TexWatchServer:
         proj = self._require_project(request)
         return self._build_bibliography_response(proj)
 
+    async def _handle_project_labels(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_labels_response(proj)
+
     async def _handle_project_environments(self, request: web.Request) -> web.Response:
         proj = self._require_project(request)
         return self._build_environments_response(proj)
@@ -796,6 +803,9 @@ class TexWatchServer:
 
     async def _handle_root_bibliography(self, request: web.Request) -> web.Response:
         return self._single_or_aggregate("_build_bibliography_response")
+
+    async def _handle_root_labels(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_labels_response")
 
     async def _handle_root_environments(self, request: web.Request) -> web.Response:
         return self._single_or_aggregate("_build_environments_response")
@@ -1117,6 +1127,25 @@ class TexWatchServer:
             })
 
         return web.json_response(dataclasses.asdict(bib))
+
+    def _build_labels_response(self, proj: ProjectInstance) -> web.Response:
+        """Build GET /labels response for a project."""
+        main_file = get_main_file(proj.config)
+        watch_dir = get_watch_dir(proj.config)
+
+        try:
+            labels = parse_labels(main_file, watch_dir)
+            structure = parse_structure(main_file, watch_dir)
+            environments = parse_environments(main_file, watch_dir)
+            enrich_labels_with_structure(labels, structure.sections, environments)
+        except Exception:
+            logger.debug("labels endpoint: parse failed", exc_info=True)
+            return web.json_response([])
+
+        return web.json_response([
+            {"key": l.key, "file": l.file, "line": l.line, "context": l.context}
+            for l in labels
+        ])
 
     def _build_environments_response(self, proj: ProjectInstance) -> web.Response:
         """Build GET /environments response for a project."""
