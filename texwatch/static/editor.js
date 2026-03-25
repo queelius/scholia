@@ -7,9 +7,12 @@
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState, StateEffect, StateField, Compartment } from "@codemirror/state";
 import { keymap, Decoration } from "@codemirror/view";
-import { StreamLanguage } from "@codemirror/language";
+import { StreamLanguage, bracketMatching } from "@codemirror/language";
 import { stex } from "@codemirror/legacy-modes/mode/stex";
 import { oneDark } from "@codemirror/theme-one-dark";
+import { autocompletion } from "@codemirror/autocomplete";
+import { getCompletionSources, refreshCaches } from "./autocomplete.js";
+import { createSnippetSource, fetchCustomSnippets } from "./snippets.js";
 
 // ─── SyncTeX highlight decoration ────────────────────────────────────────────
 
@@ -64,6 +67,15 @@ class TexWatchEditor {
         const container = document.getElementById("editor-container");
         if (!container) return;
 
+        const base = window.TEXWATCH_BASE || "";
+        const customSnippets = await fetchCustomSnippets(base);
+        const completionSources = getCompletionSources(base);
+        const snippetSource = createSnippetSource(customSnippets);
+        const autocompleteExt = autocompletion({
+            override: [...completionSources, snippetSource],
+            activateOnTyping: true,
+        });
+
         this.view = new EditorView({
             state: EditorState.create({
                 doc: "",
@@ -73,6 +85,8 @@ class TexWatchEditor {
                     oneDark,
                     highlightField,
                     wrapCompartment.of([]),
+                    autocompleteExt,
+                    bracketMatching(),
                     keymap.of([
                         {
                             key: "Mod-s",
@@ -320,6 +334,12 @@ class TexWatchEditor {
         // Source updated (from watcher via WebSocket)
         window.addEventListener("texwatch:source-updated", (e) => {
             this.onSourceUpdated(e.detail);
+        });
+
+        // Dashboard updated fires after every successful compile — refresh caches
+        window.addEventListener("texwatch:dashboard-updated", () => {
+            const base = window.TEXWATCH_BASE || "";
+            refreshCaches(base);
         });
 
         // Conflict bar buttons
