@@ -21,6 +21,7 @@ class Config:
         compiler: Compiler command ("auto", "latexmk", "pdflatex", etc.).
         port: HTTP server port.
         page_limit: Optional page count warning threshold.
+        snippets: User-defined LaTeX snippets keyed by trigger name.
         config_path: Path to .texwatch.yaml file (used to resolve watch_dir).
     """
 
@@ -30,6 +31,7 @@ class Config:
     compiler: str = "auto"
     port: int = 8765
     page_limit: int | None = None
+    snippets: dict[str, str] = field(default_factory=dict)
     config_path: Path | None = None
 
     @classmethod
@@ -42,6 +44,7 @@ class Config:
             compiler=data.get("compiler", "auto"),
             port=data.get("port", 8765),
             page_limit=data.get("page_limit"),
+            snippets=data.get("snippets", {}),
             config_path=config_path,
         )
 
@@ -56,6 +59,8 @@ class Config:
         }
         if self.page_limit is not None:
             d["page_limit"] = self.page_limit
+        if self.snippets:
+            d["snippets"] = self.snippets
         return d
 
 
