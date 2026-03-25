@@ -2946,13 +2946,13 @@ class TestFileSnapshots:
 
     @pytest.mark.asyncio
     async def test_history_endpoint_returns_snapshots(self, client, server):
-        """Test GET /p/{name}/history/{file} returns snapshots newest-first."""
+        """Test GET /p/{name}/snapshots/{file} returns snapshots newest-first."""
         name = server._single.name
         # Write twice
         await client.post("/source", json={"file": "main.tex", "content": "v2"})
         await client.post("/source", json={"file": "main.tex", "content": "v3"})
 
-        resp = await client.get(f"/p/{name}/history/main.tex")
+        resp = await client.get(f"/p/{name}/snapshots/main.tex")
         assert resp.status == 200
         data = await resp.json()
         assert data["file"] == "main.tex"
@@ -2972,10 +2972,10 @@ class TestFileSnapshots:
         assert len(server._single.file_snapshots) == 20
 
     @pytest.mark.asyncio
-    async def test_unprefixed_history_route(self, client, server):
-        """Test GET /history/{file} resolves to single project."""
+    async def test_unprefixed_snapshots_route(self, client, server):
+        """Test GET /snapshots/{file} resolves to single project."""
         await client.post("/source", json={"file": "main.tex", "content": "v2"})
-        resp = await client.get("/history/main.tex")
+        resp = await client.get("/snapshots/main.tex")
         assert resp.status == 200
         data = await resp.json()
         assert data["file"] == "main.tex"
@@ -3449,8 +3449,8 @@ class TestMultiProjectHistoryError:
 
     @pytest.mark.asyncio
     async def test_history_multi_project_no_current(self, multi_client):
-        """Test /history/{file} on multi-project server without current returns 400."""
-        resp = await multi_client.get("/history/main.tex")
+        """Test /snapshots/{file} on multi-project server without current returns 400."""
+        resp = await multi_client.get("/snapshots/main.tex")
         assert resp.status == 400
         data = await resp.json()
         assert "projects" in data
@@ -3651,6 +3651,26 @@ class TestDashboardEndpoint:
         names = [f["name"] for f in data["files"] if f.get("type") == "file"]
         assert "main.tex" in names
 
+
+class TestCompilesEndpoint:
+    @pytest.mark.asyncio
+    async def test_compiles_returns_200(self, client):
+        resp = await client.get("/compiles")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_compiles_returns_list(self, client):
+        resp = await client.get("/compiles")
+        data = await resp.json()
+        assert isinstance(data, list)
+
+
+class TestSnapshotsEndpointRename:
+    @pytest.mark.asyncio
+    async def test_snapshots_endpoint_exists(self, client):
+        resp = await client.get("/snapshots/main.tex")
+        assert resp.status == 200
+
     @pytest.mark.asyncio
     async def test_dashboard_includes_activity(self, client, config):
         """Dashboard response includes recent activity events."""
@@ -3836,3 +3856,139 @@ class TestMcpRegistration:
         mcp_file.chmod(0o444)
         _unregister_mcp(tmp_path)  # should not raise
         mcp_file.chmod(0o644)  # cleanup
+
+
+class TestLabelsEndpoint:
+    @pytest.mark.asyncio
+    async def test_labels_returns_200(self, client):
+        resp = await client.get("/labels")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_labels_returns_list(self, client):
+        resp = await client.get("/labels")
+        data = await resp.json()
+        assert isinstance(data, list)
+
+
+class TestHighlightEndpoint:
+    @pytest.mark.asyncio
+    async def test_highlight_returns_200(self, client):
+        resp = await client.post("/highlight", json={
+            "file": "main.tex",
+            "ranges": [{"start": 1, "end": 5, "color": "yellow"}],
+        })
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_highlight_response_ok(self, client):
+        resp = await client.post("/highlight", json={
+            "file": "main.tex",
+            "ranges": [],
+        })
+        data = await resp.json()
+        assert data["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_highlight_broadcasts_via_websocket(self, client, server):
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            await client.post("/highlight", json={
+                "file": "main.tex",
+                "ranges": [{"start": 1, "end": 3, "color": "blue"}],
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+            msg = await ws.receive_json()
+            assert msg["type"] == "highlights"
+            assert msg["file"] == "main.tex"
+            assert len(msg["ranges"]) == 1
+
+
+class TestAnnotateEndpoint:
+    @pytest.mark.asyncio
+    async def test_annotate_returns_200(self, client):
+        resp = await client.post("/annotate", json={
+            "file": "main.tex",
+            "annotations": [{"line": 10, "type": "warning", "text": "test"}],
+        })
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_annotate_response_ok(self, client):
+        resp = await client.post("/annotate", json={
+            "file": "main.tex",
+            "annotations": [],
+        })
+        data = await resp.json()
+        assert data["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_annotate_broadcasts_via_websocket(self, client, server):
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            await client.post("/annotate", json={
+                "file": "main.tex",
+                "annotations": [{"line": 10, "type": "error", "text": "oops"}],
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+            msg = await ws.receive_json()
+            assert msg["type"] == "annotations"
+            assert msg["file"] == "main.tex"
+            assert len(msg["annotations"]) == 1
+
+
+class TestFocusTracking:
+    @pytest.mark.asyncio
+    async def test_focus_message_updates_user_focus(self, client, server):
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            await ws.send_json({
+                "type": "focus",
+                "file": "main.tex",
+                "line": 5,
+                "column": 10,
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+        proj = server._single
+        assert proj.user_focus.file == "main.tex"
+        assert proj.user_focus.cursor == (5, 10)
+        assert proj.user_focus.ws_connected is False  # disconnected after context exit
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_ws_connected(self, client, server):
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()
+
+            await ws.send_json({
+                "type": "focus",
+                "file": "main.tex",
+                "line": 1,
+                "column": 0,
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+        await asyncio.sleep(0.1)
+        proj = server._single
+        assert proj.user_focus.ws_connected is False
+
+    @pytest.mark.asyncio
+    async def test_dashboard_includes_user_focus(self, client):
+        resp = await client.get("/dashboard")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "user_focus" in data
+        assert "ws_connected" in data["user_focus"]

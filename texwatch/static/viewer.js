@@ -216,6 +216,10 @@ class TexWatchViewer {
         const wsUrl = `ws://${window.location.host}${base}/ws`;
         this.ws = new WebSocket(wsUrl);
 
+        if (window.texwatchAwareness) {
+            window.texwatchAwareness.init(this.ws);
+        }
+
         this.ws.onopen = () => {
             console.log('WebSocket connected');
             this.reconnectAttempts = 0;
@@ -236,6 +240,9 @@ class TexWatchViewer {
             try {
                 const data = JSON.parse(e.data);
                 this.handleMessage(data);
+                if (window.texwatchAwareness) {
+                    window.texwatchAwareness.handleWsMessage(data);
+                }
             } catch (err) {
                 console.error('Failed to parse WebSocket message:', err);
             }
@@ -434,6 +441,10 @@ class TexWatchViewer {
         // Clamp page number
         pageNum = Math.max(1, Math.min(pageNum, this.totalPages));
         this.currentPage = pageNum;
+
+        if (window.texwatchAwareness) {
+            window.texwatchAwareness.reportPdfViewport(this.currentPage, this.container.scrollTop);
+        }
 
         const page = await this.pdfDoc.getPage(pageNum);
         const viewport = page.getViewport({ scale: this.scale });
@@ -1075,6 +1086,9 @@ class TexWatchViewer {
             this.currentPage = best;
             this.updatePageInfo();
             this.sendViewerState();
+            if (window.texwatchAwareness) {
+                window.texwatchAwareness.reportPdfViewport(this.currentPage, this.viewerPane.scrollTop);
+            }
         }
     }
 

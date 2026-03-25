@@ -60,9 +60,35 @@ def create_server() -> "FastMCP":
     mcp = FastMCP("texwatch")
 
     @mcp.tool()
-    async def texwatch(port: int = 8765, project: str | None = None) -> str:
-        """Get complete paper state: health, sections, issues, bibliography, changes, environments, editor/viewer context, file tree, and recent activity — all in one call."""
-        return await _get("/dashboard", port, project)
+    async def texwatch(
+        port: int = 8765,
+        project: str | None = None,
+        include_screenshot: bool = False,
+    ) -> list[TextContent | ImageContent]:
+        """Get complete paper state with optional PDF screenshot. Returns health, sections, issues, bibliography, changes, environments, editor/viewer context, file tree, and recent activity."""
+        dashboard_text = await _get("/dashboard", port, project)
+
+        if not include_screenshot:
+            return [TextContent(type="text", text=dashboard_text)]
+
+        # Capture viewport screenshot
+        try:
+            dash = json.loads(dashboard_text)
+            focus = dash.get("user_focus", {})
+            page = focus.get("pdf_page", 1)
+        except (json.JSONDecodeError, KeyError):
+            page = 1
+
+        base = _base_url(port, project)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"{base}/capture", params={"page": page, "dpi": 150})
+            if resp.headers.get("content-type", "").startswith("image/"):
+                b64_data = base64.b64encode(resp.content).decode("ascii")
+                return [
+                    TextContent(type="text", text=dashboard_text),
+                    ImageContent(type="image", data=b64_data, mimeType="image/png"),
+                ]
+        return [TextContent(type="text", text=dashboard_text)]
 
     @mcp.tool()
     async def texwatch_source(
@@ -81,26 +107,15 @@ def create_server() -> "FastMCP":
             return resp.text
 
     @mcp.tool()
-    async def texwatch_history(
-        file: str,
-        port: int = 8765,
-        project: str | None = None,
-    ) -> str:
-        """Get previous versions of a source file (saved before each write). Returns snapshots newest-first."""
-        base = _base_url(port, project)
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{base}/history/{file}")
-            return resp.text
-
-    @mcp.tool()
     async def texwatch_goto(
         line: int | None = None,
         page: int | None = None,
         section: str | None = None,
+        file: str | None = None,
         port: int = 8765,
         project: str | None = None,
     ) -> str:
-        """Navigate the PDF viewer to a specific line, page, or section. Exactly one of line, page, or section must be provided."""
+        """Navigate the PDF viewer to a specific line, page, or section. Exactly one of line, page, or section must be provided. Optionally specify a file to navigate within."""
         targets = [x for x in (line, page, section) if x is not None]
         if len(targets) != 1:
             return json.dumps({"error": "Exactly one of line, page, or section must be provided"})
@@ -112,6 +127,9 @@ def create_server() -> "FastMCP":
             data["page"] = page
         elif section is not None:
             data["section"] = section
+
+        if file is not None:
+            data["file"] = file
 
         base = _base_url(port, project)
         async with httpx.AsyncClient() as client:
@@ -147,13 +165,24 @@ def create_server() -> "FastMCP":
     async def texwatch_capture(
         page: int | None = None,
         dpi: int = 150,
+        mode: str | None = None,
+        bbox: list[float] | None = None,
         port: int = 8765,
         project: str | None = None,
     ) -> list[TextContent | ImageContent]:
-        """Screenshot current PDF page as PNG image. Returns the image as base64-encoded data."""
+        """Screenshot PDF page as PNG. Modes: default (by page number), 'viewport' (current user view), 'region' (crop by bbox [x,y,w,h] in PDF points)."""
         params: dict = {"dpi": dpi}
-        if page is not None:
-            params["page"] = page
+
+        if mode == "viewport":
+            params["mode"] = "viewport"
+        elif mode == "region":
+            if page is not None:
+                params["page"] = page
+            if bbox and len(bbox) == 4:
+                params["bbox"] = ",".join(str(v) for v in bbox)
+        else:
+            if page is not None:
+                params["page"] = page
 
         base = _base_url(port, project)
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -178,6 +207,51 @@ def create_server() -> "FastMCP":
                 )
             else:
                 resp = await client.get(f"http://localhost:{port}/current")
+            return resp.text
+
+    @mcp.tool()
+    async def texwatch_compiles(
+        since: str | None = None,
+        limit: int = 50,
+        success_only: bool = False,
+        port: int = 8765,
+        project: str | None = None,
+    ) -> str:
+        """Query compilation history from SQLite. Returns recent compiles with error counts, duration, and word count."""
+        params: dict = {"limit": limit}
+        if since:
+            params["since"] = since
+        if success_only:
+            params["success"] = "true"
+        base = _base_url(port, project)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{base}/compiles", params=params)
+            return resp.text
+
+    @mcp.tool()
+    async def texwatch_highlight(
+        file: str,
+        ranges: list[dict],
+        port: int = 8765,
+        project: str | None = None,
+    ) -> str:
+        """Highlight line ranges in the editor. Each range has start (line), end (line), and color (yellow/red/green/blue). Pass empty ranges to clear."""
+        base = _base_url(port, project)
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(f"{base}/highlight", json={"file": file, "ranges": ranges})
+            return resp.text
+
+    @mcp.tool()
+    async def texwatch_annotate(
+        file: str,
+        annotations: list[dict],
+        port: int = 8765,
+        project: str | None = None,
+    ) -> str:
+        """Add gutter annotations in the editor. Each annotation has line, type (error/warning/info), and text. Pass empty list to clear."""
+        base = _base_url(port, project)
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(f"{base}/annotate", json={"file": file, "annotations": annotations})
             return resp.text
 
     return mcp

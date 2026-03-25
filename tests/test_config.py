@@ -229,6 +229,38 @@ class TestCreateConfig:
         assert data["port"] == 9000
 
 
+class TestConfigSnippets:
+    def test_config_has_snippets_default(self):
+        """Config.snippets defaults to empty dict."""
+        config = Config(main="main.tex")
+        assert config.snippets == {}
+
+    def test_config_from_dict_with_snippets(self):
+        """Config.from_dict parses snippets."""
+        data = {
+            "main": "paper.tex",
+            "snippets": {
+                "thm": "\\begin{theorem}\n$1\n\\end{theorem}",
+                "prf": "\\begin{proof}\n$1\n\\end{proof}",
+            },
+        }
+        config = Config.from_dict(data)
+        assert config.snippets == data["snippets"]
+
+    def test_config_to_dict_includes_snippets(self):
+        """Config.to_dict includes non-empty snippets."""
+        config = Config(main="main.tex", snippets={"thm": "\\begin{theorem}\n$1\n\\end{theorem}"})
+        d = config.to_dict()
+        assert "snippets" in d
+        assert d["snippets"]["thm"] == "\\begin{theorem}\n$1\n\\end{theorem}"
+
+    def test_config_to_dict_omits_empty_snippets(self):
+        """Config.to_dict omits snippets when empty."""
+        config = Config(main="main.tex")
+        d = config.to_dict()
+        assert "snippets" not in d
+
+
 class TestHelperFunctions:
     """Tests for helper functions."""
 

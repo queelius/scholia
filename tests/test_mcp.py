@@ -216,9 +216,9 @@ class TestMcpToolUrls:
             )
 
     @pytest.mark.asyncio
-    async def test_history_url(self):
-        """Test texwatch_history calls correct URL."""
-        mock_resp = _mock_response(text='{"file":"main.tex","snapshots":[]}')
+    async def test_compiles_url_default(self):
+        """Test texwatch_compiles calls correct URL with default params."""
+        mock_resp = _mock_response(text='[]')
         with patch("httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.get = AsyncMock(return_value=mock_resp)
@@ -227,18 +227,16 @@ class TestMcpToolUrls:
             mock_client_cls.return_value = mock_client
 
             server = create_server()
-            await _call_tool(server, "texwatch_history", {
-                "file": "main.tex", "port": 8765,
-            })
+            await _call_tool(server, "texwatch_compiles", {"port": 8765})
 
             mock_client.get.assert_called_once_with(
-                "http://localhost:8765/history/main.tex",
+                "http://localhost:8765/compiles", params={"limit": 50}
             )
 
     @pytest.mark.asyncio
-    async def test_history_with_project(self):
-        """Test texwatch_history with project routes correctly."""
-        mock_resp = _mock_response(text='{"file":"main.tex","snapshots":[]}')
+    async def test_compiles_url_with_filters(self):
+        """Test texwatch_compiles with since, limit, and success_only params."""
+        mock_resp = _mock_response(text='[]')
         with patch("httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.get = AsyncMock(return_value=mock_resp)
@@ -247,12 +245,34 @@ class TestMcpToolUrls:
             mock_client_cls.return_value = mock_client
 
             server = create_server()
-            await _call_tool(server, "texwatch_history", {
-                "file": "intro.tex", "port": 8765, "project": "paper1",
+            await _call_tool(server, "texwatch_compiles", {
+                "since": "2024-01-01", "limit": 10,
+                "success_only": True, "port": 8765,
             })
 
             mock_client.get.assert_called_once_with(
-                "http://localhost:8765/p/paper1/history/intro.tex",
+                "http://localhost:8765/compiles",
+                params={"limit": 10, "since": "2024-01-01", "success": "true"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_compiles_url_with_project(self):
+        """Test texwatch_compiles routes to project URL."""
+        mock_resp = _mock_response(text='[]')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_compiles", {
+                "port": 8765, "project": "paper1",
+            })
+
+            mock_client.get.assert_called_once_with(
+                "http://localhost:8765/p/paper1/compiles", params={"limit": 50}
             )
 
     @pytest.mark.asyncio
@@ -292,6 +312,119 @@ class TestMcpToolUrls:
             mock_client.post.assert_called_once_with(
                 "http://localhost:8765/current",
                 json={"project": "beta"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_highlight_url(self):
+        """Test texwatch_highlight sends POST to /highlight."""
+        mock_resp = _mock_response(text='{"ok":true}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            ranges = [{"start": 1, "end": 5, "color": "yellow"}]
+            await _call_tool(server, "texwatch_highlight", {
+                "file": "main.tex", "ranges": ranges, "port": 8765,
+            })
+
+            mock_client.post.assert_called_once_with(
+                "http://localhost:8765/highlight",
+                json={"file": "main.tex", "ranges": ranges},
+            )
+
+    @pytest.mark.asyncio
+    async def test_annotate_url(self):
+        """Test texwatch_annotate sends POST to /annotate."""
+        mock_resp = _mock_response(text='{"ok":true}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            annotations = [{"line": 10, "type": "error", "text": "Missing brace"}]
+            await _call_tool(server, "texwatch_annotate", {
+                "file": "main.tex", "annotations": annotations, "port": 8765,
+            })
+
+            mock_client.post.assert_called_once_with(
+                "http://localhost:8765/annotate",
+                json={"file": "main.tex", "annotations": annotations},
+            )
+
+    @pytest.mark.asyncio
+    async def test_goto_with_file(self):
+        """Test texwatch_goto includes file in payload when provided."""
+        mock_resp = _mock_response(text='{"success":true}')
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_goto", {
+                "line": 10, "file": "intro.tex", "port": 8765,
+            })
+
+            mock_client.post.assert_called_once_with(
+                "http://localhost:8765/goto",
+                json={"line": 10, "file": "intro.tex"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_capture_with_viewport_mode(self):
+        """Test texwatch_capture with mode=viewport sends correct params."""
+        mock_resp = _mock_response(
+            content=b"\x89PNG\r\n\x1a\n",
+            content_type="image/png",
+        )
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_capture", {
+                "mode": "viewport", "port": 8765,
+            })
+
+            mock_client.get.assert_called_once_with(
+                "http://localhost:8765/capture",
+                params={"dpi": 150, "mode": "viewport"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_capture_with_region_mode(self):
+        """Test texwatch_capture with mode=region and bbox."""
+        mock_resp = _mock_response(
+            content=b"\x89PNG\r\n\x1a\n",
+            content_type="image/png",
+        )
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            server = create_server()
+            await _call_tool(server, "texwatch_capture", {
+                "mode": "region", "page": 1, "bbox": [0.0, 0.0, 100.0, 200.0], "port": 8765,
+            })
+
+            mock_client.get.assert_called_once_with(
+                "http://localhost:8765/capture",
+                params={"dpi": 150, "page": 1, "bbox": "0.0,0.0,100.0,200.0"},
             )
 
 
@@ -526,12 +659,14 @@ class TestMcpServerCreation:
         expected = {
             "texwatch",
             "texwatch_source",
-            "texwatch_history",
             "texwatch_goto",
             "texwatch_compile",
             "texwatch_write_source",
             "texwatch_capture",
             "texwatch_project",
+            "texwatch_compiles",
+            "texwatch_highlight",
+            "texwatch_annotate",
         }
         assert tool_names == expected
 
@@ -630,19 +765,81 @@ class TestMcpServerCreation:
         assert "port" in props
 
     @pytest.mark.asyncio
-    async def test_history_tool_schema(self):
-        """Test that texwatch_history has file, port, and project params."""
+    async def test_compiles_tool_schema(self):
+        """Test that texwatch_compiles has since, limit, success_only, port, and project params."""
         server = create_server()
         tools = await server.list_tools()
-        tool = next(t for t in tools if t.name == "texwatch_history")
+        tool = next(t for t in tools if t.name == "texwatch_compiles")
+
+        schema = tool.inputSchema
+        props = schema.get("properties", {})
+        assert "since" in props
+        assert "limit" in props
+        assert "success_only" in props
+        assert "port" in props
+        assert "project" in props
+
+    @pytest.mark.asyncio
+    async def test_goto_tool_has_file_param(self):
+        """Test that texwatch_goto has file parameter in schema."""
+        server = create_server()
+        tools = await server.list_tools()
+        tool = next(t for t in tools if t.name == "texwatch_goto")
 
         schema = tool.inputSchema
         props = schema.get("properties", {})
         assert "file" in props
+
+    @pytest.mark.asyncio
+    async def test_capture_tool_has_mode_param(self):
+        """Test that texwatch_capture has mode parameter in schema."""
+        server = create_server()
+        tools = await server.list_tools()
+        tool = next(t for t in tools if t.name == "texwatch_capture")
+
+        schema = tool.inputSchema
+        props = schema.get("properties", {})
+        assert "mode" in props
+        assert "bbox" in props
+
+    @pytest.mark.asyncio
+    async def test_texwatch_tool_has_include_screenshot_param(self):
+        """Test that texwatch has include_screenshot parameter in schema."""
+        server = create_server()
+        tools = await server.list_tools()
+        tool = next(t for t in tools if t.name == "texwatch")
+
+        schema = tool.inputSchema
+        props = schema.get("properties", {})
+        assert "include_screenshot" in props
+
+    @pytest.mark.asyncio
+    async def test_highlight_tool_schema(self):
+        """Test that texwatch_highlight has file and ranges in schema."""
+        server = create_server()
+        tools = await server.list_tools()
+        tool = next(t for t in tools if t.name == "texwatch_highlight")
+
+        schema = tool.inputSchema
+        props = schema.get("properties", {})
+        assert "file" in props
+        assert "ranges" in props
         assert "port" in props
         assert "project" in props
-        required = schema.get("required", [])
-        assert "file" in required
+
+    @pytest.mark.asyncio
+    async def test_annotate_tool_schema(self):
+        """Test that texwatch_annotate has file and annotations in schema."""
+        server = create_server()
+        tools = await server.list_tools()
+        tool = next(t for t in tools if t.name == "texwatch_annotate")
+
+        schema = tool.inputSchema
+        props = schema.get("properties", {})
+        assert "file" in props
+        assert "annotations" in props
+        assert "port" in props
+        assert "project" in props
 
 
 # ---------------------------------------------------------------------------

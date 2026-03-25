@@ -17,12 +17,15 @@ from typing import Any, Callable
 
 from aiohttp import web, WSMsgType
 
+from .awareness import UserFocus, HighlightState, AnnotationState, update_focus, on_ws_disconnect
 from .bibliography import parse_bibliography
+from .labels import enrich_labels_with_structure, parse_labels
 from .changes import ChangeLog, compute_changes
 from .compiler import CompileMessage, CompileResult, compile_tex
 from .config import Config, get_main_file, get_watch_dir
 from .digest import Digest, parse_digest
 from .environments import parse_environments
+from .persistence import CompileStore
 from .structure import DocumentStructure, parse_structure
 from .synctex import (
     SyncTeXData,
@@ -121,6 +124,14 @@ class ProjectInstance:
 
         # Change tracking
         self.change_log = ChangeLog()
+
+        # Awareness state (user focus, highlights, annotations)
+        self.user_focus = UserFocus()
+        self.highlight_state = HighlightState()
+        self.annotation_state = AnnotationState()
+
+        # SQLite persistence (injected by TexWatchServer after construction)
+        self.compile_store: CompileStore | None = None
 
     def log_event(self, event_type: str, **data: Any) -> dict:
         """Record an event in the per-project ring buffer."""
@@ -241,6 +252,28 @@ class ProjectInstance:
                 errors=len(self.last_result.errors) if self.last_result else 0,
                 warnings=len(self.last_result.warnings) if self.last_result else 0,
             )
+            # Record to SQLite persistence
+            if self.compile_store and self.last_result:
+                try:
+                    self.compile_store.record_compile(
+                        project=self.name,
+                        success=self.last_result.success,
+                        duration_s=self.last_result.duration_seconds,
+                        error_count=len(self.last_result.errors),
+                        warning_count=len(self.last_result.warnings),
+                        word_count=None,  # word count computed separately
+                        page_count=None,  # page count set by browser
+                        main_file=str(get_main_file(self.config)),
+                        messages=[
+                            {"level": "error", "file": e.file, "line": e.line, "message": e.message}
+                            for e in self.last_result.errors
+                        ] + [
+                            {"level": "warning", "file": w.file, "line": w.line, "message": w.message}
+                            for w in self.last_result.warnings
+                        ],
+                    )
+                except Exception:
+                    logger.debug("Failed to record compile to SQLite", exc_info=True)
             await self.broadcast({"type": "compiling", "status": False})
             msg = {
                 "type": "compiled",
@@ -251,6 +284,10 @@ class ProjectInstance:
             await self.broadcast(msg)
             if self.last_result and self.last_result.success:
                 await self.broadcast({"type": "dashboard_updated"})
+                # Clear annotations on successful compile
+                payloads = self.annotation_state.clear_all()
+                for payload in payloads:
+                    await self.broadcast(payload)
 
     async def on_file_change(self, changed_path: str) -> None:
         """Handle file change from watcher."""
@@ -365,6 +402,14 @@ class TexWatchServer:
             )
         else:
             raise ValueError("Must provide config or projects")
+
+        # Set up SQLite persistence
+        self.compile_store: CompileStore | None = None
+        if self._projects:
+            db_dir = Path.cwd() / ".texwatch"
+            self.compile_store = CompileStore(db_dir / "history.db")
+        for proj in self._projects.values():
+            proj.compile_store = self.compile_store
 
         # Middleware to track current project from /p/{name}/... requests
         @web.middleware
@@ -512,11 +557,15 @@ class TexWatchServer:
         self.app.router.add_get(r"/p/{name:.+}/context", self._handle_project_context)
         self.app.router.add_get(r"/p/{name:.+}/structure", self._handle_project_structure)
         self.app.router.add_get(r"/p/{name:.+}/bibliography", self._handle_project_bibliography)
+        self.app.router.add_get(r"/p/{name:.+}/labels", self._handle_project_labels)
         self.app.router.add_get(r"/p/{name:.+}/environments", self._handle_project_environments)
         self.app.router.add_get(r"/p/{name:.+}/digest", self._handle_project_digest)
         self.app.router.add_get(r"/p/{name:.+}/dashboard", self._handle_project_dashboard)
         self.app.router.add_get(r"/p/{name:.+}/activity", self._handle_project_activity)
-        self.app.router.add_get(r"/p/{name}/history/{file:.+}", self._handle_project_history)
+        self.app.router.add_get(r"/p/{name}/snapshots/{file:.+}", self._handle_project_snapshots)
+        self.app.router.add_get(r"/p/{name:.+}/compiles", self._handle_project_compiles)
+        self.app.router.add_post(r"/p/{name:.+}/highlight", self._handle_project_highlight)
+        self.app.router.add_post(r"/p/{name:.+}/annotate", self._handle_project_annotate)
 
         # Unprefixed routes (resolve to single project or aggregate)
         self.app.router.add_get("/ws", self._handle_root_ws)
@@ -533,11 +582,15 @@ class TexWatchServer:
         self.app.router.add_get("/context", self._handle_root_context)
         self.app.router.add_get("/structure", self._handle_root_structure)
         self.app.router.add_get("/bibliography", self._handle_root_bibliography)
+        self.app.router.add_get("/labels", self._handle_root_labels)
         self.app.router.add_get("/environments", self._handle_root_environments)
         self.app.router.add_get("/digest", self._handle_root_digest)
         self.app.router.add_get("/dashboard", self._handle_root_dashboard)
         self.app.router.add_get("/activity", self._handle_root_activity)
-        self.app.router.add_get(r"/history/{file:.+}", self._handle_root_history)
+        self.app.router.add_get(r"/snapshots/{file:.+}", self._handle_root_snapshots)
+        self.app.router.add_get("/compiles", self._handle_root_compiles)
+        self.app.router.add_post("/highlight", self._handle_root_highlight)
+        self.app.router.add_post("/annotate", self._handle_root_annotate)
         self.app.router.add_get("/current", self._handle_get_current)
         self.app.router.add_post("/current", self._handle_set_current)
 
@@ -671,6 +724,10 @@ class TexWatchServer:
         proj = self._require_project(request)
         return self._build_bibliography_response(proj)
 
+    async def _handle_project_labels(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_labels_response(proj)
+
     async def _handle_project_environments(self, request: web.Request) -> web.Response:
         proj = self._require_project(request)
         return self._build_environments_response(proj)
@@ -687,11 +744,39 @@ class TexWatchServer:
         proj = self._require_project(request)
         return self._build_activity_response(proj.events, request)
 
-    async def _handle_project_history(self, request: web.Request) -> web.Response:
+    async def _handle_project_snapshots(self, request: web.Request) -> web.Response:
         proj = self._require_project(request)
         file_param = request.match_info.get("file", "")
         snapshots = [s for s in reversed(proj.file_snapshots) if s["file"] == file_param]
         return web.json_response({"file": file_param, "snapshots": snapshots})
+
+    async def _handle_project_compiles(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_compiles_response(proj, request)
+
+    async def _handle_project_highlight(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        file = data.get("file", "")
+        ranges = data.get("ranges", [])
+        payload = proj.highlight_state.set_highlights(file, ranges)
+        await proj.broadcast(payload)
+        return web.json_response({"ok": True})
+
+    async def _handle_project_annotate(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        file = data.get("file", "")
+        annotations = data.get("annotations", [])
+        payload = proj.annotation_state.set_annotations(file, annotations)
+        await proj.broadcast(payload)
+        return web.json_response({"ok": True})
 
     # --- Unprefixed routes (single-project or aggregate) ---
 
@@ -797,6 +882,9 @@ class TexWatchServer:
     async def _handle_root_bibliography(self, request: web.Request) -> web.Response:
         return self._single_or_aggregate("_build_bibliography_response")
 
+    async def _handle_root_labels(self, request: web.Request) -> web.Response:
+        return self._single_or_aggregate("_build_labels_response")
+
     async def _handle_root_environments(self, request: web.Request) -> web.Response:
         return self._single_or_aggregate("_build_environments_response")
 
@@ -810,15 +898,53 @@ class TexWatchServer:
         """Handle GET /activity — global activity log."""
         return self._build_activity_response(self._global_events, request)
 
-    async def _handle_root_history(self, request: web.Request) -> web.Response:
-        """Handle GET /history/{file} — resolve to effective project."""
+    async def _handle_root_snapshots(self, request: web.Request) -> web.Response:
+        """Handle GET /snapshots/{file} — resolve to effective project."""
         proj, auto = self._get_effective_project()
         if proj is None:
-            return self._multi_project_error("history/{file}")
+            return self._multi_project_error("snapshots/{file}")
         file_param = request.match_info.get("file", "")
         snapshots = [s for s in reversed(proj.file_snapshots) if s["file"] == file_param]
         resp = web.json_response({"file": file_param, "snapshots": snapshots})
         return self._auto_selected_response(resp, proj, auto)
+
+    async def _handle_root_compiles(self, request: web.Request) -> web.Response:
+        """Handle GET /compiles — resolve to effective project."""
+        proj, auto = self._get_effective_project()
+        if proj is None:
+            return web.json_response([])
+        resp = self._build_compiles_response(proj, request)
+        return self._auto_selected_response(resp, proj, auto)
+
+    async def _handle_root_highlight(self, request: web.Request) -> web.Response:
+        """Handle POST /highlight — set editor highlights for the active project."""
+        proj, _auto = self._get_effective_project()
+        if proj is None:
+            return web.json_response({"error": "No project"}, status=400)
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        file = data.get("file", "")
+        ranges = data.get("ranges", [])
+        payload = proj.highlight_state.set_highlights(file, ranges)
+        await proj.broadcast(payload)
+        return web.json_response({"ok": True})
+
+    async def _handle_root_annotate(self, request: web.Request) -> web.Response:
+        """Handle POST /annotate — set gutter annotations for the active project."""
+        proj, _auto = self._get_effective_project()
+        if proj is None:
+            return web.json_response({"error": "No project"}, status=400)
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        file = data.get("file", "")
+        annotations = data.get("annotations", [])
+        payload = proj.annotation_state.set_annotations(file, annotations)
+        await proj.broadcast(payload)
+        return web.json_response({"ok": True})
 
     async def _handle_get_current(self, request: web.Request) -> web.Response:
         """Handle GET /current — return current project name."""
@@ -852,6 +978,23 @@ class TexWatchServer:
 
         self._current_project_name = name
         return web.json_response({"current": name})
+
+    def _build_compiles_response(
+        self, proj: ProjectInstance, request: web.Request,
+    ) -> web.Response:
+        """Build GET /compiles response."""
+        if not self.compile_store:
+            return web.json_response([])
+        since = request.query.get("since")
+        limit = int(request.query.get("limit", "50"))
+        success_str = request.query.get("success")
+        success_bool = None
+        if success_str is not None:
+            success_bool = success_str.lower() in ("true", "1")
+        results = self.compile_store.query_compiles(
+            project=proj.name, since=since, limit=limit, success=success_bool,
+        )
+        return web.json_response(results)
 
     def _build_activity_response(
         self, events: deque[dict], request: web.Request,
@@ -937,6 +1080,7 @@ class TexWatchServer:
                     logger.error(f"WebSocket error: {ws.exception()}")
         finally:
             proj.websockets.discard(ws)
+            on_ws_disconnect(proj.user_focus)
             logger.info(f"[{proj.name}] WebSocket disconnected, {len(proj.websockets)} clients")
 
         return ws
@@ -972,6 +1116,9 @@ class TexWatchServer:
                 proj._last_file_edit = cur
                 proj.log_event("file_edit", file=file, line=line)
             logger.debug(f"[{proj.name}] Editor state updated: {proj.editor_state}")
+
+        elif msg_type in ("focus", "selection", "visible_lines", "pdf_viewport"):
+            update_focus(proj.user_focus, data)
 
         elif msg_type == "click":
             page = data.get("page")
@@ -1117,6 +1264,25 @@ class TexWatchServer:
             })
 
         return web.json_response(dataclasses.asdict(bib))
+
+    def _build_labels_response(self, proj: ProjectInstance) -> web.Response:
+        """Build GET /labels response for a project."""
+        main_file = get_main_file(proj.config)
+        watch_dir = get_watch_dir(proj.config)
+
+        try:
+            labels = parse_labels(main_file, watch_dir)
+            structure = parse_structure(main_file, watch_dir)
+            environments = parse_environments(main_file, watch_dir)
+            enrich_labels_with_structure(labels, structure.sections, environments)
+        except Exception:
+            logger.debug("labels endpoint: parse failed", exc_info=True)
+            return web.json_response([])
+
+        return web.json_response([
+            {"key": l.key, "file": l.file, "line": l.line, "context": l.context}
+            for l in labels
+        ])
 
     def _build_environments_response(self, proj: ProjectInstance) -> web.Response:
         """Build GET /environments response for a project."""
@@ -1300,7 +1466,7 @@ class TexWatchServer:
         # Activity — last 10 events (newest first)
         activity = list(reversed(proj.events))[:10]
 
-        return web.json_response({
+        dashboard: dict[str, Any] = {
             "health": health,
             "sections": sections_list,
             "issues": issues,
@@ -1310,7 +1476,15 @@ class TexWatchServer:
             "context": context,
             "files": files_tree,
             "activity": activity,
-        })
+            "user_focus": proj.user_focus.to_dict(),
+        }
+
+        if self.compile_store is not None:
+            dashboard["recent_compiles"] = self.compile_store.query_compiles(
+                project=proj.name, limit=5
+            )
+
+        return web.json_response(dashboard)
 
     async def _goto_estimated_page(
         self,
@@ -1487,6 +1661,8 @@ class TexWatchServer:
 
         page_param = request.query.get("page")
         dpi_param = request.query.get("dpi")
+        mode = request.query.get("mode")
+        bbox_str = request.query.get("bbox")
 
         try:
             dpi = int(dpi_param) if dpi_param else 150
@@ -1508,7 +1684,11 @@ class TexWatchServer:
             if total == 0:
                 return web.json_response({"error": "PDF has no pages"}, status=400)
 
-            if page_param is not None:
+            if mode == "viewport":
+                from .awareness import resolve_viewport_capture
+                page_num = resolve_viewport_capture(proj.user_focus)
+                page_num = max(1, min(page_num, total))
+            elif page_param is not None:
                 try:
                     page_num = int(page_param)
                 except ValueError:
@@ -1527,7 +1707,20 @@ class TexWatchServer:
             page = doc[page_num - 1]
             zoom = dpi / 72.0
             mat = pymupdf.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
+
+            clip = None
+            if bbox_str:
+                try:
+                    coords = [float(v) for v in bbox_str.split(",")]
+                    if len(coords) == 4:
+                        clip = pymupdf.Rect(*coords)
+                except (ValueError, Exception):
+                    pass  # fall back to full page
+
+            if clip is not None:
+                pix = page.get_pixmap(matrix=mat, clip=clip)
+            else:
+                pix = page.get_pixmap(matrix=mat)
             png_data = pix.tobytes("png")
         finally:
             doc.close()
