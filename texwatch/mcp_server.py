@@ -81,18 +81,6 @@ def create_server() -> "FastMCP":
             return resp.text
 
     @mcp.tool()
-    async def texwatch_history(
-        file: str,
-        port: int = 8765,
-        project: str | None = None,
-    ) -> str:
-        """Get previous versions of a source file (saved before each write). Returns snapshots newest-first."""
-        base = _base_url(port, project)
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{base}/history/{file}")
-            return resp.text
-
-    @mcp.tool()
     async def texwatch_goto(
         line: int | None = None,
         page: int | None = None,
@@ -178,6 +166,25 @@ def create_server() -> "FastMCP":
                 )
             else:
                 resp = await client.get(f"http://localhost:{port}/current")
+            return resp.text
+
+    @mcp.tool()
+    async def texwatch_compiles(
+        since: str | None = None,
+        limit: int = 50,
+        success_only: bool = False,
+        port: int = 8765,
+        project: str | None = None,
+    ) -> str:
+        """Query compilation history from SQLite. Returns recent compiles with error counts, duration, and word count."""
+        params: dict = {"limit": limit}
+        if since:
+            params["since"] = since
+        if success_only:
+            params["success"] = "true"
+        base = _base_url(port, project)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{base}/compiles", params=params)
             return resp.text
 
     return mcp
