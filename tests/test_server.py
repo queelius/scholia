@@ -2946,13 +2946,13 @@ class TestFileSnapshots:
 
     @pytest.mark.asyncio
     async def test_history_endpoint_returns_snapshots(self, client, server):
-        """Test GET /p/{name}/history/{file} returns snapshots newest-first."""
+        """Test GET /p/{name}/snapshots/{file} returns snapshots newest-first."""
         name = server._single.name
         # Write twice
         await client.post("/source", json={"file": "main.tex", "content": "v2"})
         await client.post("/source", json={"file": "main.tex", "content": "v3"})
 
-        resp = await client.get(f"/p/{name}/history/main.tex")
+        resp = await client.get(f"/p/{name}/snapshots/main.tex")
         assert resp.status == 200
         data = await resp.json()
         assert data["file"] == "main.tex"
@@ -2972,10 +2972,10 @@ class TestFileSnapshots:
         assert len(server._single.file_snapshots) == 20
 
     @pytest.mark.asyncio
-    async def test_unprefixed_history_route(self, client, server):
-        """Test GET /history/{file} resolves to single project."""
+    async def test_unprefixed_snapshots_route(self, client, server):
+        """Test GET /snapshots/{file} resolves to single project."""
         await client.post("/source", json={"file": "main.tex", "content": "v2"})
-        resp = await client.get("/history/main.tex")
+        resp = await client.get("/snapshots/main.tex")
         assert resp.status == 200
         data = await resp.json()
         assert data["file"] == "main.tex"
@@ -3449,8 +3449,8 @@ class TestMultiProjectHistoryError:
 
     @pytest.mark.asyncio
     async def test_history_multi_project_no_current(self, multi_client):
-        """Test /history/{file} on multi-project server without current returns 400."""
-        resp = await multi_client.get("/history/main.tex")
+        """Test /snapshots/{file} on multi-project server without current returns 400."""
+        resp = await multi_client.get("/snapshots/main.tex")
         assert resp.status == 400
         data = await resp.json()
         assert "projects" in data
@@ -3650,6 +3650,26 @@ class TestDashboardEndpoint:
         # main.tex should appear in the file tree
         names = [f["name"] for f in data["files"] if f.get("type") == "file"]
         assert "main.tex" in names
+
+
+class TestCompilesEndpoint:
+    @pytest.mark.asyncio
+    async def test_compiles_returns_200(self, client):
+        resp = await client.get("/compiles")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_compiles_returns_list(self, client):
+        resp = await client.get("/compiles")
+        data = await resp.json()
+        assert isinstance(data, list)
+
+
+class TestSnapshotsEndpointRename:
+    @pytest.mark.asyncio
+    async def test_snapshots_endpoint_exists(self, client):
+        resp = await client.get("/snapshots/main.tex")
+        assert resp.status == 200
 
     @pytest.mark.asyncio
     async def test_dashboard_includes_activity(self, client, config):

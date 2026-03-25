@@ -24,6 +24,7 @@ from .compiler import CompileMessage, CompileResult, compile_tex
 from .config import Config, get_main_file, get_watch_dir
 from .digest import Digest, parse_digest
 from .environments import parse_environments
+from .persistence import CompileStore
 from .structure import DocumentStructure, parse_structure
 from .synctex import (
     SyncTeXData,
@@ -122,6 +123,9 @@ class ProjectInstance:
 
         # Change tracking
         self.change_log = ChangeLog()
+
+        # SQLite persistence (injected by TexWatchServer after construction)
+        self.compile_store: CompileStore | None = None
 
     def log_event(self, event_type: str, **data: Any) -> dict:
         """Record an event in the per-project ring buffer."""
@@ -242,6 +246,28 @@ class ProjectInstance:
                 errors=len(self.last_result.errors) if self.last_result else 0,
                 warnings=len(self.last_result.warnings) if self.last_result else 0,
             )
+            # Record to SQLite persistence
+            if self.compile_store and self.last_result:
+                try:
+                    self.compile_store.record_compile(
+                        project=self.name,
+                        success=self.last_result.success,
+                        duration_s=self.last_result.duration_seconds,
+                        error_count=len(self.last_result.errors),
+                        warning_count=len(self.last_result.warnings),
+                        word_count=None,  # word count computed separately
+                        page_count=None,  # page count set by browser
+                        main_file=str(get_main_file(self.config)),
+                        messages=[
+                            {"level": "error", "file": e.file, "line": e.line, "message": e.message}
+                            for e in self.last_result.errors
+                        ] + [
+                            {"level": "warning", "file": w.file, "line": w.line, "message": w.message}
+                            for w in self.last_result.warnings
+                        ],
+                    )
+                except Exception:
+                    logger.debug("Failed to record compile to SQLite", exc_info=True)
             await self.broadcast({"type": "compiling", "status": False})
             msg = {
                 "type": "compiled",
@@ -366,6 +392,14 @@ class TexWatchServer:
             )
         else:
             raise ValueError("Must provide config or projects")
+
+        # Set up SQLite persistence
+        self.compile_store: CompileStore | None = None
+        if self._projects:
+            db_dir = Path.cwd() / ".texwatch"
+            self.compile_store = CompileStore(db_dir / "history.db")
+        for proj in self._projects.values():
+            proj.compile_store = self.compile_store
 
         # Middleware to track current project from /p/{name}/... requests
         @web.middleware
@@ -518,7 +552,8 @@ class TexWatchServer:
         self.app.router.add_get(r"/p/{name:.+}/digest", self._handle_project_digest)
         self.app.router.add_get(r"/p/{name:.+}/dashboard", self._handle_project_dashboard)
         self.app.router.add_get(r"/p/{name:.+}/activity", self._handle_project_activity)
-        self.app.router.add_get(r"/p/{name}/history/{file:.+}", self._handle_project_history)
+        self.app.router.add_get(r"/p/{name}/snapshots/{file:.+}", self._handle_project_snapshots)
+        self.app.router.add_get(r"/p/{name:.+}/compiles", self._handle_project_compiles)
 
         # Unprefixed routes (resolve to single project or aggregate)
         self.app.router.add_get("/ws", self._handle_root_ws)
@@ -540,7 +575,8 @@ class TexWatchServer:
         self.app.router.add_get("/digest", self._handle_root_digest)
         self.app.router.add_get("/dashboard", self._handle_root_dashboard)
         self.app.router.add_get("/activity", self._handle_root_activity)
-        self.app.router.add_get(r"/history/{file:.+}", self._handle_root_history)
+        self.app.router.add_get(r"/snapshots/{file:.+}", self._handle_root_snapshots)
+        self.app.router.add_get("/compiles", self._handle_root_compiles)
         self.app.router.add_get("/current", self._handle_get_current)
         self.app.router.add_post("/current", self._handle_set_current)
 
@@ -694,11 +730,15 @@ class TexWatchServer:
         proj = self._require_project(request)
         return self._build_activity_response(proj.events, request)
 
-    async def _handle_project_history(self, request: web.Request) -> web.Response:
+    async def _handle_project_snapshots(self, request: web.Request) -> web.Response:
         proj = self._require_project(request)
         file_param = request.match_info.get("file", "")
         snapshots = [s for s in reversed(proj.file_snapshots) if s["file"] == file_param]
         return web.json_response({"file": file_param, "snapshots": snapshots})
+
+    async def _handle_project_compiles(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        return self._build_compiles_response(proj, request)
 
     # --- Unprefixed routes (single-project or aggregate) ---
 
@@ -820,14 +860,22 @@ class TexWatchServer:
         """Handle GET /activity — global activity log."""
         return self._build_activity_response(self._global_events, request)
 
-    async def _handle_root_history(self, request: web.Request) -> web.Response:
-        """Handle GET /history/{file} — resolve to effective project."""
+    async def _handle_root_snapshots(self, request: web.Request) -> web.Response:
+        """Handle GET /snapshots/{file} — resolve to effective project."""
         proj, auto = self._get_effective_project()
         if proj is None:
-            return self._multi_project_error("history/{file}")
+            return self._multi_project_error("snapshots/{file}")
         file_param = request.match_info.get("file", "")
         snapshots = [s for s in reversed(proj.file_snapshots) if s["file"] == file_param]
         resp = web.json_response({"file": file_param, "snapshots": snapshots})
+        return self._auto_selected_response(resp, proj, auto)
+
+    async def _handle_root_compiles(self, request: web.Request) -> web.Response:
+        """Handle GET /compiles — resolve to effective project."""
+        proj, auto = self._get_effective_project()
+        if proj is None:
+            return web.json_response([])
+        resp = self._build_compiles_response(proj, request)
         return self._auto_selected_response(resp, proj, auto)
 
     async def _handle_get_current(self, request: web.Request) -> web.Response:
@@ -862,6 +910,23 @@ class TexWatchServer:
 
         self._current_project_name = name
         return web.json_response({"current": name})
+
+    def _build_compiles_response(
+        self, proj: ProjectInstance, request: web.Request,
+    ) -> web.Response:
+        """Build GET /compiles response."""
+        if not self.compile_store:
+            return web.json_response([])
+        since = request.query.get("since")
+        limit = int(request.query.get("limit", "50"))
+        success_str = request.query.get("success")
+        success_bool = None
+        if success_str is not None:
+            success_bool = success_str.lower() in ("true", "1")
+        results = self.compile_store.query_compiles(
+            project=proj.name, since=since, limit=limit, success=success_bool,
+        )
+        return web.json_response(results)
 
     def _build_activity_response(
         self, events: deque[dict], request: web.Request,
@@ -1329,7 +1394,7 @@ class TexWatchServer:
         # Activity — last 10 events (newest first)
         activity = list(reversed(proj.events))[:10]
 
-        return web.json_response({
+        dashboard: dict[str, Any] = {
             "health": health,
             "sections": sections_list,
             "issues": issues,
@@ -1339,7 +1404,14 @@ class TexWatchServer:
             "context": context,
             "files": files_tree,
             "activity": activity,
-        })
+        }
+
+        if self.compile_store is not None:
+            dashboard["recent_compiles"] = self.compile_store.query_compiles(
+                project=proj.name, limit=5
+            )
+
+        return web.json_response(dashboard)
 
     async def _goto_estimated_page(
         self,
