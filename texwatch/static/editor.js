@@ -113,11 +113,19 @@ class TexWatchEditor {
                     EditorView.updateListener.of((update) => {
                         if (update.docChanged) {
                             this.onDocChanged();
+                            if (window.texwatchAwareness && this.currentFile) {
+                                window.texwatchAwareness.clearHighlights(this.currentFile);
+                            }
                         }
                     }),
                     EditorView.updateListener.of((update) => {
                         if (update.selectionSet) {
                             this._debouncedEmitEditorState();
+                            if (window.texwatchAwareness && this.currentFile) {
+                                const line = update.state.doc.lineAt(update.state.selection.main.head);
+                                const col = update.state.selection.main.head - line.from;
+                                window.texwatchAwareness.reportCursor(this.currentFile, line.number, col);
+                            }
                         }
                     }),
                     EditorView.domEventHandlers({
