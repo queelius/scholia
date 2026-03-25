@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from aiohttp import web, WSMsgType
 
+from .awareness import UserFocus, HighlightState, AnnotationState, update_focus, on_ws_disconnect
 from .bibliography import parse_bibliography
 from .labels import enrich_labels_with_structure, parse_labels
 from .changes import ChangeLog, compute_changes
@@ -123,6 +124,11 @@ class ProjectInstance:
 
         # Change tracking
         self.change_log = ChangeLog()
+
+        # Awareness state (user focus, highlights, annotations)
+        self.user_focus = UserFocus()
+        self.highlight_state = HighlightState()
+        self.annotation_state = AnnotationState()
 
         # SQLite persistence (injected by TexWatchServer after construction)
         self.compile_store: CompileStore | None = None
@@ -278,6 +284,10 @@ class ProjectInstance:
             await self.broadcast(msg)
             if self.last_result and self.last_result.success:
                 await self.broadcast({"type": "dashboard_updated"})
+                # Clear annotations on successful compile
+                payloads = self.annotation_state.clear_all()
+                for payload in payloads:
+                    await self.broadcast(payload)
 
     async def on_file_change(self, changed_path: str) -> None:
         """Handle file change from watcher."""
@@ -554,6 +564,8 @@ class TexWatchServer:
         self.app.router.add_get(r"/p/{name:.+}/activity", self._handle_project_activity)
         self.app.router.add_get(r"/p/{name}/snapshots/{file:.+}", self._handle_project_snapshots)
         self.app.router.add_get(r"/p/{name:.+}/compiles", self._handle_project_compiles)
+        self.app.router.add_post(r"/p/{name:.+}/highlight", self._handle_project_highlight)
+        self.app.router.add_post(r"/p/{name:.+}/annotate", self._handle_project_annotate)
 
         # Unprefixed routes (resolve to single project or aggregate)
         self.app.router.add_get("/ws", self._handle_root_ws)
@@ -577,6 +589,8 @@ class TexWatchServer:
         self.app.router.add_get("/activity", self._handle_root_activity)
         self.app.router.add_get(r"/snapshots/{file:.+}", self._handle_root_snapshots)
         self.app.router.add_get("/compiles", self._handle_root_compiles)
+        self.app.router.add_post("/highlight", self._handle_root_highlight)
+        self.app.router.add_post("/annotate", self._handle_root_annotate)
         self.app.router.add_get("/current", self._handle_get_current)
         self.app.router.add_post("/current", self._handle_set_current)
 
@@ -740,6 +754,30 @@ class TexWatchServer:
         proj = self._require_project(request)
         return self._build_compiles_response(proj, request)
 
+    async def _handle_project_highlight(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        file = data.get("file", "")
+        ranges = data.get("ranges", [])
+        payload = proj.highlight_state.set_highlights(file, ranges)
+        await proj.broadcast(payload)
+        return web.json_response({"ok": True})
+
+    async def _handle_project_annotate(self, request: web.Request) -> web.Response:
+        proj = self._require_project(request)
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        file = data.get("file", "")
+        annotations = data.get("annotations", [])
+        payload = proj.annotation_state.set_annotations(file, annotations)
+        await proj.broadcast(payload)
+        return web.json_response({"ok": True})
+
     # --- Unprefixed routes (single-project or aggregate) ---
 
     def _auto_selected_response(
@@ -878,6 +916,36 @@ class TexWatchServer:
         resp = self._build_compiles_response(proj, request)
         return self._auto_selected_response(resp, proj, auto)
 
+    async def _handle_root_highlight(self, request: web.Request) -> web.Response:
+        """Handle POST /highlight — set editor highlights for the active project."""
+        proj, _auto = self._get_effective_project()
+        if proj is None:
+            return web.json_response({"error": "No project"}, status=400)
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        file = data.get("file", "")
+        ranges = data.get("ranges", [])
+        payload = proj.highlight_state.set_highlights(file, ranges)
+        await proj.broadcast(payload)
+        return web.json_response({"ok": True})
+
+    async def _handle_root_annotate(self, request: web.Request) -> web.Response:
+        """Handle POST /annotate — set gutter annotations for the active project."""
+        proj, _auto = self._get_effective_project()
+        if proj is None:
+            return web.json_response({"error": "No project"}, status=400)
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        file = data.get("file", "")
+        annotations = data.get("annotations", [])
+        payload = proj.annotation_state.set_annotations(file, annotations)
+        await proj.broadcast(payload)
+        return web.json_response({"ok": True})
+
     async def _handle_get_current(self, request: web.Request) -> web.Response:
         """Handle GET /current — return current project name."""
         name = self._current_project_name
@@ -1012,6 +1080,7 @@ class TexWatchServer:
                     logger.error(f"WebSocket error: {ws.exception()}")
         finally:
             proj.websockets.discard(ws)
+            on_ws_disconnect(proj.user_focus)
             logger.info(f"[{proj.name}] WebSocket disconnected, {len(proj.websockets)} clients")
 
         return ws
@@ -1047,6 +1116,9 @@ class TexWatchServer:
                 proj._last_file_edit = cur
                 proj.log_event("file_edit", file=file, line=line)
             logger.debug(f"[{proj.name}] Editor state updated: {proj.editor_state}")
+
+        elif msg_type in ("focus", "selection", "visible_lines", "pdf_viewport"):
+            update_focus(proj.user_focus, data)
 
         elif msg_type == "click":
             page = data.get("page")
@@ -1404,6 +1476,7 @@ class TexWatchServer:
             "context": context,
             "files": files_tree,
             "activity": activity,
+            "user_focus": proj.user_focus.to_dict(),
         }
 
         if self.compile_store is not None:

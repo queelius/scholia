@@ -3869,3 +3869,126 @@ class TestLabelsEndpoint:
         resp = await client.get("/labels")
         data = await resp.json()
         assert isinstance(data, list)
+
+
+class TestHighlightEndpoint:
+    @pytest.mark.asyncio
+    async def test_highlight_returns_200(self, client):
+        resp = await client.post("/highlight", json={
+            "file": "main.tex",
+            "ranges": [{"start": 1, "end": 5, "color": "yellow"}],
+        })
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_highlight_response_ok(self, client):
+        resp = await client.post("/highlight", json={
+            "file": "main.tex",
+            "ranges": [],
+        })
+        data = await resp.json()
+        assert data["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_highlight_broadcasts_via_websocket(self, client, server):
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            await client.post("/highlight", json={
+                "file": "main.tex",
+                "ranges": [{"start": 1, "end": 3, "color": "blue"}],
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+            msg = await ws.receive_json()
+            assert msg["type"] == "highlights"
+            assert msg["file"] == "main.tex"
+            assert len(msg["ranges"]) == 1
+
+
+class TestAnnotateEndpoint:
+    @pytest.mark.asyncio
+    async def test_annotate_returns_200(self, client):
+        resp = await client.post("/annotate", json={
+            "file": "main.tex",
+            "annotations": [{"line": 10, "type": "warning", "text": "test"}],
+        })
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_annotate_response_ok(self, client):
+        resp = await client.post("/annotate", json={
+            "file": "main.tex",
+            "annotations": [],
+        })
+        data = await resp.json()
+        assert data["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_annotate_broadcasts_via_websocket(self, client, server):
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            await client.post("/annotate", json={
+                "file": "main.tex",
+                "annotations": [{"line": 10, "type": "error", "text": "oops"}],
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+            msg = await ws.receive_json()
+            assert msg["type"] == "annotations"
+            assert msg["file"] == "main.tex"
+            assert len(msg["annotations"]) == 1
+
+
+class TestFocusTracking:
+    @pytest.mark.asyncio
+    async def test_focus_message_updates_user_focus(self, client, server):
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()  # initial state
+
+            await ws.send_json({
+                "type": "focus",
+                "file": "main.tex",
+                "line": 5,
+                "column": 10,
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+        proj = server._single
+        assert proj.user_focus.file == "main.tex"
+        assert proj.user_focus.cursor == (5, 10)
+        assert proj.user_focus.ws_connected is False  # disconnected after context exit
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_ws_connected(self, client, server):
+        async with client.ws_connect("/ws") as ws:
+            await ws.receive_json()
+
+            await ws.send_json({
+                "type": "focus",
+                "file": "main.tex",
+                "line": 1,
+                "column": 0,
+            })
+
+            import asyncio
+            await asyncio.sleep(0.1)
+
+        await asyncio.sleep(0.1)
+        proj = server._single
+        assert proj.user_focus.ws_connected is False
+
+    @pytest.mark.asyncio
+    async def test_dashboard_includes_user_focus(self, client):
+        resp = await client.get("/dashboard")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "user_focus" in data
+        assert "ws_connected" in data["user_focus"]
