@@ -1661,6 +1661,8 @@ class TexWatchServer:
 
         page_param = request.query.get("page")
         dpi_param = request.query.get("dpi")
+        mode = request.query.get("mode")
+        bbox_str = request.query.get("bbox")
 
         try:
             dpi = int(dpi_param) if dpi_param else 150
@@ -1682,7 +1684,11 @@ class TexWatchServer:
             if total == 0:
                 return web.json_response({"error": "PDF has no pages"}, status=400)
 
-            if page_param is not None:
+            if mode == "viewport":
+                from .awareness import resolve_viewport_capture
+                page_num = resolve_viewport_capture(proj.user_focus)
+                page_num = max(1, min(page_num, total))
+            elif page_param is not None:
                 try:
                     page_num = int(page_param)
                 except ValueError:
@@ -1701,7 +1707,20 @@ class TexWatchServer:
             page = doc[page_num - 1]
             zoom = dpi / 72.0
             mat = pymupdf.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
+
+            clip = None
+            if bbox_str:
+                try:
+                    coords = [float(v) for v in bbox_str.split(",")]
+                    if len(coords) == 4:
+                        clip = pymupdf.Rect(*coords)
+                except (ValueError, Exception):
+                    pass  # fall back to full page
+
+            if clip is not None:
+                pix = page.get_pixmap(matrix=mat, clip=clip)
+            else:
+                pix = page.get_pixmap(matrix=mat)
             png_data = pix.tobytes("png")
         finally:
             doc.close()
