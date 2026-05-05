@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "texwatch"
-version = "0.3.0"
-description = "TeX file watcher with browser-based PDF viewer"
+version = "0.4.0"
+description = "Review-style commenting and live PDF preview for LaTeX papers, designed for Claude Code as author"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "spinoza" }
+    { name = "Alex Towell", email = "lex@metafunctor.com" }
 ]
-keywords = ["tex", "latex", "pdf", "watcher", "viewer"]
+keywords = ["tex", "latex", "pdf", "watcher", "viewer", "review", "annotation", "claude", "mcp"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -32,13 +32,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-capture = ["pymupdf>=1.23.0"]
 mcp = ["mcp>=1.0", "httpx"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
-    "pymupdf>=1.23.0",
 ]
 
 [project.scripts]

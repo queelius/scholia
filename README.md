@@ -1,234 +1,127 @@
 # texwatch
 
-Live-reloading TeX editor with PDF viewer in the browser. Edit LaTeX, see the PDF update instantly, click between source and output.
+**Pull-request-style review for LaTeX papers, with Claude Code as the author.**
 
-## Why
+You read the rendered PDF in your browser. You drop comments on paragraphs, sections, or the paper as a whole. Claude Code reads the queue, edits the source, and replies with what changed. The PDF rebuilds in front of you. Repeat until done.
 
-Writing LaTeX means compiling, switching windows, scrolling to find your place, checking for errors, switching back, fixing, recompiling. Every cycle costs seconds that add up to hours.
+## Why this exists
 
-texwatch collapses that loop into one command. Run `texwatch` in your project directory and it watches every `.tex` and `.bib` file, recompiles on save, and serves a split-pane editor+viewer at `localhost:8765`. SyncTeX links source lines to PDF positions bidirectionally — double-click a line to jump the PDF there, click the PDF to jump the editor back. Errors appear inline with surrounding source context, not buried in a log file.
+texwatch v0.3.0 was a browser IDE that *also* had Claude Code integration. It tried to be a place you wrote LaTeX. It lost: VS Code, Overleaf, and Vim are all better text editors. The MCP integration was a sidecar.
 
-What sets it apart:
+v0.4.0 inverts the framing. **Claude Code is the only editor.** texwatch is the place you *review* its work. The browser viewer is read-only by design: you point at things, you describe what's wrong, and Claude does the rewriting.
 
-- **Bidirectional SyncTeX** in the browser — no IDE plugin required
-- **Semantic paper analysis** — bibliography health, environment inventory, document metadata, all available from the CLI or API
-- **AI-native** — an MCP server gives Claude Code full read/write access to your paper state, so it can navigate, inspect, and edit your document directly
-- **Multi-project** — serve an entire directory of papers from one process, each on its own route
+## What it gives you
+
+- **A live PDF preview** that auto-rebuilds on every save (yours or Claude's).
+- **Comments anchored to PDF regions, sections, source ranges, or the paper as a whole.** Threaded: every comment is a conversation between you and Claude.
+- **Anchor durability.** When Claude edits, line numbers shift; texwatch follows the content via snippet matching and structural anchors, and flags comments as `STALE` when it can't.
+- **Structured compile errors** (file, line, message, and 5-line source context) so Claude doesn't have to grep the latexmk log.
+- **MCP tools** for paper state, recompile, and the comments queue. Claude Code reads the queue and treats each comment as a task.
 
 ## Install
 
-**Requires Python 3.10+**
+Requires Python 3.10+ and `latexmk` (or `pdflatex`/`xelatex`/`lualatex`/`pandoc`) on your `PATH`.
 
 ```bash
 pip install texwatch
+pip install texwatch[mcp]   # add MCP server for Claude Code
 ```
-
-Optional extras:
-
-```bash
-pip install texwatch[capture]   # PDF screenshot support (pymupdf)
-pip install texwatch[mcp]       # Claude Code integration (MCP server)
-```
-
-Requires `latexmk` (or `pdflatex`/`xelatex`/`lualatex`) on your PATH.
 
 ## Quick start
 
 ```bash
 cd my-paper/
-texwatch init          # creates .texwatch.yaml
-texwatch               # starts server, opens at http://localhost:8765
+texwatch init       # writes .texwatch.yaml (configures main file, port)
+texwatch            # starts the daemon, opens at http://localhost:8765
 ```
 
-The browser UI has three panes: file tree, CodeMirror editor, and PDF viewer. Save a file anywhere in the project and the PDF reloads automatically.
+In the browser:
 
-## Common use cases
+- The PDF appears on the left, the comments sidebar on the right.
+- **Select text in the PDF** → a "Comment on selection" toolbar pops up. Click it to anchor a comment to that region. SyncTeX resolves the selection back to a source line range.
+- **"+ Note"** in the top bar → paper-level comment ("the abstract is too long").
+- **Paper tab** → list of sections with **"+ comment"** buttons → section-anchored comments.
 
-**Navigate from source to PDF:**
+## The Claude Code workflow
 
-Double-click a line in the editor, or press `Ctrl+Enter` to jump the PDF to that position.
+Once `texwatch` is running, the MCP server auto-registers in `.mcp.json`. Claude Code sees these tools:
 
-**Navigate from PDF to source:**
+| Tool | What it does |
+|---|---|
+| `texwatch_paper()` | Full structured paper state: sections (with line ranges), labels, citations, comment counts. |
+| `texwatch_compile()` | Recompile and return structured errors with source context. |
+| `texwatch_comments(status="open")` | Read the review queue. |
+| `texwatch_comment(action, ...)` | Add/reply/resolve/dismiss/reopen/delete. |
+| `texwatch_goto(target)` | Scroll the user's viewer to a section / page / line. |
 
-Click anywhere in the PDF to scroll the editor to the corresponding source line.
+The intended dialogue:
 
-**Jump to a section:**
+```
+You:    [drop 8 comments on the PDF, then in Claude Code]
+        "Process the open comments."
 
-```bash
-texwatch goto "Related Work"    # fuzzy matches section titles
-texwatch goto 42                # jump to line 42
-texwatch goto p3                # jump to page 3
+Claude: [calls texwatch_comments, reads the queue]
+        [for each one: edits source via Edit tool, then calls
+         texwatch_comment(action="resolve", id=..., summary="...", edits=[...])]
+        [calls texwatch_compile to verify]
+
+You:    [PDF rebuilds in your browser; sidebar updates]
+        [reply to the ones that need more work]
 ```
 
-**Check compilation errors (from another terminal):**
+## Comment anchors
 
-```bash
-texwatch status
-texwatch compile --json
+Four kinds, with different staleness behavior:
+
+| Anchor | Use when | How staleness is handled |
+|---|---|---|
+| `pdf_region` | You're reading the PDF and want to point at a paragraph. | SyncTeX resolves to a source range, then a content snippet is captured. If Claude rewrites the paragraph, the snippet match fails and the comment goes `STALE`. |
+| `section` | "Expand the methods section." | Resolved by section title or `\label{...}`. Stale only if the section is removed or renamed. |
+| `source_range` | You're reading source and know the lines. CLI: `--source intro.tex:42-58` | Same snippet-match as `pdf_region`. |
+| `paper` | Global note about the paper. | Never stale. |
+
+## CLI
+
+```
+texwatch                        # serve (default)
+texwatch init                   # scaffold .texwatch.yaml
+texwatch compile                # one-shot compile, structured errors
+texwatch goto "Related Work"    # tell the running viewer to scroll
+texwatch mcp                    # run the MCP server (stdio)
+
+texwatch comment add "abstract is too long" --paper
+texwatch comment add "expand this" --section "Methods"
+texwatch comment add "rephrase" --source intro.tex:42-58
+texwatch comment list [--status open|resolved|dismissed|all]
+texwatch comment show c-7f2a
+texwatch comment resolve c-7f2a "broke into two paragraphs" --edit "intro.tex:42-58 -> :42-78"
+texwatch comment dismiss c-7f2a "no longer relevant"
+texwatch comment reopen c-7f2a
+texwatch comment delete c-7f2a
 ```
 
-**Get a paper overview:**
+Comments live in `.texwatch/comments.json`. `git add` it to keep your review history with the paper.
 
-```bash
-texwatch dashboard              # unified view: health, sections, issues, bibliography
-texwatch dashboard --section bibliography
-texwatch bibliography           # shortcut for bibliography analysis
-texwatch environments           # list all LaTeX environments
-texwatch digest                 # document metadata (title, author, class)
-```
+## What's intentionally missing in v0.4.0
 
-**Screenshot a PDF page:**
-
-```bash
-texwatch capture output.png --page 1 --dpi 300
-```
-
-**Serve multiple projects:**
-
-```bash
-texwatch serve --recursive --dir ~/papers/
-# Dashboard at http://localhost:8765, each project at /p/{name}/
-texwatch current                # show which project is active
-texwatch current other-paper    # switch to a different project
-```
+- **No editor pane.** v0.3.0 had CodeMirror, autocomplete, snippets, file tree. Gone. Claude Code is the editor.
+- **No multi-project workspace.** One paper per `texwatch` process.
+- **No bibliography/environment/digest dashboards.** Folded into one `texwatch_paper()` MCP call. If you want richer analysis, the data is there for Claude to slice.
+- **No SQLite compile history.** Each compile result stands on its own; the comments thread captures the review history.
+- **No file-save endpoint.** Claude Code edits source files directly via its own `Edit`/`Write` tools. The watcher picks up changes automatically.
 
 ## Configuration
 
-`.texwatch.yaml` in your project root:
+`.texwatch.yaml`:
 
 ```yaml
 main: paper.tex
-watch:
-  - "*.tex"
-  - "*.bib"
-ignore:
-  - "old_*.tex"
-compiler: latexmk     # auto | latexmk | pdflatex | xelatex | lualatex
+watch: ["*.tex", "*.bib", "*.md"]
+ignore: ["*_backup.tex"]
+compiler: auto       # auto | latexmk | pdflatex | xelatex | lualatex | pandoc
 port: 8765
-page_limit: 8         # optional: flag when PDF exceeds N pages
 ```
-
-**Multi-paper projects**: Use the `papers:` key to define multiple compilable documents in one directory:
-
-```yaml
-papers:
-  - name: main-paper
-    main: paper.tex
-  - name: supplementary
-    main: supplement.tex
-    compiler: pdflatex
-watch:
-  - "*.tex"
-  - "*.bib"
-```
-
-Each paper appears as a separate project at `/p/{dirname}/{name}/`.
-
-## Web UI features
-
-- **Editor**: CodeMirror 6 with LaTeX syntax highlighting, word wrap toggle, conflict detection when files change on disk
-- **Viewer**: PDF.js with continuous or paged scroll, SyncTeX highlight overlay
-- **Error panel**: Compile errors/warnings with clickable source locations and surrounding context lines
-- **TODO panel**: Collects `% TODO`, `% FIXME`, `\todo{}` annotations from all `.tex` files
-- **Log viewer**: Full LaTeX compilation log, toggled from the error panel
-- **File tree**: Navigate and open project files (`.tex`, `.bib`, `.cls`, `.sty`, etc.)
-- **Structure**: Parses `\section`, `\input`/`\include` tree, word count (via `texcount`)
-
-## Claude Code integration
-
-texwatch includes an MCP server that gives Claude Code full access to your paper's state and source files. When you run `texwatch serve`, it auto-registers itself in your project's `.mcp.json` — no manual configuration needed.
-
-If you prefer manual setup:
-
-```json
-// .claude/.mcp.json
-{
-  "mcpServers": {
-    "texwatch": {
-      "command": "texwatch",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-### MCP tools
-
-| Tool | Description |
-|------|-------------|
-| `texwatch` | Get complete paper state (health, sections, issues, bibliography, changes, environments, editor/viewer context, file tree, recent activity) |
-| `texwatch_source` | Read source file content |
-| `texwatch_history` | Get previous versions of a source file (saved before each write) |
-| `texwatch_goto` | Navigate PDF viewer to a line, page, or section |
-| `texwatch_compile` | Trigger recompilation |
-| `texwatch_write_source` | Write content to a source file with conflict detection |
-| `texwatch_capture` | Screenshot current PDF page as PNG (base64) |
-| `texwatch_project` | Show or switch the current project |
-
-This lets Claude see your full paper state — sections, compile errors, bibliography, word count — and navigate, recompile, or edit source files directly.
-
-## CLI reference
-
-| Command | Description |
-|---------|-------------|
-| `texwatch init` | Create `.texwatch.yaml` in current directory |
-| `texwatch` / `texwatch serve` | Start the watcher and web server |
-| `texwatch status` | Show compile status, errors, viewer state |
-| `texwatch view` | Show editor and viewer pane state |
-| `texwatch goto <target>` | Navigate to line, page (`p3`), or section name |
-| `texwatch compile` | Trigger recompilation |
-| `texwatch capture <file>` | Screenshot PDF page to PNG |
-| `texwatch config` | View or modify `.texwatch.yaml` |
-| `texwatch files` | List project file tree |
-| `texwatch dashboard` | Unified paper dashboard (health, sections, issues, bibliography, changes, environments) |
-| `texwatch bibliography` | Show bibliography analysis |
-| `texwatch environments` | List LaTeX environments |
-| `texwatch digest` | Show document metadata (title, author, class) |
-| `texwatch activity` | Show recent activity events |
-| `texwatch current` | Show or switch the current project |
-| `texwatch scan <dir>` | Find projects with `.texwatch.yaml` |
-| `texwatch mcp` | Run MCP stdio server for Claude Code |
-
-Most commands accept `--port`, `--json`, and `--project` flags.
-
-### Exit codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | General failure (compile error, file not found, etc.) |
-| 2 | Argument parsing error |
-| 3 | Server not running (for commands that require a running server) |
-
-## HTTP API
-
-When `texwatch serve` is running, the following endpoints are available. For multi-project mode, prefix with `/p/{project_name}`.
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/status` | GET | Compile status, errors, viewer/editor state |
-| `/compile` | POST | Trigger recompilation |
-| `/goto` | POST | Navigate to `{"line": N}`, `{"page": N}`, or `{"section": "..."}` |
-| `/pdf` | GET | Serve the compiled PDF |
-| `/source` | GET | Get source file content (`?file=...`) |
-| `/source` | POST | Update source file (`{"file": "...", "content": "..."}`) |
-| `/files` | GET | Project file tree |
-| `/errors` | GET | Current errors and warnings |
-| `/context` | GET | Editor/viewer state + current section + word count |
-| `/structure` | GET | Document structure (sections, TODOs, inputs) |
-| `/capture` | GET | Screenshot PDF page as PNG (`?page=N&dpi=N`) |
-| `/dashboard` | GET | Unified paper state (all sections combined) |
-| `/bibliography` | GET | Bibliography entries and citation analysis |
-| `/environments` | GET | LaTeX environment inventory |
-| `/digest` | GET | Document metadata (title, author, document class) |
-| `/activity` | GET | Recent activity events |
-| `/history/{file}` | GET | Previous versions of a source file |
-| `/config` | GET | Project configuration |
-| `/current` | GET | Current project name |
-| `/current` | POST | Switch current project |
-| `/ws` | WebSocket | Real-time updates (compile events, navigation) |
-| `/projects` | GET | List all projects (multi-project mode) |
 
 ## License
 
-MIT
+MIT. See `LICENSE`.

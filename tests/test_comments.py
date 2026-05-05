@@ -1,0 +1,394 @@
+"""Tests for texwatch.comments — anchors, threads, staleness."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from texwatch.comments import (
+    Comment,
+    CommentStore,
+    PaperAnchor,
+    PdfRegionAnchor,
+    ResolvedSource,
+    SectionAnchor,
+    SourceRangeAnchor,
+    ThreadEntry,
+    anchor_from_dict,
+    capture_snippet,
+    find_snippet,
+)
+
+
+# ---------------------------------------------------------------------------
+# Anchor serialization
+# ---------------------------------------------------------------------------
+
+
+def test_pdf_region_anchor_roundtrip():
+    a = PdfRegionAnchor(page=3, bbox=(10.5, 20.5, 100.0, 200.0))
+    d = a.to_dict()
+    assert d == {"kind": "pdf_region", "page": 3, "bbox": [10.5, 20.5, 100.0, 200.0]}
+    restored = anchor_from_dict(d)
+    assert restored == a
+
+
+def test_section_anchor_roundtrip_with_label():
+    a = SectionAnchor(title="Related Work", label="sec:related")
+    d = a.to_dict()
+    assert d == {"kind": "section", "title": "Related Work", "label": "sec:related"}
+    restored = anchor_from_dict(d)
+    assert restored == a
+
+
+def test_section_anchor_roundtrip_without_label():
+    a = SectionAnchor(title="Introduction")
+    assert a.to_dict() == {"kind": "section", "title": "Introduction"}
+    assert anchor_from_dict(a.to_dict()) == a
+
+
+def test_source_range_anchor_roundtrip():
+    a = SourceRangeAnchor(file="intro.tex", line_start=42, line_end=58)
+    assert anchor_from_dict(a.to_dict()) == a
+
+
+def test_paper_anchor_roundtrip():
+    a = PaperAnchor()
+    assert a.to_dict() == {"kind": "paper"}
+    assert anchor_from_dict(a.to_dict()) == a
+
+
+def test_anchor_from_dict_unknown_kind():
+    with pytest.raises(ValueError, match="Unknown anchor kind"):
+        anchor_from_dict({"kind": "invalid"})
+
+
+# ---------------------------------------------------------------------------
+# Comment serialization
+# ---------------------------------------------------------------------------
+
+
+def test_comment_roundtrip(tmp_path: Path):
+    store = CommentStore(tmp_path / "comments.json")
+    c = store.add(
+        SectionAnchor(title="Methods"),
+        "expand the algorithm description",
+        tags=["structure"],
+    )
+    raw = json.loads((tmp_path / "comments.json").read_text())
+    assert raw["version"] == 1
+    assert len(raw["comments"]) == 1
+    restored = Comment.from_dict(raw["comments"][0])
+    assert restored.id == c.id
+    assert restored.text == "expand the algorithm description"
+    assert restored.tags == ["structure"]
+    assert isinstance(restored.anchor, SectionAnchor)
+    assert restored.anchor.title == "Methods"
+
+
+def test_thread_entry_with_edits():
+    e = ThreadEntry(
+        author="claude",
+        at="2026-05-05T12:00:00",
+        text="expanded the proof",
+        edits=["intro.tex:42-58 → :42-78"],
+    )
+    d = e.to_dict()
+    assert d["edits"] == ["intro.tex:42-58 → :42-78"]
+    assert ThreadEntry.from_dict(d).edits == ["intro.tex:42-58 → :42-78"]
+
+
+# ---------------------------------------------------------------------------
+# CommentStore basic CRUD
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> CommentStore:
+    return CommentStore(tmp_path / "comments.json")
+
+
+def test_store_initially_empty(store: CommentStore):
+    assert store.list() == []
+
+
+def test_add_then_list(store: CommentStore):
+    c = store.add(PaperAnchor(), "abstract is too long")
+    assert c.id.startswith("c-")
+    assert c.status == "open"
+    assert c.text == "abstract is too long"
+    assert len(store.list()) == 1
+    assert store.list()[0].id == c.id
+
+
+def test_get_existing(store: CommentStore):
+    c = store.add(PaperAnchor(), "x")
+    assert store.get(c.id) is not None
+    assert store.get(c.id).id == c.id
+
+
+def test_get_missing(store: CommentStore):
+    assert store.get("c-deadbeef") is None
+
+
+def test_reply_appends_thread_entry(store: CommentStore):
+    c = store.add(PaperAnchor(), "first comment")
+    updated = store.reply(c.id, "follow up", author="human")
+    assert len(updated.thread) == 2
+    assert updated.thread[1].author == "human"
+    assert updated.thread[1].text == "follow up"
+    # Updated timestamp should advance.
+    assert updated.updated >= c.created
+
+
+def test_resolve_marks_resolved_with_edits(store: CommentStore):
+    c = store.add(PaperAnchor(), "needs more proof")
+    resolved = store.resolve(
+        c.id,
+        "expanded proof in section 3",
+        edits=["paper.tex:120-145 → :120-180"],
+    )
+    assert resolved.status == "resolved"
+    assert resolved.thread[-1].author == "claude"
+    assert resolved.thread[-1].edits == ["paper.tex:120-145 → :120-180"]
+
+
+def test_dismiss_marks_dismissed(store: CommentStore):
+    c = store.add(PaperAnchor(), "x")
+    dismissed = store.dismiss(c.id, "no longer relevant")
+    assert dismissed.status == "dismissed"
+    assert dismissed.thread[-1].text == "no longer relevant"
+
+
+def test_reopen_restores_open_status(store: CommentStore):
+    c = store.add(PaperAnchor(), "x")
+    store.dismiss(c.id, "skip")
+    reopened = store.reopen(c.id)
+    assert reopened.status == "open"
+    assert reopened.stale is False
+
+
+def test_delete_removes_comment(store: CommentStore):
+    c = store.add(PaperAnchor(), "x")
+    assert store.delete(c.id) is True
+    assert store.list() == []
+    assert store.delete(c.id) is False
+
+
+def test_update_unknown_id_raises(store: CommentStore):
+    with pytest.raises(KeyError):
+        store.reply("c-nonexistent", "x", author="human")
+
+
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
+
+
+def test_list_filter_by_status(store: CommentStore):
+    a = store.add(PaperAnchor(), "open one")
+    b = store.add(PaperAnchor(), "to resolve")
+    store.resolve(b.id, "done")
+    open_ids = {c.id for c in store.list(status="open")}
+    resolved_ids = {c.id for c in store.list(status="resolved")}
+    assert open_ids == {a.id}
+    assert resolved_ids == {b.id}
+
+
+def test_list_filter_by_tags(store: CommentStore):
+    a = store.add(PaperAnchor(), "x", tags=["typo"])
+    b = store.add(PaperAnchor(), "y", tags=["structure", "math"])
+    c = store.add(PaperAnchor(), "z", tags=["math"])
+    matching = {c.id for c in store.list(tags=["math"])}
+    assert matching == {b.id, c.id}
+    assert {x.id for x in store.list(tags=["typo"])} == {a.id}
+
+
+# ---------------------------------------------------------------------------
+# Snippet capture and find
+# ---------------------------------------------------------------------------
+
+
+def test_capture_snippet_basic(tmp_path: Path):
+    f = tmp_path / "intro.tex"
+    f.write_text("line 1\nline 2\nline 3\nline 4\nline 5\n")
+    snippet = capture_snippet(f, line_start=2, line_end=3, context=0)
+    assert snippet == "line 2\nline 3"
+
+
+def test_capture_snippet_with_context(tmp_path: Path):
+    f = tmp_path / "intro.tex"
+    f.write_text("a\nb\nc\nd\ne\n")
+    snippet = capture_snippet(f, line_start=3, line_end=3, context=1)
+    assert snippet == "b\nc\nd"
+
+
+def test_capture_snippet_nonexistent_file(tmp_path: Path):
+    snippet = capture_snippet(tmp_path / "missing.tex", 1, 1, context=0)
+    assert snippet == ""
+
+
+def test_find_snippet_exact(tmp_path: Path):
+    f = tmp_path / "intro.tex"
+    f.write_text("alpha\nbeta gamma\ndelta\nepsilon\n")
+    located = find_snippet("beta gamma\ndelta", f)
+    assert located == (2, 3)
+
+
+def test_find_snippet_whitespace_normalized(tmp_path: Path):
+    """Snippet matches even when whitespace differs in the source."""
+    f = tmp_path / "intro.tex"
+    f.write_text("alpha\nbeta    gamma\ndelta\nepsilon\n")  # extra spaces in src
+    located = find_snippet("beta gamma\ndelta", f)
+    assert located == (2, 3)
+
+
+def test_find_snippet_after_insertion_above(tmp_path: Path):
+    """Snippet still found after lines are inserted above it."""
+    f = tmp_path / "intro.tex"
+    f.write_text("inserted\nnew\nlines\nbeta gamma\ndelta\nepsilon\n")
+    located = find_snippet("beta gamma\ndelta", f)
+    assert located == (4, 5)
+
+
+def test_find_snippet_missing(tmp_path: Path):
+    f = tmp_path / "intro.tex"
+    f.write_text("alpha\nbeta\n")
+    assert find_snippet("nowhere to be found\nat all", f) is None
+
+
+# ---------------------------------------------------------------------------
+# Staleness — section anchors
+# ---------------------------------------------------------------------------
+
+
+def test_section_anchor_staleness_resolved(store: CommentStore, tmp_path: Path):
+    c = store.add(SectionAnchor(title="Methods"), "expand")
+
+    # Resolver finds the section
+    def resolver(title: str, label: str | None):
+        if title == "Methods":
+            return ResolvedSource(file="paper.tex", line_start=50, line_end=75, excerpt="")
+        return None
+
+    newly_stale = store.check_staleness(tmp_path, sections_resolver=resolver)
+    assert newly_stale == []
+    refreshed = store.get(c.id)
+    assert refreshed.stale is False
+    assert refreshed.resolved_source.line_start == 50
+    assert refreshed.resolved_source.line_end == 75
+
+
+def test_section_anchor_staleness_missing(store: CommentStore, tmp_path: Path):
+    c = store.add(SectionAnchor(title="Old Section"), "x")
+
+    def resolver(title: str, label: str | None):
+        return None  # section no longer exists
+
+    newly_stale = store.check_staleness(tmp_path, sections_resolver=resolver)
+    assert newly_stale == [c.id]
+    assert store.get(c.id).stale is True
+
+
+# ---------------------------------------------------------------------------
+# Staleness — source/PDF anchors via snippets
+# ---------------------------------------------------------------------------
+
+
+def test_source_range_staleness_unchanged_source(store: CommentStore, tmp_path: Path):
+    f = tmp_path / "intro.tex"
+    f.write_text("preface\nthe quick brown fox\njumps over\nthe lazy dog\n")
+    snippet = "the quick brown fox\njumps over"
+    c = store.add(
+        SourceRangeAnchor(file="intro.tex", line_start=2, line_end=3),
+        "rephrase",
+        resolved_source=ResolvedSource(file="intro.tex", line_start=2, line_end=3),
+        snippet=snippet,
+    )
+    newly_stale = store.check_staleness(tmp_path)
+    assert newly_stale == []
+    assert store.get(c.id).stale is False
+
+
+def test_source_range_anchor_follows_content_after_insertion(
+    store: CommentStore, tmp_path: Path
+):
+    """When Claude inserts lines above the anchor, the line range follows the snippet."""
+    f = tmp_path / "intro.tex"
+    f.write_text("preface\nthe quick brown fox\njumps over\nthe lazy dog\n")
+    snippet = "the quick brown fox\njumps over"
+    c = store.add(
+        SourceRangeAnchor(file="intro.tex", line_start=2, line_end=3),
+        "rephrase",
+        resolved_source=ResolvedSource(file="intro.tex", line_start=2, line_end=3),
+        snippet=snippet,
+    )
+    # Insert 3 lines above the anchor
+    f.write_text("inserted\nmore\nstuff\npreface\nthe quick brown fox\njumps over\nthe lazy dog\n")
+    store.check_staleness(tmp_path)
+    refreshed = store.get(c.id)
+    assert refreshed.stale is False
+    assert refreshed.resolved_source.line_start == 5
+    assert refreshed.resolved_source.line_end == 6
+
+
+def test_source_range_goes_stale_when_content_deleted(
+    store: CommentStore, tmp_path: Path
+):
+    f = tmp_path / "intro.tex"
+    f.write_text("preface\nthe quick brown fox\njumps over\n")
+    snippet = "the quick brown fox\njumps over"
+    c = store.add(
+        SourceRangeAnchor(file="intro.tex", line_start=2, line_end=3),
+        "rephrase",
+        resolved_source=ResolvedSource(file="intro.tex", line_start=2, line_end=3),
+        snippet=snippet,
+    )
+    # Delete the anchored content
+    f.write_text("preface\ncompletely different content\n")
+    newly_stale = store.check_staleness(tmp_path)
+    assert newly_stale == [c.id]
+    assert store.get(c.id).stale is True
+
+
+def test_paper_anchor_never_goes_stale(store: CommentStore, tmp_path: Path):
+    c = store.add(PaperAnchor(), "abstract too long")
+    newly_stale = store.check_staleness(tmp_path)
+    assert newly_stale == []
+    assert store.get(c.id).stale is False
+
+
+def test_resolved_comments_skip_staleness_check(store: CommentStore, tmp_path: Path):
+    """Resolved comments shouldn't be flipped to stale even if their anchor is gone."""
+    c = store.add(SectionAnchor(title="X"), "x")
+    store.resolve(c.id, "done")
+    # Resolver returns None — would mark stale if comment were open
+    store.check_staleness(tmp_path, sections_resolver=lambda t, l: None)
+    assert store.get(c.id).stale is False
+
+
+# ---------------------------------------------------------------------------
+# Atomic write / re-read robustness
+# ---------------------------------------------------------------------------
+
+
+def test_store_persists_across_instances(tmp_path: Path):
+    path = tmp_path / "comments.json"
+    s1 = CommentStore(path)
+    a = s1.add(PaperAnchor(), "x")
+    s2 = CommentStore(path)
+    listed = s2.list()
+    assert len(listed) == 1
+    assert listed[0].id == a.id
+
+
+def test_store_recovers_from_corrupt_file(tmp_path: Path):
+    path = tmp_path / "comments.json"
+    path.write_text("{ this is not valid json")
+    store = CommentStore(path)
+    assert store.list() == []
+    # New writes should work after a corrupt-file recovery
+    c = store.add(PaperAnchor(), "fresh start")
+    assert store.list() == [c]

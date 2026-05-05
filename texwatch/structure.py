@@ -1,67 +1,70 @@
 """LaTeX document structure parsing.
 
-Parses document structure from .tex files: sections, TODOs, \\input/\\include
-tree, and word count (via texcount).
+Parses sections, labels, citations, and \\input/\\include references from
+.tex source files.  Used by the ``paper()`` MCP tool and by section-anchor
+staleness checks.
+
+Deliberately narrower than the v0.3.0 module: TODO scraping, per-section
+statistics, and texcount integration were dropped because v0.4.0 expects
+the human to capture review intent as comments rather than embed it in
+source.
 """
+
+from __future__ import annotations
 
 import logging
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class Section:
-    """A section-level heading in a LaTeX document.
+    """A section-level heading (\\section/\\chapter/etc).
 
     Attributes:
-        level: Sectioning command ("chapter", "section", "subsection", "subsubsection").
-        title: Section title text (from the mandatory {} argument).
-        file: Source file path (relative to watch_dir).
-        line: Line number where the heading appears (1-indexed).
+        level: ``chapter``/``section``/``subsection``/``subsubsection``.
+        title: Section title.
+        file: Source file (relative to watch_dir).
+        line: 1-indexed line number.
+        label: Closest \\label{...} that follows the heading, or None.
     """
 
     level: str
     title: str
     file: str
     line: int
+    label: str | None = None
 
 
-@dataclass
-class TodoItem:
-    """A TODO/FIXME/NOTE/XXX annotation found in a LaTeX file.
+@dataclass(frozen=True)
+class Label:
+    """A \\label{...} declaration."""
 
-    Matches both comment-style (% TODO: ...) and command-style (\\todo{...}).
-
-    Attributes:
-        text: The annotation text content.
-        file: Source file path (relative to watch_dir).
-        line: Line number (1-indexed).
-        tag: Annotation type ("TODO", "FIXME", "NOTE", or "XXX").
-    """
-
-    text: str
+    name: str
     file: str
     line: int
-    tag: str
 
 
-@dataclass
+@dataclass(frozen=True)
+class Citation:
+    """A citation key referenced by \\cite/\\citep/\\citet/etc."""
+
+    key: str
+    file: str
+    line: int
+
+
+@dataclass(frozen=True)
 class InputFile:
-    """An \\input or \\include reference in a LaTeX file.
-
-    Attributes:
-        path: The included file path as written in the source (e.g., "chapters/intro").
-        file: Parent file containing the \\input command.
-        line: Line number of the \\input command (1-indexed).
-    """
+    """An \\input/\\include reference."""
 
     path: str
     file: str
@@ -69,117 +72,28 @@ class InputFile:
 
 
 @dataclass
-class SectionStats:
-    """Per-section statistics.
-
-    Attributes:
-        section_title: Title of the section.
-        section_file: File containing the section heading.
-        section_line: Line of the section heading (1-indexed).
-        start_line: First line of section content (inclusive).
-        end_line: Last line of section content (inclusive).
-        word_count: Approximate word count in the section range.
-        citation_count: Number of citation commands in the section.
-        environment_counts: Count of each environment type (e.g. {"equation": 3}).
-        todo_count: Number of TODOs in the section.
-        figure_count: Number of figure/figure* environments.
-        table_count: Number of table/table* environments.
-    """
-
-    section_title: str
-    section_file: str
-    section_line: int
-    start_line: int
-    end_line: int
-    word_count: int = 0
-    citation_count: int = 0
-    environment_counts: dict[str, int] = field(default_factory=dict)
-    todo_count: int = 0
-    figure_count: int = 0
-    table_count: int = 0
-
-
-@dataclass
-class StructureSummary:
-    """Document-level summary statistics.
-
-    Attributes:
-        total_figures: Total figure/figure* count.
-        total_tables: Total table/table* count.
-        total_equations: Total equation-like environment count.
-        total_citations: Total citation command count.
-        total_todos: Total TODO/FIXME/NOTE/XXX count.
-    """
-
-    total_figures: int = 0
-    total_tables: int = 0
-    total_equations: int = 0
-    total_citations: int = 0
-    total_todos: int = 0
-
-
-@dataclass
 class DocumentStructure:
-    """Aggregated structure of a LaTeX project.
-
-    Contains all sections, TODOs, input references, word count,
-    per-section statistics, and a document summary.
-
-    Attributes:
-        sections: All section headings found in the project.
-        todos: All TODO/FIXME/NOTE/XXX annotations.
-        inputs: All \\input/\\include references.
-        word_count: Total word count from texcount, or None if unavailable.
-        section_stats: Per-section statistics.
-        summary: Document-level summary counts.
-    """
+    """Aggregated structure of a LaTeX project."""
 
     sections: list[Section] = field(default_factory=list)
-    todos: list[TodoItem] = field(default_factory=list)
+    labels: list[Label] = field(default_factory=list)
+    citations: list[Citation] = field(default_factory=list)
     inputs: list[InputFile] = field(default_factory=list)
-    word_count: int | None = None
-    section_stats: list[SectionStats] = field(default_factory=list)
-    summary: StructureSummary = field(default_factory=StructureSummary)
 
 
 # ---------------------------------------------------------------------------
 # Regex patterns
 # ---------------------------------------------------------------------------
 
-# Matches section command prefix: \chapter, \section*, \subsection[short], etc.
-# Group 1: level (chapter|section|subsection|subsubsection)
-# Title is extracted separately via _extract_braced for nested-brace safety.
+
 _SECTION_PREFIX_RE = re.compile(
-    r"\\(chapter|section|subsection|subsubsection)"
-    r"\*?"
-    r"(?:\[[^\]]*\])?"  # optional [short title]
+    r"\\(chapter|section|subsection|subsubsection)\*?(?:\[[^\]]*\])?"
 )
-
-# Matches % TODO: ..., % FIXME ..., % NOTE: ..., % XXX: ... (in comments)
-_COMMENT_TODO_RE = re.compile(
-    r"%\s*(TODO|FIXME|NOTE|XXX)[:\s]\s*(.*)",
+_INPUT_RE = re.compile(r"\\(?:input|include)\{([^}]+)\}")
+_LABEL_RE = re.compile(r"\\label\{([^}]+)\}")
+_CITE_RE = re.compile(
+    r"\\(?:cite[pt]?|citeauthor|citeyear|nocite)(?:\[[^\]]*\])*\{([^}]+)\}"
 )
-
-# Matches \todo{...} (e.g. todonotes package)
-_CMD_TODO_RE = re.compile(
-    r"\\todo(?:\[[^\]]*\])?\{([^}]+)\}",
-)
-
-# Matches \input{...} and \include{...}
-_INPUT_RE = re.compile(
-    r"\\(input|include)\{([^}]+)\}",
-)
-
-# Regex for counting citations in a line range
-_STATS_CITE_RE = re.compile(
-    r"\\(cite[pt]?|citeauthor|citeyear|nocite)(?:\[[^\]]*\])*\{([^}]+)\}"
-)
-
-# Regex for counting environments in a line range
-_STATS_BEGIN_RE = re.compile(r"\\begin\{([a-zA-Z*]+)\}")
-
-# Heuristic word regex: sequences of alphabetic chars not starting with \
-_WORD_RE = re.compile(r"(?<!\\)\b[a-zA-Z]{2,}\b")
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +102,6 @@ _WORD_RE = re.compile(r"(?<!\\)\b[a-zA-Z]{2,}\b")
 
 
 def _count_preceding_backslashes(text: str, pos: int) -> int:
-    """Count consecutive backslashes immediately before *pos*."""
     count = 0
     j = pos - 1
     while j >= 0 and text[j] == "\\":
@@ -200,12 +113,8 @@ def _count_preceding_backslashes(text: str, pos: int) -> int:
 def _extract_braced(text: str, pos: int) -> tuple[str, int] | None:
     """Extract content within matched braces starting at *pos*.
 
-    Returns ``(content, end_pos)`` where *content* excludes the outer braces
-    and *end_pos* is the index after the closing ``}``.  Returns ``None`` if
-    ``text[pos]`` is not ``{`` or braces are unmatched.
-
-    Escaped braces (``\\{`` and ``\\}``) are treated as literal characters
-    and do not affect depth counting.
+    Returns ``(content, end_pos)`` where ``content`` excludes the outer braces.
+    Handles escaped ``\\{`` / ``\\}`` and nested groups.
     """
     if pos >= len(text) or text[pos] != "{":
         return None
@@ -225,7 +134,7 @@ def _strip_comment(line: str) -> str:
     """Strip an inline LaTeX comment (``%`` and everything after).
 
     A ``%`` is a comment marker only when preceded by an even number of
-    backslashes (``\\%`` = linebreak + comment, ``\\\\%`` = escaped percent).
+    backslashes.
     """
     i = 0
     while i < len(line):
@@ -236,262 +145,99 @@ def _strip_comment(line: str) -> str:
 
 
 def _find_tex_files(watch_dir: Path) -> list[Path]:
-    """Recursively find all .tex files under *watch_dir*."""
     return sorted(watch_dir.rglob("*.tex"))
 
 
 def _relative(path: Path, watch_dir: Path) -> str:
-    """Return *path* relative to *watch_dir* as a string."""
     try:
         return str(path.relative_to(watch_dir))
     except ValueError:
         return str(path)
 
 
-def _read_files(
-    paths: list[Path], watch_dir: Path, label: str = "read",
-) -> list[tuple[str, str]]:
-    """Read files and return (content, relative_path) pairs.
-
-    Silently skips files that cannot be read.
-    """
-    results: list[tuple[str, str]] = []
-    for path in paths:
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            logger.debug("%s: failed to read %s", label, path)
-            continue
-        results.append((content, _relative(path, watch_dir)))
-    return results
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
 
 
 def _parse_sections(content: str, rel_path: str) -> list[Section]:
-    """Extract section headings from file content."""
+    """Extract section headings (and the immediately-following label, if any)."""
     sections: list[Section] = []
-    for line_no, raw_line in enumerate(content.splitlines(), start=1):
-        stripped = raw_line.lstrip()
-        if stripped.startswith("%"):
+    lines = content.splitlines()
+    n = len(lines)
+
+    for line_no, raw_line in enumerate(lines, start=1):
+        if raw_line.lstrip().startswith("%"):
             continue
         line = _strip_comment(raw_line)
         for m in _SECTION_PREFIX_RE.finditer(line):
             pos = m.end()
             while pos < len(line) and line[pos] in " \t":
                 pos += 1
-            result = _extract_braced(line, pos)
-            if result:
-                sections.append(
-                    Section(
-                        level=m.group(1),
-                        title=result[0].strip(),
-                        file=rel_path,
-                        line=line_no,
-                    )
+            extracted = _extract_braced(line, pos)
+            if not extracted:
+                continue
+            title = extracted[0].strip()
+
+            # Look ahead a few lines for \label{...}
+            label: str | None = None
+            for ahead in range(line_no - 1, min(line_no + 3, n)):
+                candidate = _strip_comment(lines[ahead])
+                lm = _LABEL_RE.search(candidate)
+                if lm:
+                    label = lm.group(1).strip()
+                    break
+
+            sections.append(
+                Section(
+                    level=m.group(1),
+                    title=title,
+                    file=rel_path,
+                    line=line_no,
+                    label=label,
                 )
+            )
     return sections
 
 
-def _parse_todos(content: str, rel_path: str) -> list[TodoItem]:
-    """Extract TODO/FIXME/NOTE/XXX items from file content."""
-    todos: list[TodoItem] = []
-    for line_no, line in enumerate(content.splitlines(), start=1):
-        # Comment-style TODOs
-        m = _COMMENT_TODO_RE.search(line)
-        if m:
-            todos.append(
-                TodoItem(
-                    text=m.group(2).strip(),
-                    file=rel_path,
-                    line=line_no,
-                    tag=m.group(1),
-                )
-            )
-        # \todo{...} command
-        for m in _CMD_TODO_RE.finditer(line):
-            todos.append(
-                TodoItem(
-                    text=m.group(1).strip(),
-                    file=rel_path,
-                    line=line_no,
-                    tag="TODO",
-                )
-            )
-    return todos
+def _parse_labels(content: str, rel_path: str) -> list[Label]:
+    labels: list[Label] = []
+    for line_no, raw_line in enumerate(content.splitlines(), start=1):
+        if raw_line.lstrip().startswith("%"):
+            continue
+        line = _strip_comment(raw_line)
+        for m in _LABEL_RE.finditer(line):
+            labels.append(Label(name=m.group(1).strip(), file=rel_path, line=line_no))
+    return labels
+
+
+def _parse_citations(content: str, rel_path: str) -> list[Citation]:
+    citations: list[Citation] = []
+    for line_no, raw_line in enumerate(content.splitlines(), start=1):
+        if raw_line.lstrip().startswith("%"):
+            continue
+        line = _strip_comment(raw_line)
+        for m in _CITE_RE.finditer(line):
+            for key in m.group(1).split(","):
+                key = key.strip()
+                if key:
+                    citations.append(
+                        Citation(key=key, file=rel_path, line=line_no)
+                    )
+    return citations
 
 
 def _parse_inputs(content: str, rel_path: str) -> list[InputFile]:
-    """Extract \\input/\\include references from file content."""
     inputs: list[InputFile] = []
     for line_no, raw_line in enumerate(content.splitlines(), start=1):
-        stripped = raw_line.lstrip()
-        if stripped.startswith("%"):
+        if raw_line.lstrip().startswith("%"):
             continue
         line = _strip_comment(raw_line)
         for m in _INPUT_RE.finditer(line):
-            raw_path = m.group(2).strip()
             inputs.append(
-                InputFile(
-                    path=raw_path,
-                    file=rel_path,
-                    line=line_no,
-                )
+                InputFile(path=m.group(1).strip(), file=rel_path, line=line_no)
             )
     return inputs
-
-
-def _get_word_count(main_file: Path) -> int | None:
-    """Run ``texcount`` on *main_file* and return total word count.
-
-    Returns ``None`` if texcount is not installed or fails.
-    """
-    try:
-        result = subprocess.run(
-            ["texcount", "-total", "-brief", str(main_file)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            logger.debug("texcount returned non-zero: %s", result.stderr.strip())
-            return None
-
-        # texcount -total -brief output looks like:
-        #   "Words in text: 1234\n" or just "1234+56+7 (1 file)\n"
-        # We try to extract the first integer.
-        output = result.stdout.strip()
-        m = re.search(r"(\d+)", output)
-        if m:
-            count = int(m.group(1))
-            logger.debug("texcount: %d words in %s", count, main_file.name)
-            return count
-
-        logger.debug("texcount: could not parse output: %r", output)
-        return None
-
-    except FileNotFoundError:
-        logger.debug("texcount: not installed")
-        return None
-    except subprocess.TimeoutExpired:
-        logger.debug("texcount: timed out")
-        return None
-    except Exception:
-        logger.debug("texcount: unexpected error", exc_info=True)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Section stats computation
-# ---------------------------------------------------------------------------
-
-_EQUATION_ENVS = {
-    "equation", "equation*", "align", "align*",
-    "gather", "gather*", "multline", "multline*",
-}
-
-
-def _accumulate_line_stats(line: str, summary: StructureSummary) -> None:
-    """Accumulate citation, figure, table, and equation counts from a single line."""
-    for m in _STATS_CITE_RE.finditer(line):
-        summary.total_citations += len(m.group(2).split(","))
-    for m in _STATS_BEGIN_RE.finditer(line):
-        env = m.group(1)
-        if env in ("figure", "figure*"):
-            summary.total_figures += 1
-        elif env in ("table", "table*"):
-            summary.total_tables += 1
-        elif env in _EQUATION_ENVS:
-            summary.total_equations += 1
-
-
-def _compute_section_stats(
-    sections: list[Section],
-    todos: list[TodoItem],
-    file_contents: dict[str, str],
-) -> tuple[list[SectionStats], StructureSummary]:
-    """Compute per-section statistics and document summary.
-
-    Args:
-        sections: All sections found by parsing.
-        todos: All TODO items found by parsing.
-        file_contents: Mapping of rel_path -> file content string.
-
-    Returns:
-        Tuple of (section_stats list, summary).
-    """
-    stats_list: list[SectionStats] = []
-    summary = StructureSummary(total_todos=len(todos))
-
-    if not sections:
-        # Still compute summary from all files
-        for content in file_contents.values():
-            for raw_line in content.splitlines():
-                if raw_line.lstrip().startswith("%"):
-                    continue
-                _accumulate_line_stats(_strip_comment(raw_line), summary)
-        return stats_list, summary
-
-    for idx, sec in enumerate(sections):
-        content = file_contents.get(sec.file, "")
-        total_lines = len(content.splitlines()) if content else 0
-
-        # Determine end_line: next section in same file, or EOF
-        end_line = total_lines
-        for next_idx in range(idx + 1, len(sections)):
-            if sections[next_idx].file == sec.file:
-                end_line = sections[next_idx].line - 1
-                break
-
-        start_line = min(sec.line, total_lines)
-
-        # Extract lines for this section
-        lines = content.splitlines()[start_line - 1:end_line] if content else []
-
-        # Single pass: count words, citations, and environments
-        word_count = 0
-        citation_count = 0
-        env_counts: dict[str, int] = {}
-        for raw_line in lines:
-            if raw_line.lstrip().startswith("%"):
-                continue
-            line = _strip_comment(raw_line)
-            word_count += len(_WORD_RE.findall(line))
-            for m in _STATS_CITE_RE.finditer(line):
-                citation_count += len(m.group(2).split(","))
-            for m in _STATS_BEGIN_RE.finditer(line):
-                env = m.group(1)
-                env_counts[env] = env_counts.get(env, 0) + 1
-
-        todo_count = sum(
-            1 for t in todos
-            if t.file == sec.file and start_line <= t.line <= end_line
-        )
-
-        figure_count = env_counts.get("figure", 0) + env_counts.get("figure*", 0)
-        table_count = env_counts.get("table", 0) + env_counts.get("table*", 0)
-
-        stats_list.append(SectionStats(
-            section_title=sec.title,
-            section_file=sec.file,
-            section_line=sec.line,
-            start_line=start_line,
-            end_line=end_line,
-            word_count=word_count,
-            citation_count=citation_count,
-            environment_counts=env_counts,
-            todo_count=todo_count,
-            figure_count=figure_count,
-            table_count=table_count,
-        ))
-
-        # Accumulate summary
-        summary.total_citations += citation_count
-        summary.total_figures += figure_count
-        summary.total_tables += table_count
-        for env, count in env_counts.items():
-            if env in _EQUATION_ENVS:
-                summary.total_equations += count
-
-    return stats_list, summary
 
 
 # ---------------------------------------------------------------------------
@@ -499,51 +245,68 @@ def _compute_section_stats(
 # ---------------------------------------------------------------------------
 
 
-def parse_structure(main_file: Path, watch_dir: Path) -> DocumentStructure:
-    """Parse LaTeX document structure from all .tex files in *watch_dir*.
+def parse_structure(watch_dir: Path) -> DocumentStructure:
+    """Parse structure across every .tex file under *watch_dir*."""
+    structure = DocumentStructure()
 
-    Args:
-        main_file: Path to the main .tex file (used for texcount).
-        watch_dir: Root directory to scan for .tex files.
-
-    Returns:
-        A :class:`DocumentStructure` with sections, TODOs, inputs, and
-        word count.
-    """
-    sections: list[Section] = []
-    todos: list[TodoItem] = []
-    inputs: list[InputFile] = []
-    file_contents: dict[str, str] = {}
-
-    tex_files = _find_tex_files(watch_dir)
-    logger.debug("structure: found %d .tex files in %s", len(tex_files), watch_dir)
-
-    for content, rel in _read_files(tex_files, watch_dir, "structure"):
-        file_contents[rel] = content
-        sections.extend(_parse_sections(content, rel))
-        todos.extend(_parse_todos(content, rel))
-        inputs.extend(_parse_inputs(content, rel))
-
-    word_count = _get_word_count(main_file)
-
-    # Compute per-section stats
-    section_stats, summary = _compute_section_stats(sections, todos, file_contents)
-
-    structure = DocumentStructure(
-        sections=sections,
-        todos=todos,
-        inputs=inputs,
-        word_count=word_count,
-        section_stats=section_stats,
-        summary=summary,
-    )
-
-    logger.debug(
-        "structure: %d sections, %d todos, %d inputs, word_count=%s",
-        len(sections),
-        len(todos),
-        len(inputs),
-        word_count,
-    )
+    for path in _find_tex_files(watch_dir):
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            logger.debug("structure: failed to read %s", path)
+            continue
+        rel = _relative(path, watch_dir)
+        structure.sections.extend(_parse_sections(content, rel))
+        structure.labels.extend(_parse_labels(content, rel))
+        structure.citations.extend(_parse_citations(content, rel))
+        structure.inputs.extend(_parse_inputs(content, rel))
 
     return structure
+
+
+def find_section(
+    structure: DocumentStructure,
+    title: str | None = None,
+    label: str | None = None,
+) -> tuple[str, int, int] | None:
+    """Resolve a section anchor to ``(file, line_start, line_end)``.
+
+    Match order:
+        1. exact label match (when *label* is given)
+        2. exact title match (case-sensitive)
+        3. case-insensitive title match
+
+    The end line is the line just before the next section in the same
+    file (or end-of-file).  Returns None if no section matches.
+    """
+    sections = structure.sections
+    if not sections:
+        return None
+
+    target: Section | None = None
+    if label:
+        for s in sections:
+            if s.label == label:
+                target = s
+                break
+    if target is None and title is not None:
+        for s in sections:
+            if s.title == title:
+                target = s
+                break
+        if target is None:
+            lc = title.lower()
+            for s in sections:
+                if s.title.lower() == lc:
+                    target = s
+                    break
+    if target is None:
+        return None
+
+    # Determine end line: next section in the same file, or EOF
+    same_file_after = [s for s in sections if s.file == target.file and s.line > target.line]
+    if same_file_after:
+        end_line = min(s.line for s in same_file_after) - 1
+    else:
+        end_line = -1  # caller should treat as "to EOF"
+    return (target.file, target.line, end_line)

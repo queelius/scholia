@@ -1,1302 +1,724 @@
-/**
- * texwatch PDF viewer with WebSocket live reload
- */
+// texwatch v0.4.0 viewer
+//
+// Responsibilities:
+//   1. Render the PDF via PDF.js with a text layer (for selection).
+//   2. Subscribe to compile events over WebSocket; auto-reload on success.
+//   3. Display the comments queue in a sidebar; create / reply / resolve / dismiss.
+//   4. Convert text selections in the PDF into pdf_region anchors with bbox
+//      coords in PDF points (the unit SyncTeX speaks).
+//   5. Show structured errors when the build fails.
+//
+// All DOM construction goes through the `h()` helper, which builds DOM
+// nodes via createElement/textContent — no innerHTML on dynamic data.
+// (Static empty-state HTML uses textContent, also safe.)
 
-// PDF.js configuration
-pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs";
 
-function _dbg(...args) {
-    if (window.TEXWATCH_DEBUG) console.log('[texwatch]', ...args);
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.mjs";
+
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+// ---------------------------------------------------------------------------
+// DOM helper: hyperscript-style element factory (safe — no innerHTML)
+// ---------------------------------------------------------------------------
+
+function h(tag, props, ...children) {
+  const el = document.createElement(tag);
+  if (props) {
+    for (const [k, v] of Object.entries(props)) {
+      if (v == null || v === false) continue;
+      if (k === "class" || k === "className") el.className = v;
+      else if (k === "text") el.textContent = v;
+      else if (k === "data") {
+        for (const [dk, dv] of Object.entries(v)) el.dataset[dk] = dv;
+      } else if (k === "style") {
+        for (const [sk, sv] of Object.entries(v)) el.style[sk] = sv;
+      } else if (k.startsWith("on")) {
+        el.addEventListener(k.slice(2).toLowerCase(), v);
+      } else if (k === "title" || k === "type" || k === "value" || k === "placeholder") {
+        el[k] = v;
+      } else {
+        el.setAttribute(k, v);
+      }
+    }
+  }
+  for (const c of children.flat()) {
+    if (c == null || c === false) continue;
+    if (typeof c === "string" || typeof c === "number") {
+      el.appendChild(document.createTextNode(String(c)));
+    } else {
+      el.appendChild(c);
+    }
+  }
+  return el;
 }
 
-class TexWatchViewer {
-    constructor() {
-        this.pdfDoc = null;
-        this.currentPage = 1;
-        this.totalPages = 0;
-        this.scale = 1.5;
-        this.ws = null;
-        this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 10;
-        this._wheelCooldown = false;
-        this.pdfHighlight = document.getElementById('pdf-highlight');
-        this._highlightFadeTimer = null;
-
-        // DOM elements
-        this.canvas = document.getElementById('pdf-canvas');
-        this.ctx = this.canvas.getContext('2d');
-        this.container = document.getElementById('pdf-container');
-        this.textLayer = document.getElementById('text-layer');
-        this.markdownPreview = document.getElementById('markdown-preview');
-        this.viewerPane = document.getElementById('viewer-pane');
-
-        // Viewer mode: 'pdf' or 'markdown'
-        this.viewerMode = 'pdf';
-        this._markdownDebounceTimer = null;
-        this.filename = document.getElementById('filename');
-        this.statusIndicator = document.getElementById('status-indicator');
-        this.pageInfo = document.getElementById('page-info');
-        this.lineInfo = document.getElementById('line-info');
-        this.compileInfo = document.getElementById('compile-info');
-        this.errorSummary = document.getElementById('error-summary');
-        this.errorList = document.getElementById('error-list');
-        this.errorPanel = document.getElementById('error-panel');
-
-        // Cached config (fetched once)
-        this._cachedConfig = null;
-        // Last compilation log output
-        this._lastLogOutput = '';
-
-        // Log viewer elements
-        this.logViewer = document.getElementById('log-viewer');
-        this.logContent = document.getElementById('log-content');
-        this.todoList = document.getElementById('todo-list');
-
-        // Continuous scroll state
-        this.scrollMode = 'page';  // 'page' or 'continuous'
-        this.pageElements = [];    // per-page wrapper elements
-        this.renderedPages = new Set();
-        this.observer = null;
-        this._scrollTrackingTimer = null;
-        this._renderQueue = new Set();
-        this._rendering = false;
-
-        this.init();
-    }
-
-    async init() {
-        this.setupEventListeners();
-        this.connectWebSocket();
-        await this.loadPDF();
-    }
-
-    setupEventListeners() {
-        // Refresh button
-        document.getElementById('btn-refresh').addEventListener('click', () => {
-            this.forceCompile();
-        });
-
-        // Zoom controls
-        document.getElementById('btn-zoom-in').addEventListener('click', () => this.zoomIn());
-        document.getElementById('btn-zoom-out').addEventListener('click', () => this.zoomOut());
-        document.getElementById('zoom-select').addEventListener('change', (e) => {
-            const val = e.target.value;
-            if (val === 'fit-width') {
-                this.fitWidth();
-            } else if (val === 'fit-page') {
-                this.fitPage();
-            } else {
-                this.setZoom(parseFloat(val));
-            }
-        });
-
-        // Scroll mode toggle
-        document.getElementById('btn-scroll-mode').addEventListener('click', () => {
-            this.toggleScrollMode();
-        });
-
-        // Error panel toggle
-        document.getElementById('error-header').addEventListener('click', () => {
-            this.errorPanel.classList.toggle('collapsed');
-        });
-
-        // Log button toggle
-        const btnLog = document.getElementById('btn-show-log');
-        if (btnLog) {
-            btnLog.addEventListener('click', (e) => {
-                e.stopPropagation();
-                this.toggleLogViewer();
-            });
-        }
-
-        // PDF double-click for SyncTeX reverse (target container, not canvas,
-        // because the text layer sits on top of the canvas)
-        this.container.addEventListener('dblclick', (e) => {
-            if (this.scrollMode === 'continuous') {
-                this._handleContinuousDblClick(e);
-            } else {
-                const rect = this.canvas.getBoundingClientRect();
-                const x = e.clientX - rect.left;
-                const y = e.clientY - rect.top;
-
-                _dbg(`dblclick: pixel(${x.toFixed(1)}, ${y.toFixed(1)}) -> pdf(${(x / this.scale).toFixed(1)}, ${(y / this.scale).toFixed(1)}) page=${this.currentPage}`);
-
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send(JSON.stringify({
-                        type: 'click',
-                        page: this.currentPage,
-                        x: x / this.scale,
-                        y: y / this.scale
-                    }));
-                }
-            }
-        });
-
-        // Keyboard navigation (guard against editor focus)
-        document.addEventListener('keydown', (e) => {
-            if (e.target.closest('.cm-editor')) return;
-            if (this.scrollMode === 'continuous') {
-                // In continuous mode, let natural scroll work; only handle Home/End
-                if (e.key === 'Home') {
-                    this.goToPage(1);
-                } else if (e.key === 'End') {
-                    this.goToPage(this.totalPages);
-                }
-                return;
-            }
-            if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
-                this.prevPage();
-            } else if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') {
-                this.nextPage();
-            } else if (e.key === 'Home') {
-                this.goToPage(1);
-            } else if (e.key === 'End') {
-                this.goToPage(this.totalPages);
-            }
-        });
-
-        // Forward SyncTeX: editor double-click -> PDF navigates
-        window.addEventListener('texwatch:goto-line', (e) => {
-            this.gotoLine(e.detail.line, e.detail.file);
-        });
-
-        // File loaded: switch viewer mode based on extension
-        window.addEventListener('texwatch:file-loaded', (e) => {
-            const file = e.detail.file;
-            if (file && (file.endsWith('.md') || file.endsWith('.markdown') || file.endsWith('.txt'))) {
-                this.setViewerMode('markdown');
-                if (window.texwatchEditor && window.texwatchEditor.view) {
-                    this.renderMarkdown(window.texwatchEditor.view.state.doc.toString());
-                }
-            } else {
-                this.setViewerMode('pdf');
-            }
-        });
-
-        // Content changed: live-update markdown preview (debounced 300ms)
-        window.addEventListener('texwatch:content-changed', (e) => {
-            if (this.viewerMode !== 'markdown') return;
-            if (this._markdownDebounceTimer) clearTimeout(this._markdownDebounceTimer);
-            this._markdownDebounceTimer = setTimeout(() => {
-                this.renderMarkdown(e.detail.content);
-                this._markdownDebounceTimer = null;
-            }, 300);
-        });
-
-        // Editor state: forward to server via WebSocket
-        window.addEventListener('texwatch:editor-state', (e) => {
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                this.ws.send(JSON.stringify({
-                    type: 'editor_state',
-                    state: { file: e.detail.file, line: e.detail.line }
-                }));
-            }
-        });
-
-        // Scroll-based page navigation (with cooldown to prevent trackpad rapid-fire)
-        this.container.addEventListener('wheel', (e) => {
-            if (this.scrollMode === 'continuous') return;  // let natural scroll work
-            if (this._wheelCooldown) return;
-
-            const atTop = this.container.scrollTop === 0;
-            const atBottom = this.container.scrollTop + this.container.clientHeight >= this.container.scrollHeight;
-
-            if (e.deltaY < 0 && atTop) {
-                this.prevPage();
-                this._startWheelCooldown();
-            } else if (e.deltaY > 0 && atBottom) {
-                this.nextPage();
-                this._startWheelCooldown();
-            }
-        });
-    }
-
-    connectWebSocket() {
-        const base = window.TEXWATCH_BASE || '';
-        const wsUrl = `ws://${window.location.host}${base}/ws`;
-        this.ws = new WebSocket(wsUrl);
-
-        if (window.texwatchAwareness) {
-            window.texwatchAwareness.init(this.ws);
-        }
-
-        this.ws.onopen = () => {
-            console.log('WebSocket connected');
-            this.reconnectAttempts = 0;
-            this.setStatus('watching');
-        };
-
-        this.ws.onclose = () => {
-            console.log('WebSocket disconnected');
-            this.setStatus('error');
-            this.scheduleReconnect();
-        };
-
-        this.ws.onerror = (e) => {
-            console.error('WebSocket error:', e);
-        };
-
-        this.ws.onmessage = (e) => {
-            try {
-                const data = JSON.parse(e.data);
-                this.handleMessage(data);
-                if (window.texwatchAwareness) {
-                    window.texwatchAwareness.handleWsMessage(data);
-                }
-            } catch (err) {
-                console.error('Failed to parse WebSocket message:', err);
-            }
-        };
-    }
-
-    scheduleReconnect() {
-        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-            console.log('Max reconnect attempts reached');
-            return;
-        }
-
-        const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-        this.reconnectAttempts++;
-
-        console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-        setTimeout(() => this.connectWebSocket(), delay);
-    }
-
-    handleMessage(data) {
-        if (data.type === 'goto' || data.type === 'source_position') {
-            _dbg('handleMessage:', data.type, JSON.stringify(data));
-        }
-        switch (data.type) {
-            case 'state':
-                this.handleState(data);
-                break;
-            case 'compiling':
-                this.setStatus(data.status ? 'compiling' : 'watching');
-                if (data.status) {
-                    this.compileInfo.textContent = 'Compiling...';
-                    this.compileInfo.className = '';
-                }
-                break;
-            case 'compiled':
-                if (data.log_output) {
-                    this._lastLogOutput = data.log_output;
-                }
-                this.handleCompiled(data.result);
-                break;
-            case 'goto':
-                if (data.page != null) {
-                    this.goToPage(data.page, data.y, data.x, data.width, data.height);
-                }
-                break;
-            case 'source_position':
-                this.showSourcePosition(data);
-                break;
-            case 'source_updated':
-                window.dispatchEvent(new CustomEvent('texwatch:source-updated', {
-                    detail: { file: data.file, mtime_ns: data.mtime_ns }
-                }));
-                break;
-            case 'dashboard_updated':
-                window.dispatchEvent(new Event('texwatch:dashboard-updated'));
-                break;
-        }
-    }
-
-    handleState(data) {
-        if (data.compiling) {
-            this.setStatus('compiling');
-        }
-        if (data.result) {
-            this.handleCompiled(data.result);
-        }
-        this._ensureConfig();
-    }
-
-    handleCompiled(result) {
-        if (!result) return;
-
-        this.setStatus(result.success ? 'watching' : 'error');
-
-        // Update compile info
-        const ago = this.formatTimeAgo(new Date(result.timestamp));
-        if (result.success) {
-            this.compileInfo.textContent = `Last compile: ${ago} ✓`;
-            this.compileInfo.className = 'success';
-        } else {
-            this.compileInfo.textContent = `Compile failed: ${ago}`;
-            this.compileInfo.className = 'error';
-        }
-
-        // Update error panel
-        this.updateErrors(result.errors, result.warnings);
-
-        // Reload PDF
-        if (result.success) {
-            this.loadPDF();
-        }
-
-        // Fetch config (for page limit) and structure (for TODOs)
-        this._ensureConfig().then(() => this.updatePageInfo());
-        this._fetchTodos();
-    }
-
-    updateErrors(errors, warnings) {
-        const total = errors.length + warnings.length;
-
-        if (total === 0) {
-            this.errorSummary.textContent = 'No issues';
-            this.errorSummary.className = '';
-        } else if (errors.length > 0) {
-            this.errorSummary.textContent = `${errors.length} error${errors.length > 1 ? 's' : ''}, ${warnings.length} warning${warnings.length !== 1 ? 's' : ''}`;
-            this.errorSummary.className = 'has-errors';
-        } else {
-            this.errorSummary.textContent = `${warnings.length} warning${warnings.length !== 1 ? 's' : ''}`;
-            this.errorSummary.className = 'has-warnings';
-        }
-
-        // Build error list
-        this.errorList.innerHTML = '';
-
-        for (const err of errors) {
-            this.errorList.appendChild(this.createErrorItem(err, 'error'));
-        }
-
-        for (const warn of warnings) {
-            this.errorList.appendChild(this.createErrorItem(warn, 'warning'));
-        }
-    }
-
-    createErrorItem(item, type) {
-        const div = document.createElement('div');
-        div.className = `error-item ${type}`;
-
-        const icon = document.createElement('span');
-        icon.className = 'icon';
-        icon.textContent = type === 'error' ? '✖' : '⚠';
-
-        const location = document.createElement('span');
-        location.className = 'location';
-        location.textContent = item.line ? `${item.file}:${item.line}` : item.file;
-
-        const message = document.createElement('span');
-        message.className = 'message';
-        message.textContent = item.message;
-
-        div.appendChild(icon);
-        div.appendChild(location);
-        div.appendChild(message);
-
-        // Click to navigate
-        if (item.line) {
-            location.addEventListener('click', () => {
-                this.gotoLine(item.line);
-            });
-        }
-
-        return div;
-    }
-
-    setStatus(status) {
-        this.statusIndicator.className = `status ${status}`;
-        this.statusIndicator.textContent = {
-            watching: 'Watching',
-            compiling: 'Compiling',
-            error: 'Error'
-        }[status] || status;
-    }
-
-    async loadPDF() {
-        try {
-            const base = window.TEXWATCH_BASE || '';
-            // Add cache-busting parameter
-            const url = `${base}/pdf?t=${Date.now()}`;
-            this.pdfDoc = await pdfjsLib.getDocument(url).promise;
-            this.totalPages = this.pdfDoc.numPages;
-
-            // Get filename from status
-            const response = await fetch(`${base}/status`);
-            const status = await response.json();
-            this.filename.textContent = status.file;
-
-            if (this.scrollMode === 'continuous') {
-                await this.initContinuousMode();
-            } else {
-                await this.renderPage(this.currentPage);
-
-                // Highlight change effect
-                this.container.classList.add('highlight-change');
-                setTimeout(() => {
-                    this.container.classList.remove('highlight-change');
-                }, 2000);
-            }
-
-        } catch (err) {
-            console.error('Failed to load PDF:', err);
-        }
-    }
-
-    async renderPage(pageNum) {
-        if (!this.pdfDoc) return;
-
-        // Clamp page number
-        pageNum = Math.max(1, Math.min(pageNum, this.totalPages));
-        this.currentPage = pageNum;
-
-        if (window.texwatchAwareness) {
-            window.texwatchAwareness.reportPdfViewport(this.currentPage, this.container.scrollTop);
-        }
-
-        const page = await this.pdfDoc.getPage(pageNum);
-        const viewport = page.getViewport({ scale: this.scale });
-
-        this.canvas.height = viewport.height;
-        this.canvas.width = viewport.width;
-
-        await page.render({
-            canvasContext: this.ctx,
-            viewport: viewport
-        }).promise;
-
-        // Render text layer for selection/copy support
-        if (this.textLayer) {
-            this.textLayer.innerHTML = '';
-            this.textLayer.style.width = viewport.width + 'px';
-            this.textLayer.style.height = viewport.height + 'px';
-            this.textLayer.style.setProperty('--scale-factor', viewport.scale);
-
-            const textContent = await page.getTextContent();
-            try {
-                await pdfjsLib.renderTextLayer({
-                    textContentSource: textContent,
-                    container: this.textLayer,
-                    viewport: viewport,
-                }).promise;
-            } catch (err) {
-                console.error('Failed to render text layer:', err);
-            }
-        }
-
-        this.updatePageInfo();
-        this.sendViewerState();
-    }
-
-    updatePageInfo() {
-        const limit = this._cachedConfig && this._cachedConfig.page_limit;
-        if (limit && this.totalPages > limit) {
-            this.pageInfo.textContent = `Page ${this.currentPage}/${this.totalPages} (limit: ${limit})`;
-            this.pageInfo.classList.add('over-limit');
-        } else {
-            this.pageInfo.textContent = `Page ${this.currentPage}/${this.totalPages}`;
-            this.pageInfo.classList.remove('over-limit');
-        }
-    }
-
-    sendViewerState() {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify({
-                type: 'viewer_state',
-                state: {
-                    page: this.currentPage,
-                    total_pages: this.totalPages
-                }
-            }));
-        }
-    }
-
-    showSourcePosition(data) {
-        _dbg(`showSourcePosition: ${data.file}:${data.line} col=${data.column || 0}`);
-        this.lineInfo.textContent = `${data.file}:${data.line}`;
-        window.dispatchEvent(new CustomEvent('texwatch:source-position', {
-            detail: { file: data.file, line: data.line, column: data.column || 0 }
-        }));
-    }
-
-    _startWheelCooldown() {
-        this._wheelCooldown = true;
-        setTimeout(() => { this._wheelCooldown = false; }, 300);
-    }
-
-    // -----------------------------------------------------------------------
-    // Page navigation — dispatches to continuous or page mode
-    // -----------------------------------------------------------------------
-
-    _clearAllHighlights() {
-        if (this._highlightFadeTimer) {
-            clearTimeout(this._highlightFadeTimer);
-            this._highlightFadeTimer = null;
-        }
-        // Clear text highlights in all layers (single-page + per-page)
-        document.querySelectorAll('.synctex-text-highlight')
-            .forEach(el => el.classList.remove('synctex-text-highlight'));
-        // Clear PDF overlay highlight (single-page mode)
-        if (this.pdfHighlight) this.pdfHighlight.classList.remove('active');
-        // Clear per-page highlights (continuous mode)
-        document.querySelectorAll('.page-highlight.active')
-            .forEach(el => el.classList.remove('active'));
-    }
-
-    goToPage(pageNum, y = null, x = null, width = null, height = null) {
-        _dbg(`goToPage: page=${pageNum} y=${y} x=${x} w=${width} h=${height} mode=${this.scrollMode}`);
-        this._clearAllHighlights();
-        if (this.scrollMode === 'continuous') {
-            this.goToPageContinuous(pageNum, y, x, width, height);
-        } else {
-            this.renderPage(pageNum).then(() => {
-                if (y !== null) {
-                    const textHighlighted = this._highlightTextInLayer(this.textLayer, x, y, width, height);
-                    _dbg(`goToPage: textHighlighted=${textHighlighted}`);
-                    this._showPdfHighlight(x, y, width, height, textHighlighted);
-                }
-            });
-        }
-    }
-
-    _showPdfHighlight(x, y, width, height, skipVisual = false) {
-        if (!this.pdfHighlight) return;
-
-        const s = this.scale;
-        const hasPreciseBox = (width && width > 0 && height && height > 0);
-        _dbg(`showPdfHighlight: hasPreciseBox=${hasPreciseBox}, skipVisual=${skipVisual}`);
-
-        if (hasPreciseBox) {
-            // SyncTeX y = baseline, box top = y - height
-            this.pdfHighlight.style.top = ((y - height) * s) + 'px';
-            this.pdfHighlight.style.left = (x * s) + 'px';
-            this.pdfHighlight.style.width = (width * s) + 'px';
-            this.pdfHighlight.style.height = (height * s * 1.3) + 'px'; // pad for descenders
-        } else {
-            // Fallback: full-width bar
-            this.pdfHighlight.style.top = (y * s - 10) + 'px';
-            this.pdfHighlight.style.left = '0';
-            this.pdfHighlight.style.width = '100%';
-            this.pdfHighlight.style.height = '20px';
-        }
-
-        // Only show the overlay rectangle when text-span highlighting didn't match
-        if (!skipVisual) {
-            this.pdfHighlight.classList.remove('active');
-            void this.pdfHighlight.offsetWidth;  // force reflow to restart animation
-            this.pdfHighlight.classList.add('active');
-        }
-
-        // Scroll viewer pane to show the highlight (always, regardless of skipVisual)
-        if (this.viewerPane) {
-            const containerTop = this.container.offsetTop;
-            const scrollTarget = parseFloat(this.pdfHighlight.style.top);
-            this.viewerPane.scrollTo({
-                top: containerTop + scrollTarget - this.viewerPane.clientHeight / 2,
-                behavior: 'smooth'
-            });
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Shared text-layer highlighting — works with both #text-layer and
-    // per-page .page-text-layer elements
-    // -----------------------------------------------------------------------
-
-    _highlightTextInLayer(layer, x, y, width, height) {
-        if (!layer) {
-            _dbg('highlight: layer not available');
-            return false;
-        }
-
-        // Clear any previous text highlights in this layer
-        layer.querySelectorAll('.synctex-text-highlight')
-            .forEach(el => el.classList.remove('synctex-text-highlight'));
-
-        const s = this.scale;
-        const spans = layer.querySelectorAll(
-            'span:not(.markedContent):not(.endOfContent)');
-        if (spans.length === 0) {
-            _dbg('highlight: 0 text spans');
-            return false;
-        }
-
-        const hasPreciseBox = (width && width > 0 && height && height > 0);
-        _dbg(`highlight: ${spans.length} spans, hasPreciseBox=${hasPreciseBox} (w=${width}, h=${height}), scale=${s.toFixed(2)}`);
-        let matched = 0;
-
-        if (hasPreciseBox) {
-            // PATH A: Precise bounding box — use box overlap
-            const boxTop = (y - height) * s;
-            const boxLeft = x * s;
-            const boxRight = boxLeft + width * s;
-            const boxBottom = boxTop + height * s * 1.3;  // pad for descenders
-
-            _dbg(`highlight: PATH A — box: top=${boxTop.toFixed(1)} left=${boxLeft.toFixed(1)} right=${boxRight.toFixed(1)} bottom=${boxBottom.toFixed(1)}`);
-
-            for (const span of spans) {
-                const top = parseFloat(span.style.top) || 0;
-                const left = parseFloat(span.style.left) || 0;
-                const spanHeight = span.offsetHeight;
-                const scaleX = parseFloat(
-                    span.style.transform?.match(/scaleX\(([^)]+)\)/)?.[1]) || 1;
-                const spanWidth = span.offsetWidth * scaleX;
-
-                if (top < boxBottom && (top + spanHeight) > boxTop &&
-                    left < boxRight && (left + spanWidth) > boxLeft) {
-                    span.classList.add('synctex-text-highlight');
-                    matched++;
-                }
-            }
-
-            _dbg(`highlight: PATH A matched ${matched}/${spans.length} spans`);
-        } else {
-            // PATH B: Only y (and maybe x) — line-based matching
-            const targetY = y * s;
-
-            // Compute tolerance from actual span heights
-            let avgHeight = 0;
-            let count = 0;
-            for (const span of spans) {
-                const h = span.offsetHeight;
-                if (h > 0) { avgHeight += h; count++; }
-            }
-            const tolerance = count > 0 ? (avgHeight / count) * 0.6 : 15;
-
-            const targetX = (x && x > 0) ? x * s : 0;
-
-            _dbg(`highlight: PATH B — targetY=${targetY.toFixed(1)}, tolerance=${tolerance.toFixed(1)}, targetX=${targetX.toFixed(1)}`);
-
-            for (const span of spans) {
-                const top = parseFloat(span.style.top) || 0;
-                const spanHeight = span.offsetHeight;
-                const spanMidY = top + spanHeight / 2;
-
-                if (Math.abs(spanMidY - targetY) > tolerance) continue;
-
-                // If x is specified, only highlight from that point onward
-                if (targetX > 0) {
-                    const left = parseFloat(span.style.left) || 0;
-                    if (left + span.offsetWidth < targetX) continue;
-                }
-
-                span.classList.add('synctex-text-highlight');
-                matched++;
-            }
-
-            _dbg(`highlight: PATH B matched ${matched}/${spans.length} spans`);
-        }
-
-        // Log sample span positions when nothing matched
-        if (matched === 0) {
-            const sample = Math.min(5, spans.length);
-            const positions = [];
-            for (let i = 0; i < sample; i++) {
-                const sp = spans[i];
-                positions.push(`top=${parseFloat(sp.style.top) || 0} left=${parseFloat(sp.style.left) || 0} h=${sp.offsetHeight}`);
-            }
-            _dbg(`highlight: 0 matches — first ${sample} span positions:`, positions.join('; '));
-        }
-
-        if (matched > 0) {
-            if (this._highlightFadeTimer) clearTimeout(this._highlightFadeTimer);
-            this._highlightFadeTimer = setTimeout(() => {
-                layer.querySelectorAll('.synctex-text-highlight')
-                    .forEach(el => el.classList.remove('synctex-text-highlight'));
-                this._highlightFadeTimer = null;
-            }, 8000);
-        }
-
-        return matched > 0;
-    }
-
-    // Legacy wrapper — old name calls new shared implementation
-    _highlightTextAtPosition(x, y, width, height) {
-        return this._highlightTextInLayer(this.textLayer, x, y, width, height);
-    }
-
-    prevPage() {
-        if (this.currentPage > 1) {
-            this.renderPage(this.currentPage - 1);
-        }
-    }
-
-    nextPage() {
-        if (this.currentPage < this.totalPages) {
-            this.renderPage(this.currentPage + 1);
-        }
-    }
-
-    gotoLine(line, file) {
-        _dbg(`gotoLine: requesting forward sync for line=${line} file=${file || '(default)'}`);
-        const base = window.TEXWATCH_BASE || '';
-        const body = { line: line };
-        if (file) body.file = file;
-        fetch(`${base}/goto`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        }).then(resp => {
-            if (!resp.ok) {
-                resp.json().then(data => {
-                    console.warn('Forward SyncTeX failed:', data.error || resp.statusText);
-                }).catch(() => {
-                    console.warn('Forward SyncTeX failed:', resp.statusText);
-                });
-            }
-        }).catch(err => {
-            console.error('Forward SyncTeX request failed:', err);
-        });
-    }
-
-    async forceCompile() {
-        try {
-            const base = window.TEXWATCH_BASE || '';
-            await fetch(`${base}/compile`, { method: 'POST' });
-        } catch (err) {
-            console.error('Failed to trigger compile:', err);
-        }
-    }
-
-    setViewerMode(mode) {
-        this.viewerMode = mode;
-        if (mode === 'markdown') {
-            this.container.style.display = 'none';
-            if (this.markdownPreview) this.markdownPreview.classList.remove('hidden');
-        } else {
-            this.container.style.display = '';
-            if (this.markdownPreview) this.markdownPreview.classList.add('hidden');
-        }
-    }
-
-    renderMarkdown(content) {
-        if (!this.markdownPreview || typeof marked === 'undefined') return;
-        try {
-            this.markdownPreview.innerHTML = marked.parse(content);
-        } catch (err) {
-            console.error('Markdown rendering failed:', err);
-        }
-    }
-
-    formatTimeAgo(date) {
-        const seconds = Math.floor((new Date() - date) / 1000);
-
-        if (seconds < 5) return 'just now';
-        if (seconds < 60) return `${seconds}s ago`;
-        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-        return `${Math.floor(seconds / 3600)}h ago`;
-    }
-
-    // ===================================================================
-    // Config cache, log viewer, and TODO panel
-    // ===================================================================
-
-    async _ensureConfig() {
-        if (this._cachedConfig) return;
-        try {
-            const base = window.TEXWATCH_BASE || '';
-            const resp = await fetch(`${base}/config`);
-            if (resp.ok) {
-                this._cachedConfig = await resp.json();
-            }
-        } catch (err) {
-            console.error('Failed to fetch config:', err);
-        }
-    }
-
-    toggleLogViewer() {
-        if (!this.logViewer) return;
-        const isHidden = this.logViewer.classList.contains('hidden');
-        if (isHidden) {
-            // Show log
-            if (this.logContent) {
-                this.logContent.textContent = this._lastLogOutput || '(no log output)';
-            }
-            this.logViewer.classList.remove('hidden');
-        } else {
-            this.logViewer.classList.add('hidden');
-        }
-    }
-
-    async _fetchTodos() {
-        try {
-            const base = window.TEXWATCH_BASE || '';
-            const resp = await fetch(`${base}/structure`);
-            if (!resp.ok) return;
-            const data = await resp.json();
-            this._renderTodos(data.todos || []);
-        } catch (err) {
-            console.error('Failed to fetch structure:', err);
-        }
-    }
-
-    _renderTodos(todos) {
-        if (!this.todoList) return;
-        this.todoList.innerHTML = '';
-        if (todos.length === 0) return;
-
-        for (const todo of todos) {
-            const div = document.createElement('div');
-            div.className = 'todo-item';
-
-            const icon = document.createElement('span');
-            icon.className = 'icon';
-            icon.textContent = '\u2610';  // ballot box
-
-            const text = document.createElement('span');
-            text.className = 'message';
-            text.textContent = `[${todo.tag}] ${todo.text}`;
-
-            const location = document.createElement('span');
-            location.className = 'location';
-            location.textContent = `${todo.file}:${todo.line}`;
-
-            div.appendChild(icon);
-            div.appendChild(text);
-            div.appendChild(location);
-
-            // Click to navigate to file:line
-            div.addEventListener('click', () => {
-                // Load the file in the editor and scroll to line
-                if (window.texwatchEditor) {
-                    window.texwatchEditor.loadFile(todo.file).then(() => {
-                        window.texwatchEditor.scrollToLine(todo.line);
-                    });
-                }
-            });
-
-            this.todoList.appendChild(div);
-        }
-    }
-
-    // ===================================================================
-    // Continuous scroll mode
-    // ===================================================================
-
-    toggleScrollMode() {
-        if (this.scrollMode === 'page') {
-            this.scrollMode = 'continuous';
-            document.getElementById('btn-scroll-mode').classList.add('active');
-            if (this.pdfDoc) this.initContinuousMode();
-        } else {
-            this.exitContinuousMode();
-            this.scrollMode = 'page';
-            document.getElementById('btn-scroll-mode').classList.remove('active');
-            if (this.pdfDoc) this.renderPage(this.currentPage);
-        }
-    }
-
-    async initContinuousMode() {
-        if (!this.pdfDoc) return;
-        _dbg(`initContinuousMode: ${this.totalPages} pages`);
-
-        // Tear down any previous continuous state
-        this._teardownContinuous();
-
-        // Add continuous class to container
-        this.container.classList.add('continuous');
-
-        // Create page wrappers with correct dimensions (but no rendered content yet)
-        this.pageElements = [];
-        this.renderedPages = new Set();
-
-        for (let i = 1; i <= this.totalPages; i++) {
-            const page = await this.pdfDoc.getPage(i);
-            const viewport = page.getViewport({ scale: this.scale });
-
-            const wrapper = document.createElement('div');
-            wrapper.className = 'page-wrapper';
-            wrapper.dataset.pageNum = i;
-            wrapper.style.width = viewport.width + 'px';
-            wrapper.style.height = viewport.height + 'px';
-
-            // Page number label (visible on hover)
-            const label = document.createElement('div');
-            label.className = 'page-number-label';
-            label.textContent = `${i}`;
-            wrapper.appendChild(label);
-
-            this.container.appendChild(wrapper);
-            this.pageElements.push(wrapper);
-        }
-
-        // Set up IntersectionObserver for lazy rendering
-        this.setupIntersectionObserver();
-
-        // Set up scroll tracking to update currentPage
-        this.setupScrollTracking();
-
-        // Scroll to current page
-        if (this.currentPage > 1 && this.pageElements[this.currentPage - 1]) {
-            this.pageElements[this.currentPage - 1].scrollIntoView({ behavior: 'instant' });
-        }
-
-        this.updatePageInfo();
-    }
-
-    setupIntersectionObserver() {
-        if (this.observer) this.observer.disconnect();
-
-        this.observer = new IntersectionObserver((entries) => {
-            for (const entry of entries) {
-                const pageNum = parseInt(entry.target.dataset.pageNum, 10);
-                if (entry.isIntersecting) {
-                    this._queueRender(pageNum);
-                    // Pre-render buffer pages
-                    for (let delta = 1; delta <= 2; delta++) {
-                        if (pageNum - delta >= 1) this._queueRender(pageNum - delta);
-                        if (pageNum + delta <= this.totalPages) this._queueRender(pageNum + delta);
-                    }
-                }
-            }
-            // Unload distant pages for memory management
-            this._unloadDistantPages();
-        }, {
-            root: this.viewerPane,
-            rootMargin: '200px 0px',
-            threshold: 0.01,
-        });
-
-        for (const wrapper of this.pageElements) {
-            this.observer.observe(wrapper);
-        }
-    }
-
-    _queueRender(pageNum) {
-        if (this.renderedPages.has(pageNum)) return;
-        this._renderQueue.add(pageNum);
-        if (!this._rendering) this._processRenderQueue();
-    }
-
-    async _processRenderQueue() {
-        this._rendering = true;
-        while (this._renderQueue.size > 0) {
-            const pageNum = this._renderQueue.values().next().value;
-            this._renderQueue.delete(pageNum);
-            if (!this.renderedPages.has(pageNum)) {
-                await this.renderPageContinuous(pageNum);
-            }
-        }
-        this._rendering = false;
-    }
-
-    async renderPageContinuous(pageNum) {
-        if (!this.pdfDoc || this.renderedPages.has(pageNum)) return;
-
-        const wrapper = this.pageElements[pageNum - 1];
-        if (!wrapper) return;
-
-        _dbg(`renderPageContinuous: page=${pageNum}`);
-
-        const page = await this.pdfDoc.getPage(pageNum);
-        const viewport = page.getViewport({ scale: this.scale });
-
-        // Create canvas
-        const canvas = document.createElement('canvas');
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-
-        await page.render({
-            canvasContext: canvas.getContext('2d'),
-            viewport: viewport
-        }).promise;
-
-        // Create text layer
-        const textLayerDiv = document.createElement('div');
-        textLayerDiv.className = 'page-text-layer';
-        textLayerDiv.style.width = viewport.width + 'px';
-        textLayerDiv.style.height = viewport.height + 'px';
-        textLayerDiv.style.setProperty('--scale-factor', viewport.scale);
-
-        const textContent = await page.getTextContent();
-        try {
-            await pdfjsLib.renderTextLayer({
-                textContentSource: textContent,
-                container: textLayerDiv,
-                viewport: viewport,
-            }).promise;
-        } catch (err) {
-            console.error(`Failed to render text layer for page ${pageNum}:`, err);
-        }
-
-        // Create highlight overlay
-        const highlight = document.createElement('div');
-        highlight.className = 'page-highlight';
-
-        // Insert rendered content (keep the page-number-label that's already there)
-        wrapper.appendChild(canvas);
-        wrapper.appendChild(textLayerDiv);
-        wrapper.appendChild(highlight);
-
-        this.renderedPages.add(pageNum);
-    }
-
-    _unloadDistantPages() {
-        const maxDistance = 6;
-        for (const pageNum of [...this.renderedPages]) {
-            if (Math.abs(pageNum - this.currentPage) > maxDistance) {
-                this.unloadPage(pageNum);
-            }
-        }
-    }
-
-    unloadPage(pageNum) {
-        const wrapper = this.pageElements[pageNum - 1];
-        if (!wrapper) return;
-
-        // Remove rendered content but keep the wrapper (preserves height) and label
-        const canvas = wrapper.querySelector('canvas');
-        const textLayer = wrapper.querySelector('.page-text-layer');
-        const highlight = wrapper.querySelector('.page-highlight');
-        if (canvas) canvas.remove();
-        if (textLayer) textLayer.remove();
-        if (highlight) highlight.remove();
-
-        this.renderedPages.delete(pageNum);
-        _dbg(`unloadPage: page=${pageNum}`);
-    }
-
-    setupScrollTracking() {
-        if (!this.viewerPane) return;
-
-        const handler = () => {
-            if (this._scrollTrackingTimer) return;
-            this._scrollTrackingTimer = setTimeout(() => {
-                this._scrollTrackingTimer = null;
-                this.updateCurrentPageFromScroll();
-            }, 100);
-        };
-
-        this.viewerPane.addEventListener('scroll', handler);
-        // Store reference for cleanup
-        this._scrollHandler = handler;
-    }
-
-    updateCurrentPageFromScroll() {
-        if (!this.viewerPane || this.pageElements.length === 0) return;
-
-        const viewportMid = this.viewerPane.scrollTop + this.viewerPane.clientHeight / 2;
-
-        let best = 1;
-        let bestDist = Infinity;
-
-        for (let i = 0; i < this.pageElements.length; i++) {
-            const wrapper = this.pageElements[i];
-            const wrapperMid = wrapper.offsetTop + wrapper.offsetHeight / 2;
-            const dist = Math.abs(wrapperMid - viewportMid);
-            if (dist < bestDist) {
-                bestDist = dist;
-                best = i + 1;
-            }
-        }
-
-        if (best !== this.currentPage) {
-            this.currentPage = best;
-            this.updatePageInfo();
-            this.sendViewerState();
-            if (window.texwatchAwareness) {
-                window.texwatchAwareness.reportPdfViewport(this.currentPage, this.viewerPane.scrollTop);
-            }
-        }
-    }
-
-    goToPageContinuous(pageNum, y = null, x = null, width = null, height = null) {
-        pageNum = Math.max(1, Math.min(pageNum, this.totalPages));
-        const wrapper = this.pageElements[pageNum - 1];
-        if (!wrapper) return;
-
-        _dbg(`goToPageContinuous: page=${pageNum} y=${y}`);
-
-        // Ensure page is rendered before scrolling
-        const doScroll = () => {
-            if (y !== null) {
-                // Scroll to specific y position within the page
-                const s = this.scale;
-                const targetTop = wrapper.offsetTop + (y * s);
-                this.viewerPane.scrollTo({
-                    top: targetTop - this.viewerPane.clientHeight / 2,
-                    behavior: 'smooth'
-                });
-
-                // Highlight on the specific page
-                this._highlightOnPage(pageNum, x, y, width, height);
-            } else {
-                wrapper.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            }
-
-            this.currentPage = pageNum;
-            this.updatePageInfo();
-            this.sendViewerState();
-        };
-
-        if (this.renderedPages.has(pageNum)) {
-            doScroll();
-        } else {
-            this.renderPageContinuous(pageNum).then(doScroll);
-        }
-    }
-
-    _highlightOnPage(pageNum, x, y, width, height) {
-        const wrapper = this.pageElements[pageNum - 1];
-        if (!wrapper) return;
-
-        const textLayer = wrapper.querySelector('.page-text-layer');
-        const highlightDiv = wrapper.querySelector('.page-highlight');
-
-        // Text-layer highlighting
-        const textHighlighted = this._highlightTextInLayer(textLayer, x, y, width, height);
-
-        // Overlay highlight
-        if (highlightDiv) {
-            const s = this.scale;
-            const hasPreciseBox = (width && width > 0 && height && height > 0);
-
-            if (hasPreciseBox) {
-                highlightDiv.style.top = ((y - height) * s) + 'px';
-                highlightDiv.style.left = (x * s) + 'px';
-                highlightDiv.style.width = (width * s) + 'px';
-                highlightDiv.style.height = (height * s * 1.3) + 'px';
-            } else {
-                highlightDiv.style.top = (y * s - 10) + 'px';
-                highlightDiv.style.left = '0';
-                highlightDiv.style.width = '100%';
-                highlightDiv.style.height = '20px';
-            }
-
-            if (!textHighlighted) {
-                highlightDiv.classList.remove('active');
-                void highlightDiv.offsetWidth;  // force reflow to restart animation
-                highlightDiv.classList.add('active');
-            }
-        }
-    }
-
-    _handleContinuousDblClick(e) {
-        // Find which page-wrapper was clicked
-        const wrapper = e.target.closest('.page-wrapper');
-        if (!wrapper) return;
-
-        const pageNum = parseInt(wrapper.dataset.pageNum, 10);
-        const canvas = wrapper.querySelector('canvas');
-        if (!canvas) return;
-
-        const rect = canvas.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-
-        _dbg(`continuous dblclick: page=${pageNum} pixel(${x.toFixed(1)}, ${y.toFixed(1)}) -> pdf(${(x / this.scale).toFixed(1)}, ${(y / this.scale).toFixed(1)})`);
-
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify({
-                type: 'click',
-                page: pageNum,
-                x: x / this.scale,
-                y: y / this.scale
-            }));
-        }
-    }
-
-    _teardownContinuous() {
-        // Disconnect observer
-        if (this.observer) {
-            this.observer.disconnect();
-            this.observer = null;
-        }
-
-        // Remove scroll handler
-        if (this._scrollHandler && this.viewerPane) {
-            this.viewerPane.removeEventListener('scroll', this._scrollHandler);
-            this._scrollHandler = null;
-        }
-
-        if (this._scrollTrackingTimer) {
-            clearTimeout(this._scrollTrackingTimer);
-            this._scrollTrackingTimer = null;
-        }
-
-        // Remove all page wrappers
-        for (const wrapper of this.pageElements) {
-            wrapper.remove();
-        }
-        this.pageElements = [];
-        this.renderedPages.clear();
-        this._renderQueue.clear();
-    }
-
-    exitContinuousMode() {
-        _dbg('exitContinuousMode');
-        this._teardownContinuous();
-        this.container.classList.remove('continuous');
-    }
-
-    // ===================================================================
-    // Zoom controls
-    // ===================================================================
-
-    setZoom(newScale) {
-        newScale = Math.max(0.25, Math.min(5.0, newScale));
-        if (Math.abs(newScale - this.scale) < 0.001) return;
-
-        this.scale = newScale;
-        this._updateZoomDisplay();
-
-        if (this.scrollMode === 'continuous') {
-            if (this.pdfDoc) this.initContinuousMode();
-        } else {
-            if (this.pdfDoc) this.renderPage(this.currentPage);
-        }
-    }
-
-    zoomIn() {
-        this.setZoom(this.scale * 1.25);
-    }
-
-    zoomOut() {
-        this.setZoom(this.scale / 1.25);
-    }
-
-    async fitWidth() {
-        if (!this.pdfDoc) return;
-        const page = await this.pdfDoc.getPage(this.currentPage || 1);
-        const viewport = page.getViewport({ scale: 1.0 });
-        const paneWidth = this.viewerPane.clientWidth - 40; // minus padding
-        this.setZoom(paneWidth / viewport.width);
-    }
-
-    async fitPage() {
-        if (!this.pdfDoc) return;
-        const page = await this.pdfDoc.getPage(this.currentPage || 1);
-        const viewport = page.getViewport({ scale: 1.0 });
-        const paneWidth = this.viewerPane.clientWidth - 40;
-        const paneHeight = this.viewerPane.clientHeight - 40;
-        const scaleW = paneWidth / viewport.width;
-        const scaleH = paneHeight / viewport.height;
-        this.setZoom(Math.min(scaleW, scaleH));
-    }
-
-    _updateZoomDisplay() {
-        const pct = Math.round(this.scale * 100);
-        const span = document.getElementById('zoom-level');
-        if (span) span.textContent = pct + '%';
-
-        // Update select to match (or deselect if custom)
-        const select = document.getElementById('zoom-select');
-        if (!select) return;
-        const rounded = Math.round(this.scale * 100) / 100;
-        let matched = false;
-        for (const opt of select.options) {
-            if (opt.value !== 'fit-width' && opt.value !== 'fit-page' &&
-                Math.abs(parseFloat(opt.value) - rounded) < 0.01) {
-                select.value = opt.value;
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) {
-            select.value = '';
-        }
-    }
+function clear(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
 }
 
-// Initialize when DOM is ready
-document.addEventListener('DOMContentLoaded', () => {
-    // Show back-link when in multi-project mode
-    if (window.TEXWATCH_BASE) {
-        const backLink = document.getElementById('back-link');
-        if (backLink) backLink.style.display = '';
+function placeholder(text) {
+  return h("p", { class: "placeholder", text });
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+const state = {
+  pdfDoc: null,
+  renderScale: 1.4,
+  pages: [],
+  comments: [],
+  paper: null,
+  errors: [],
+  warnings: [],
+  ws: null,
+  pendingAnchor: null,
+  expanded: new Set(),
+};
+
+// ---------------------------------------------------------------------------
+// PDF rendering
+// ---------------------------------------------------------------------------
+
+async function loadPdf() {
+  try {
+    const loadingTask = pdfjsLib.getDocument({
+      url: `/pdf?t=${Date.now()}`,
+      withCredentials: false,
+    });
+    const pdf = await loadingTask.promise;
+    state.pdfDoc = pdf;
+    await renderAllPages();
+    refreshAnnotationOverlays();
+  } catch (err) {
+    showPdfError(err);
+  }
+}
+
+async function renderAllPages() {
+  const host = $("#pdf-canvas-host");
+  clear(host);
+  state.pages = [];
+  for (let n = 1; n <= state.pdfDoc.numPages; n++) {
+    const wrap = h("div", { class: "pdf-page", data: { page: String(n) } });
+    host.appendChild(wrap);
+
+    const page = await state.pdfDoc.getPage(n);
+    const viewport = page.getViewport({ scale: state.renderScale });
+    const canvas = h("canvas", { class: "pdf-canvas" });
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    wrap.style.width = `${viewport.width}px`;
+    wrap.style.height = `${viewport.height}px`;
+    wrap.appendChild(canvas);
+
+    const textLayer = h("div", { class: "text-layer" });
+    wrap.appendChild(textLayer);
+
+    const overlay = h("div", { class: "annotation-overlay", data: { page: String(n) } });
+    wrap.appendChild(overlay);
+
+    const ctx = canvas.getContext("2d");
+    await page.render({ canvasContext: ctx, viewport }).promise;
+
+    const textContent = await page.getTextContent();
+    if (pdfjsLib.renderTextLayer) {
+      pdfjsLib.renderTextLayer({
+        textContentSource: textContent,
+        container: textLayer,
+        viewport,
+      });
+    } else {
+      const layer = new pdfjsLib.TextLayer({
+        textContentSource: textContent,
+        container: textLayer,
+        viewport,
+      });
+      await layer.render();
     }
 
-    window.viewer = new TexWatchViewer();
-});
+    state.pages.push({ pageNum: n, viewport, canvas, textLayer, overlay, wrap });
+  }
+}
+
+function showPdfError(err) {
+  const host = $("#pdf-canvas-host");
+  clear(host);
+  host.appendChild(placeholder(`PDF unavailable. ${err && err.message ? err.message : err}`));
+}
+
+// ---------------------------------------------------------------------------
+// Selection -> pdf_region anchor
+// ---------------------------------------------------------------------------
+
+function attachSelectionListener() {
+  document.addEventListener("mouseup", () => {
+    setTimeout(updateSelectionToolbar, 0);
+  });
+  document.addEventListener("selectionchange", updateSelectionToolbar);
+}
+
+function getSelectionPdfRegion() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  const rects = range.getClientRects();
+  if (rects.length === 0) return null;
+
+  let node = range.startContainer;
+  while (node && node.nodeType !== 1) node = node.parentNode;
+  let pageEl = node;
+  while (pageEl && !(pageEl.classList && pageEl.classList.contains("pdf-page"))) {
+    pageEl = pageEl.parentElement;
+  }
+  if (!pageEl) return null;
+
+  const pageNum = parseInt(pageEl.dataset.page, 10);
+  const pageInfo = state.pages.find((p) => p.pageNum === pageNum);
+  if (!pageInfo) return null;
+
+  const pageRect = pageEl.getBoundingClientRect();
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  for (const r of rects) {
+    x1 = Math.min(x1, r.left);
+    y1 = Math.min(y1, r.top);
+    x2 = Math.max(x2, r.right);
+    y2 = Math.max(y2, r.bottom);
+  }
+  const cx1 = (x1 - pageRect.left) / state.renderScale;
+  const cy1 = (y1 - pageRect.top) / state.renderScale;
+  const cx2 = (x2 - pageRect.left) / state.renderScale;
+  const cy2 = (y2 - pageRect.top) / state.renderScale;
+
+  return {
+    page: pageNum,
+    bbox: [cx1, cy1, cx2, cy2],
+    text: sel.toString().trim(),
+  };
+}
+
+function updateSelectionToolbar() {
+  const region = getSelectionPdfRegion();
+  const tb = $("#selection-toolbar");
+  if (!region) {
+    tb.classList.add("hidden");
+    return;
+  }
+  tb.classList.remove("hidden");
+  const sel = window.getSelection();
+  const range = sel.getRangeAt(0);
+  const rect = range.getBoundingClientRect();
+  tb.style.left = `${window.scrollX + rect.left}px`;
+  tb.style.top = `${window.scrollY + rect.top - 36}px`;
+  tb.dataset.region = JSON.stringify(region);
+}
+
+// ---------------------------------------------------------------------------
+// Compose dialog
+// ---------------------------------------------------------------------------
+
+function openCompose(anchor, label) {
+  state.pendingAnchor = anchor;
+  $("#compose-anchor").textContent = label;
+  $("#compose-text").value = "";
+  $("#compose-tags").value = "";
+  $("#compose-dialog").showModal();
+  setTimeout(() => $("#compose-text").focus(), 50);
+}
+
+async function submitCompose(ev) {
+  ev.preventDefault();
+  const text = $("#compose-text").value.trim();
+  if (!text || !state.pendingAnchor) return;
+  const tags = $("#compose-tags").value
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const body = { anchor: state.pendingAnchor, text, tags, author: "human" };
+  $("#compose-dialog").close();
+  state.pendingAnchor = null;
+  try {
+    const resp = await fetch("/comments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      alert(`Could not save comment: ${err.error || resp.status}`);
+      return;
+    }
+    await refreshComments();
+  } catch (err) {
+    alert(`Network error: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar — comments
+// ---------------------------------------------------------------------------
+
+async function refreshComments() {
+  const status = $("#comment-filter").value;
+  const url = status === "all" ? "/comments" : `/comments?status=${status}`;
+  try {
+    const resp = await fetch(url);
+    const data = await resp.json();
+    state.comments = data.comments || [];
+    renderComments();
+    refreshAnnotationOverlays();
+  } catch (err) {
+    console.warn("refreshComments failed:", err);
+  }
+}
+
+function renderComments() {
+  const list = $("#comments-list");
+  clear(list);
+  if (state.comments.length === 0) {
+    list.appendChild(placeholder("No comments at this filter."));
+    updateCommentCount();
+    return;
+  }
+  for (const c of state.comments) list.appendChild(renderCommentItem(c));
+  updateCommentCount();
+}
+
+function renderCommentItem(c) {
+  const expanded = state.expanded.has(c.id);
+
+  const headChildren = [
+    h("button", {
+      class: "cmt-toggle",
+      type: "button",
+      title: expanded ? "collapse" : "expand",
+      text: expanded ? "▾" : "▸",
+      onclick: () => {
+        if (state.expanded.has(c.id)) state.expanded.delete(c.id);
+        else state.expanded.add(c.id);
+        renderComments();
+      },
+    }),
+    h("span", { class: "cmt-id", text: c.id }),
+    h("span", { class: "cmt-status", text: `[${c.status}]` }),
+    c.stale ? h("span", { class: "stale", text: "STALE" }) : null,
+    h("button", {
+      class: "cmt-anchor",
+      type: "button",
+      title: "Jump to anchor",
+      text: anchorLabel(c.anchor),
+      onclick: () => jumpToComment(c.id),
+    }),
+    h("span", { class: "cmt-tags" },
+      ...(c.tags || []).map((t) => h("span", { class: "tag", text: `#${t}` })),
+    ),
+  ];
+
+  const head = h("div", { class: "cmt-head" }, ...headChildren);
+  const preview = h("div", { class: "cmt-preview", text: c.thread[0]?.text || "" });
+
+  const children = [head, preview];
+
+  if (expanded) {
+    const thread = h("div", { class: "cmt-thread" },
+      ...c.thread.map(renderThreadEntry));
+    const actions = h("div", { class: "cmt-actions" }, ...actionButtons(c));
+    children.push(thread, actions);
+  }
+
+  return h("div", {
+    class: `cmt status-${c.status}`,
+    data: { commentId: c.id },
+  }, ...children);
+}
+
+function renderThreadEntry(entry) {
+  const meta = h("div", {
+    class: "thread-meta",
+    text: `${entry.author} · ${entry.at}`,
+  });
+  const txt = h("div", { class: "thread-text", text: entry.text });
+  const children = [meta, txt];
+  if (entry.edits && entry.edits.length > 0) {
+    children.push(
+      h("div", { class: "thread-edits" },
+        ...entry.edits.map((e) => h("span", { class: "edit", text: e })),
+      ),
+    );
+  }
+  return h("div", { class: `thread-entry author-${entry.author}` }, ...children);
+}
+
+function actionButtons(c) {
+  if (c.status === "open") {
+    return [
+      h("button", { class: "cmt-reply", type: "button", text: "Reply",
+        onclick: () => promptReply(c.id) }),
+      h("button", { class: "cmt-resolve", type: "button", text: "Resolve",
+        onclick: () => promptResolve(c.id) }),
+      h("button", { class: "cmt-dismiss", type: "button", text: "Dismiss",
+        onclick: () => promptDismiss(c.id) }),
+      h("button", { class: "cmt-delete", type: "button", text: "Delete",
+        onclick: () => { if (confirm(`Permanently delete ${c.id}?`)) doMutation(c.id, "delete", {}); } }),
+    ];
+  }
+  return [
+    h("button", { class: "cmt-reopen", type: "button", text: "Reopen",
+      onclick: () => doMutation(c.id, "reopen", {}) }),
+    h("button", { class: "cmt-delete", type: "button", text: "Delete",
+      onclick: () => { if (confirm(`Permanently delete ${c.id}?`)) doMutation(c.id, "delete", {}); } }),
+  ];
+}
+
+function anchorLabel(anchor) {
+  if (!anchor) return "[?]";
+  switch (anchor.kind) {
+    case "paper": return "[paper]";
+    case "section": return `[section: ${anchor.title}]`;
+    case "source_range": return `[${anchor.file}:${anchor.line_start}-${anchor.line_end}]`;
+    case "pdf_region": return `[pdf p${anchor.page}]`;
+    default: return "[?]";
+  }
+}
+
+function updateCommentCount() {
+  const open = state.comments.filter((c) => c.status === "open").length;
+  $("#comment-count").textContent = `${open} open`;
+}
+
+// ---------------------------------------------------------------------------
+// Comment mutations
+// ---------------------------------------------------------------------------
+
+async function doMutation(cid, action, body) {
+  let url, method;
+  if (action === "delete") {
+    url = `/comments/${cid}`;
+    method = "DELETE";
+    body = null;
+  } else {
+    url = `/comments/${cid}/${action}`;
+    method = "POST";
+  }
+  const opts = { method };
+  if (body) {
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const resp = await fetch(url, opts);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      alert(`Action failed: ${err.error || resp.status}`);
+      return;
+    }
+    await refreshComments();
+  } catch (err) {
+    alert(`Network error: ${err.message}`);
+  }
+}
+
+function promptResolve(cid) {
+  const summary = prompt("Resolve summary (what was changed)?");
+  if (!summary) return;
+  doMutation(cid, "resolve", { summary, author: "human" });
+}
+
+function promptDismiss(cid) {
+  const reason = prompt("Dismiss reason?");
+  if (!reason) return;
+  doMutation(cid, "dismiss", { reason });
+}
+
+function promptReply(cid) {
+  const text = prompt("Reply:");
+  if (!text) return;
+  doMutation(cid, "reply", { text, author: "human" });
+}
+
+// ---------------------------------------------------------------------------
+// Annotation overlays
+// ---------------------------------------------------------------------------
+
+function refreshAnnotationOverlays() {
+  for (const p of state.pages) clear(p.overlay);
+  for (const c of state.comments) {
+    if (c.anchor.kind !== "pdf_region") continue;
+    if (c.status !== "open") continue;
+    const pageInfo = state.pages.find((p) => p.pageNum === c.anchor.page);
+    if (!pageInfo) continue;
+    const [x1, y1, x2, y2] = c.anchor.bbox;
+    const left = x1 * state.renderScale;
+    const top = y1 * state.renderScale;
+    const width = Math.max((x2 - x1) * state.renderScale, 6);
+    const height = Math.max((y2 - y1) * state.renderScale, 14);
+    const mark = h("a", {
+      class: "annotation-mark",
+      title: c.thread[0]?.text || "",
+      data: { cid: c.id },
+      style: {
+        left: `${left}px`,
+        top: `${top}px`,
+        width: `${width}px`,
+        height: `${height}px`,
+      },
+      onclick: (ev) => {
+        ev.preventDefault();
+        state.expanded.add(c.id);
+        switchTab("comments");
+        renderComments();
+        const node = document.querySelector(`[data-comment-id="${c.id}"]`);
+        node?.scrollIntoView({ behavior: "smooth", block: "center" });
+      },
+    });
+    pageInfo.overlay.appendChild(mark);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Errors / paper tabs
+// ---------------------------------------------------------------------------
+
+function renderErrors() {
+  const list = $("#errors-list");
+  clear(list);
+  const items = [
+    ...state.errors.map((e) => ({ ...e, level: "error" })),
+    ...state.warnings.map((w) => ({ ...w, level: "warning" })),
+  ];
+  if (items.length === 0) {
+    list.appendChild(placeholder("No errors or warnings."));
+    return;
+  }
+  for (const e of items) {
+    const children = [
+      h("div", {
+        class: "err-loc",
+        text: `${e.file || ""}${e.line ? ":" + e.line : ""}`,
+      }),
+      h("div", { class: "err-msg", text: e.message || "" }),
+    ];
+    if (e.context && e.context.length > 0) {
+      children.push(h("pre", { class: "err-context", text: e.context.join("\n") }));
+    }
+    list.appendChild(h("div", { class: `err-item err-${e.level}` }, ...children));
+  }
+}
+
+async function refreshPaper() {
+  try {
+    const resp = await fetch("/paper");
+    const data = await resp.json();
+    state.paper = data;
+    renderPaper();
+  } catch (err) {
+    console.warn("refreshPaper failed:", err);
+  }
+}
+
+function renderPaper() {
+  const info = $("#paper-info");
+  clear(info);
+  if (!state.paper) {
+    info.appendChild(placeholder("Loading…"));
+    return;
+  }
+  const p = state.paper;
+  const compile = p.last_compile || {};
+  const compileText =
+    compile.success === true
+      ? "✓ success"
+      : compile.success === false
+        ? "✗ failed"
+        : "— (none yet)";
+  const duration =
+    typeof compile.duration_seconds === "number"
+      ? ` · ${compile.duration_seconds.toFixed(2)}s`
+      : "";
+
+  const summary = h("div", { class: "paper-summary" },
+    h("div", null,
+      h("strong", { text: "Main: " }),
+      p.main_file || "?"),
+    h("div", null,
+      h("strong", { text: "Last compile: " }),
+      compileText + duration),
+    h("div", null,
+      h("strong", { text: "Sections: " }),
+      String(p.sections?.length || 0),
+      " · ",
+      h("strong", { text: "Labels: " }),
+      String(p.labels?.length || 0),
+      " · ",
+      h("strong", { text: "Citations: " }),
+      String(p.citations?.length || 0)),
+    h("div", null,
+      h("strong", { text: "Comments: " }),
+      `${p.comments.open} open · ${p.comments.resolved} resolved · ${p.comments.dismissed} dismissed${p.comments.stale ? ` · ${p.comments.stale} stale` : ""}`),
+  );
+  info.appendChild(summary);
+  info.appendChild(h("h4", { text: "Sections" }));
+
+  const list = h("ul", { class: "paper-sections" });
+  for (const s of p.sections || []) {
+    list.appendChild(
+      h("li", { class: `paper-section level-${s.level}` },
+        h("span", { class: "paper-section-title", text: s.title }),
+        h("span", { class: "paper-section-loc", text: `${s.file}:${s.line}` }),
+        h("button", {
+          class: "comment-section-btn",
+          type: "button",
+          text: "+ comment",
+          onclick: () =>
+            openCompose({ kind: "section", title: s.title }, `Section: ${s.title}`),
+        }),
+      ),
+    );
+  }
+  info.appendChild(list);
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+function switchTab(name) {
+  for (const btn of $$(".tab-btn")) {
+    btn.classList.toggle("active", btn.dataset.tab === name);
+  }
+  for (const pane of $$(".tab-pane")) {
+    pane.classList.toggle("active", pane.id === `tab-${name}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+  state.ws = ws;
+  ws.onmessage = (ev) => {
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    handleWSMessage(msg);
+  };
+  ws.onclose = () => setTimeout(connectWS, 2000);
+}
+
+function handleWSMessage(msg) {
+  switch (msg.type) {
+    case "compiling":
+      $("#compile-status").textContent = msg.status ? "compiling…" : "idle";
+      break;
+    case "compiled": {
+      const r = msg.result || {};
+      state.errors = r.errors || [];
+      state.warnings = r.warnings || [];
+      $("#compile-status").textContent = r.success ? "✓ ok" : "✗ failed";
+      $("#error-count").textContent = `${state.errors.length} errors`;
+      renderErrors();
+      if (r.success) loadPdf();
+      refreshPaper();
+      break;
+    }
+    case "comment_added":
+    case "comment_updated":
+    case "comment_deleted":
+      refreshComments();
+      break;
+    case "state":
+      if (msg.result) {
+        state.errors = msg.result.errors || [];
+        state.warnings = msg.result.warnings || [];
+        $("#compile-status").textContent = msg.result.success ? "✓ ok" : "✗ failed";
+        $("#error-count").textContent = `${state.errors.length} errors`;
+        renderErrors();
+      }
+      break;
+    case "goto":
+      if (msg.page) jumpToPage(msg.page);
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Navigation
+// ---------------------------------------------------------------------------
+
+function jumpToPage(pageNum) {
+  const p = state.pages.find((x) => x.pageNum === pageNum);
+  if (p) p.wrap.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function jumpToComment(cid) {
+  const c = state.comments.find((x) => x.id === cid);
+  if (!c) return;
+  if (c.anchor.kind === "pdf_region") {
+    jumpToPage(c.anchor.page);
+  } else if (c.resolved_source) {
+    try {
+      const params = new URLSearchParams({
+        file: c.resolved_source.file,
+        line: String(c.resolved_source.line_start),
+      });
+      const resp = await fetch(`/synctex/source-to-pdf?${params}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.page) jumpToPage(data.page);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+function init() {
+  attachSelectionListener();
+
+  $("#recompile-btn").addEventListener("click", () => fetch("/compile", { method: "POST" }));
+  $("#paper-comment-btn").addEventListener("click", () =>
+    openCompose({ kind: "paper" }, "Paper-level comment"),
+  );
+  $("#comment-selection-btn").addEventListener("click", () => {
+    const tb = $("#selection-toolbar");
+    const region = tb.dataset.region ? JSON.parse(tb.dataset.region) : null;
+    if (!region) return;
+    tb.classList.add("hidden");
+    openCompose(
+      { kind: "pdf_region", page: region.page, bbox: region.bbox },
+      `PDF p${region.page}: "${region.text.slice(0, 80)}${region.text.length > 80 ? "…" : ""}"`,
+    );
+  });
+
+  $("#compose-form").addEventListener("submit", submitCompose);
+  $("#compose-cancel").addEventListener("click", (ev) => {
+    ev.preventDefault();
+    $("#compose-dialog").close();
+  });
+  $("#comment-filter").addEventListener("change", refreshComments);
+
+  for (const btn of $$(".tab-btn")) {
+    btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+  }
+
+  connectWS();
+  loadPdf();
+  refreshComments();
+  refreshPaper();
+}
+
+document.addEventListener("DOMContentLoaded", init);
