@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "texwatch"
-version = "0.5.1"
+version = "0.5.2"
 description = "Agentic-first review tool for LaTeX papers: live PDF preview + comment queue, designed for Claude Code as author"
 readme = "README.md"
 license = "MIT"

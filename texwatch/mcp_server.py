@@ -122,7 +122,10 @@ def _comment_add(
         resolved = ResolvedSource(file=file, line_start=ls, line_end=le)
     elif kind == "section":
         resolved = resolve_section_to_source(
-            parse_structure(watch_dir), watch_dir, anchor.get("title"), anchor.get("label")
+            parse_structure(watch_dir, get_main_file(cfg)),
+            watch_dir,
+            anchor.get("title"),
+            anchor.get("label"),
         )
     elif kind == "pdf_region":
         synctex = load_synctex_for_main(get_main_file(cfg))
@@ -186,8 +189,9 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         from .structure import parse_structure
 
         cfg, watch_dir, store = _load_project()
-        structure = parse_structure(watch_dir)
-        pdf_path = get_main_file(cfg).with_suffix(".pdf")
+        main = get_main_file(cfg)
+        structure = parse_structure(watch_dir, main)
+        pdf_path = main.with_suffix(".pdf")
 
         result: dict[str, Any] = {
             "main_file": cfg.main,

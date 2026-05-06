@@ -59,6 +59,7 @@ _SECTION_PREFIX_RE = re.compile(
     r"\\(chapter|section|subsection|subsubsection)\*?(?:\[[^\]]*\])?"
 )
 _LABEL_RE = re.compile(r"\\label\{([^}]+)\}")
+_INPUT_RE = re.compile(r"\\(?:input|include)\{([^}]+)\}")
 
 
 def _count_preceding_backslashes(text: str, pos: int) -> int:
@@ -104,15 +105,57 @@ def _strip_comment(line: str) -> str:
     return line
 
 
-def _find_tex_files(watch_dir: Path) -> list[Path]:
-    return sorted(watch_dir.rglob("*.tex"))
-
-
 def _relative(path: Path, watch_dir: Path) -> str:
     try:
         return str(path.relative_to(watch_dir))
     except ValueError:
         return str(path)
+
+
+def _resolve_input(arg: str, parent_dir: Path, watch_dir: Path) -> Path | None:
+    """Resolve an ``\\input{...}`` argument to a real .tex file path.
+
+    LaTeX appends `.tex` if missing, and resolves relative to either the
+    parent file's directory or the project root.  We try both.
+    """
+    candidates: list[Path] = []
+    for base in (parent_dir, watch_dir):
+        for suffix in ("", ".tex"):
+            p = (base / (arg + suffix)).resolve()
+            if p.is_file():
+                return p
+            candidates.append(p)
+    logger.debug("structure: could not resolve \\input{%s}; tried %s", arg, candidates)
+    return None
+
+
+def _files_reachable_from(main_file: Path, watch_dir: Path) -> list[Path]:
+    """Walk \\input / \\include from *main_file* and return the set of
+    .tex files actually used in the build.  Avoids picking up unbuilt
+    variant files that happen to live in the same directory.
+    """
+    seen: set[Path] = set()
+    out: list[Path] = []
+    stack: list[Path] = [main_file.resolve()]
+    while stack:
+        path = stack.pop()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        out.append(path)
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line_no, raw_line in enumerate(content.splitlines(), start=1):
+            if raw_line.lstrip().startswith("%"):
+                continue
+            line = _strip_comment(raw_line)
+            for m in _INPUT_RE.finditer(line):
+                resolved = _resolve_input(m.group(1).strip(), path.parent, watch_dir)
+                if resolved is not None and resolved not in seen:
+                    stack.append(resolved)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +207,26 @@ def _parse_sections(content: str, rel_path: str) -> list[Section]:
 # ---------------------------------------------------------------------------
 
 
-def parse_structure(watch_dir: Path) -> DocumentStructure:
-    """Parse sections across every .tex file under *watch_dir*."""
+def parse_structure(
+    watch_dir: Path, main_file: Path | None = None
+) -> DocumentStructure:
+    """Parse sections across the .tex files used in the build.
+
+    When *main_file* is provided, the parser starts there and follows
+    ``\\input`` / ``\\include`` recursively.  This avoids picking up
+    unbuilt variant files (e.g. ``paper-full-proofs.tex`` next to a
+    main ``paper.tex``) that live in the same directory but aren't part
+    of the active build.
+
+    When *main_file* is None (legacy call sites), falls back to walking
+    every ``*.tex`` under *watch_dir*.
+    """
     structure = DocumentStructure()
-    for path in _find_tex_files(watch_dir):
+    if main_file is not None and main_file.is_file():
+        files = _files_reachable_from(main_file, watch_dir)
+    else:
+        files = sorted(watch_dir.rglob("*.tex"))
+    for path in files:
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:

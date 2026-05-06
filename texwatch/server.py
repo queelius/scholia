@@ -254,7 +254,7 @@ class TexWatchServer:
                     if synctex_path:
                         self.synctex_data = parse_synctex(synctex_path)
                 # Refresh structure
-                self.structure = parse_structure(self.watch_dir)
+                self.structure = parse_structure(self.watch_dir, self.main_file)
                 # Re-check staleness of open comments
                 if self.structure:
                     self.comments.check_staleness(
@@ -338,7 +338,7 @@ class TexWatchServer:
 
     async def _handle_paper(self, request: web.Request) -> web.Response:
         if self.structure is None:
-            self.structure = parse_structure(self.watch_dir)
+            self.structure = parse_structure(self.watch_dir, self.main_file)
 
         return web.json_response(
             {
@@ -420,7 +420,7 @@ class TexWatchServer:
 
         if isinstance(anchor, SectionAnchor):
             if self.structure is None:
-                self.structure = parse_structure(self.watch_dir)
+                self.structure = parse_structure(self.watch_dir, self.main_file)
             return (
                 resolve_section_to_source(
                     self.structure, self.watch_dir, anchor.title, anchor.label
@@ -594,7 +594,7 @@ class TexWatchServer:
 
         if section or label:
             if self.structure is None:
-                self.structure = parse_structure(self.watch_dir)
+                self.structure = parse_structure(self.watch_dir, self.main_file)
             match = find_section(
                 self.structure,
                 title=section if section else None,
