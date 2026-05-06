@@ -1,3 +1,3 @@
-"""texwatch - TeX file watcher with browser-based PDF viewer."""
+"""texwatch — agentic-first review tool for LaTeX papers."""
 
-__version__ = "0.3.0"
+__version__ = "0.5.2"

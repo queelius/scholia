@@ -1,141 +1,77 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>texwatch</title>
-    <link rel="stylesheet" href="/static/style.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
-    <script type="importmap">
-    {
-        "imports": {
-            "@codemirror/state": "https://esm.sh/@codemirror/state",
-            "@codemirror/view": "https://esm.sh/@codemirror/view?external=@codemirror/state",
-            "@codemirror/language": "https://esm.sh/@codemirror/language?external=@codemirror/state,@codemirror/view",
-            "codemirror": "https://esm.sh/codemirror?external=@codemirror/state,@codemirror/view,@codemirror/language",
-            "@codemirror/legacy-modes/mode/stex": "https://esm.sh/@codemirror/legacy-modes/mode/stex?external=@codemirror/language",
-            "@codemirror/theme-one-dark": "https://esm.sh/@codemirror/theme-one-dark?external=@codemirror/state,@codemirror/view,@codemirror/language",
-            "@codemirror/autocomplete": "https://esm.sh/@codemirror/autocomplete?external=@codemirror/state,@codemirror/view,@codemirror/language"
-        }
-    }
-    </script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>texwatch</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs" type="module"></script>
 </head>
 <body>
-    <header>
-        <div class="header-left">
-            <a id="back-link" href="/" class="back-link" style="display:none" title="Back to dashboard">&#x2190;</a>
-            <h1>texwatch: <span id="filename">loading...</span></h1>
-        </div>
-        <div class="header-right">
-            <span id="status-indicator" class="status watching">Watching</span>
-            <div class="zoom-controls">
-                <button id="btn-zoom-out" title="Zoom out">&#x2212;</button>
-                <span id="zoom-level">150%</span>
-                <button id="btn-zoom-in" title="Zoom in">&#x2b;</button>
-                <select id="zoom-select" title="Zoom preset">
-                    <option value="fit-width">Fit width</option>
-                    <option value="fit-page">Fit page</option>
-                    <option value="0.75">75%</option>
-                    <option value="1.0">100%</option>
-                    <option value="1.5" selected>150%</option>
-                    <option value="2.0">200%</option>
-                </select>
-            </div>
-            <button id="btn-scroll-mode" title="Toggle continuous scroll">&#x2195;</button>
-            <button id="btn-refresh" title="Force recompile">&#x21bb;</button>
-            <button id="btn-settings" title="Settings">&#x2699;</button>
-        </div>
-    </header>
+<div id="app">
+  <header class="topbar">
+    <h1>texwatch</h1>
+    <div class="status">
+      <span id="compile-status">idle</span>
+      <span class="sep">·</span>
+      <span id="error-count">0 errors</span>
+      <span class="sep">·</span>
+      <span id="comment-count">0 open</span>
+    </div>
+    <div class="actions">
+      <button id="recompile-btn" type="button">Recompile</button>
+      <button id="paper-comment-btn" type="button" title="Add a paper-level comment">+ Note</button>
+    </div>
+  </header>
 
-    <main>
-        <div id="file-tree-pane">
-            <div id="sidebar-tabs">
-                <button class="sidebar-tab active" data-tab="files">Files</button>
-                <button class="sidebar-tab" data-tab="dashboard">Dashboard</button>
-                <button id="btn-toggle-tree" title="Toggle sidebar">&#x25c0;</button>
-            </div>
-            <div id="tree-container"></div>
-            <div id="dashboard-container" style="display:none">
-                <details class="dashboard-panel" id="panel-health" open>
-                    <summary>Health <span class="badge" id="badge-health"></span></summary>
-                    <div class="panel-content" id="content-health"></div>
-                </details>
-                <details class="dashboard-panel" id="panel-sections" open>
-                    <summary>Sections <span class="badge" id="badge-sections"></span></summary>
-                    <div class="panel-content" id="content-sections"></div>
-                </details>
-                <details class="dashboard-panel" id="panel-issues">
-                    <summary>Issues <span class="badge" id="badge-issues"></span></summary>
-                    <div class="panel-content" id="content-issues"></div>
-                </details>
-                <details class="dashboard-panel" id="panel-bibliography">
-                    <summary>Bibliography <span class="badge" id="badge-bibliography"></span></summary>
-                    <div class="panel-content" id="content-bibliography"></div>
-                </details>
-                <details class="dashboard-panel" id="panel-changes">
-                    <summary>Changes <span class="badge" id="badge-changes"></span></summary>
-                    <div class="panel-content" id="content-changes"></div>
-                </details>
-                <details class="dashboard-panel" id="panel-environments">
-                    <summary>Environments <span class="badge" id="badge-environments"></span></summary>
-                    <div class="panel-content" id="content-environments"></div>
-                </details>
-            </div>
-        </div>
-        <div id="tree-handle"></div>
-        <div id="editor-pane">
-            <div id="editor-header">
-                <span id="editor-filename">loading...</span>
-                <div class="editor-header-right">
-                    <button id="btn-word-wrap" title="Toggle word wrap">&#x21A9;</button>
-                    <span id="editor-status"></span>
-                </div>
-            </div>
-            <div id="conflict-bar" class="hidden">
-                <span>File changed on disk.</span>
-                <button id="btn-reload">Reload</button>
-                <button id="btn-keep">Keep mine</button>
-            </div>
-            <div id="editor-container"></div>
-        </div>
-        <div id="split-handle"></div>
-        <div id="viewer-pane">
-            <div id="pdf-container">
-                <canvas id="pdf-canvas"></canvas>
-                <div id="text-layer" class="textLayer"></div>
-                <div id="pdf-highlight"></div>
-            </div>
-            <div id="markdown-preview" class="hidden"></div>
-        </div>
-    </main>
+  <main class="layout">
+    <section id="pdf-pane">
+      <div id="pdf-canvas-host">
+        <p class="placeholder">No PDF yet — waiting for first compile…</p>
+      </div>
+      <div id="selection-toolbar" class="hidden">
+        <button id="comment-selection-btn" type="button">Comment on selection</button>
+      </div>
+    </section>
 
-    <footer>
-        <div id="error-panel" class="collapsed">
-            <div id="error-header">
-                <span id="error-summary">No issues</span>
-                <div class="error-header-buttons">
-                    <button id="btn-show-log" title="Show compilation log">Log</button>
-                    <button id="btn-toggle-errors">&#x25bc;</button>
-                </div>
-            </div>
-            <div id="error-list"></div>
-            <div id="todo-list"></div>
-            <div id="log-viewer" class="hidden">
-                <pre id="log-content"></pre>
-            </div>
-        </div>
-        <div id="status-bar">
-            <span id="page-info">Page 1/1</span>
-            <span id="line-info"></span>
-            <span id="compile-info">Ready</span>
-        </div>
-    </footer>
+    <aside id="sidebar">
+      <div class="sidebar-tabs">
+        <button class="tab-btn active" data-tab="comments">Comments</button>
+        <button class="tab-btn" data-tab="paper">Paper</button>
+      </div>
 
-    <script src="/static/dashboard.js"></script>
-    <script src="/static/filetree.js"></script>
-    <script src="/static/viewer.js"></script>
-    <script src="/static/awareness.js"></script>
-    <script type="module" src="/static/editor.js"></script>
+      <div id="tab-comments" class="tab-pane active">
+        <div id="error-banner" class="error-banner hidden"></div>
+        <div class="filter-row">
+          <select id="comment-filter">
+            <option value="open" selected>open</option>
+            <option value="resolved">resolved</option>
+            <option value="dismissed">dismissed</option>
+            <option value="all">all</option>
+          </select>
+        </div>
+        <div id="comments-list" class="comments-list"></div>
+      </div>
+
+      <div id="tab-paper" class="tab-pane">
+        <div id="paper-info" class="paper-info"><p class="placeholder">Loading…</p></div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<dialog id="compose-dialog">
+  <form method="dialog" id="compose-form">
+    <h3 id="compose-title">New comment</h3>
+    <p id="compose-anchor" class="compose-anchor"></p>
+    <textarea id="compose-text" rows="4" required placeholder="leave a comment for Claude Code…"></textarea>
+    <div class="dialog-actions">
+      <button type="button" id="compose-cancel">Cancel</button>
+      <button type="submit" id="compose-submit">Post</button>
+    </div>
+  </form>
+</dialog>
+
+<script type="module" src="/static/viewer.js"></script>
 </body>
 </html>
