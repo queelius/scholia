@@ -1,3 +1,3 @@
-"""texwatch — review-style commenting and live PDF preview for LaTeX papers."""
+"""texwatch — agentic-first review tool for LaTeX papers."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

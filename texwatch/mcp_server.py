@@ -88,7 +88,6 @@ def _comment_add(
     text: str | None,
     anchor: dict[str, Any] | None,
     author: str,
-    tags: list[str] | None,
 ) -> str:
     """Implementation of ``texwatch_comment(action="add", ...)``.
 
@@ -119,9 +118,7 @@ def _comment_add(
         ls = int(anchor["line_start"])
         le = int(anchor["line_end"])
         snippet = capture_snippet(watch_dir / file, ls, le) or None
-        resolved = ResolvedSource(
-            file=file, line_start=ls, line_end=le, excerpt=snippet or ""
-        )
+        resolved = ResolvedSource(file=file, line_start=ls, line_end=le)
     elif kind == "section":
         resolved = resolve_section_to_source(
             parse_structure(watch_dir), watch_dir, anchor.get("title"), anchor.get("label")
@@ -141,13 +138,11 @@ def _comment_add(
                 )
                 or None
             )
-            resolved.excerpt = snippet or ""
 
     comment = store.add(
         anchor=a,
         text=text,
         author=author,
-        tags=tags or [],
         resolved_source=resolved,
         snippet=snippet,
     )
@@ -164,12 +159,26 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
     mcp = FastMCP("texwatch")
 
     @mcp.tool()
-    async def texwatch_paper() -> str:
-        """Full paper state: sections (with line ranges), labels, citations,
-        \\input refs, last compile result if available, and comment summary.
+    async def texwatch_paper(
+        include_comments: bool = True,
+        comments_status: str = "open",
+    ) -> str:
+        """The "what does my paper look like right now" oracle.
 
-        This is the "what does my paper look like right now" oracle.  Call
-        once per session to orient.
+        Returns:
+          - main_file, watch_dir
+          - sections (with title, label, file, line, line_end)
+          - compile_cache (pdf path + whether it exists)
+          - comments[] (full list of comments at the requested status)
+
+        Section parsing is deliberately the only structure we hand back;
+        for labels, citations, and \\input refs, use ``Grep``.
+
+        Args:
+            include_comments: if False, the ``comments`` field is omitted
+                (useful when you only need orientation, not the queue).
+            comments_status: ``"open"`` (default), ``"resolved"``,
+                ``"dismissed"``, or ``"all"``.
         """
         from .config import get_main_file
         from .server import structure_to_dict
@@ -177,28 +186,22 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
 
         cfg, watch_dir, store = _load_project()
         structure = parse_structure(watch_dir)
-
-        # Read cached compile output (use texwatch_compile() to trigger a build).
         pdf_path = get_main_file(cfg).with_suffix(".pdf")
-        open_comments = store.list(status="open")
 
-        return _ok(
-            {
-                "main_file": cfg.main,
-                "watch_dir": str(watch_dir),
-                **structure_to_dict(structure, watch_dir),
-                "compile_cache": {
-                    "pdf_exists": pdf_path.exists(),
-                    "pdf_path": str(pdf_path),
-                },
-                "comments": {
-                    "open": len(open_comments),
-                    "resolved": len(store.list(status="resolved")),
-                    "dismissed": len(store.list(status="dismissed")),
-                    "stale": sum(1 for c in open_comments if c.stale),
-                },
-            }
-        )
+        result: dict[str, Any] = {
+            "main_file": cfg.main,
+            "watch_dir": str(watch_dir),
+            **structure_to_dict(structure, watch_dir),
+            "compile_cache": {
+                "pdf_exists": pdf_path.exists(),
+                "pdf_path": str(pdf_path),
+            },
+        }
+        if include_comments:
+            s = None if comments_status == "all" else comments_status
+            comments = store.list(status=s)  # type: ignore[arg-type]
+            result["comments"] = [c.to_dict() for c in comments]
+        return _ok(result)
 
     @mcp.tool()
     async def texwatch_compile() -> str:
@@ -218,23 +221,6 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         return _ok(_result_to_dict(result))
 
     @mcp.tool()
-    async def texwatch_comments(
-        status: str = "open",
-        tags: list[str] | None = None,
-    ) -> str:
-        """List paper review comments.
-
-        status: "open" | "resolved" | "dismissed" | "all"
-        tags: optional filter; comments with any matching tag are returned.
-
-        Each comment has an anchor (paper / section / source_range / pdf_region),
-        a thread of entries, an optional resolved_source, and a stale flag.
-        """
-        _, _, store = _load_project()
-        comments = store.list(status=None if status == "all" else status, tags=tags)
-        return _ok({"comments": [c.to_dict() for c in comments]})
-
-    @mcp.tool()
     async def texwatch_comment(
         action: str,
         id: str | None = None,
@@ -243,7 +229,6 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         summary: str | None = None,
         reason: str | None = None,
         edits: list[str] | None = None,
-        tags: list[str] | None = None,
         author: str = "claude",
     ) -> str:
         """Mutate a comment.
@@ -253,7 +238,6 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
           - reply:   append a thread entry.  Required: id + text.
           - resolve: mark resolved.          Required: id + summary.
           - dismiss: mark dismissed.         Required: id + reason.
-          - reopen:  reopen a closed one.    Required: id.
           - delete:  permanently remove.     Required: id.
 
         Anchor formats (only for add):
@@ -262,16 +246,16 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
           {"kind": "source_range", "file": "intro.tex", "line_start": 42, "line_end": 58}
           {"kind": "pdf_region", "page": 3, "bbox": [x1, y1, x2, y2]}
 
-        Edits is a list of strings describing what was changed when resolving:
-          ["intro.tex:42-58 -> :42-78", "added theorem 2.1"]
+        Edits is an optional list of strings describing what changed when
+        resolving: ["intro.tex:42-58 -> :42-78"].
+
+        To list the comment queue, call ``texwatch_paper()`` (which
+        returns comments by default).
         """
         cfg, watch_dir, store = _load_project()
-
-        # Each handler returns the JSON response or an error string.
-        # We share the KeyError -> "not found" trap across all branches.
         try:
             if action == "add":
-                return _comment_add(store, cfg, watch_dir, text, anchor, author, tags)
+                return _comment_add(store, cfg, watch_dir, text, anchor, author)
             if action == "reply":
                 if not id or not text:
                     return _err("reply requires id and text")
@@ -290,10 +274,6 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
                 if not id or not reason:
                     return _err("dismiss requires id and reason")
                 return _ok(store.dismiss(id, reason=reason, author=author).to_dict())
-            if action == "reopen":
-                if not id:
-                    return _err("reopen requires id")
-                return _ok(store.reopen(id, author=author).to_dict())
             if action == "delete":
                 if not id:
                     return _err("delete requires id")

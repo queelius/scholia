@@ -1,16 +1,17 @@
-// texwatch v0.4.0 viewer
+// texwatch v0.5.0 viewer
 //
-// Responsibilities:
-//   1. Render the PDF via PDF.js with a text layer (for selection).
+// The browser is read-only by design.  The human is a reviewer; the
+// agent is the author.  The viewer's job:
+//
+//   1. Render the PDF via PDF.js with a selectable text layer.
 //   2. Subscribe to compile events over WebSocket; auto-reload on success.
-//   3. Display the comments queue in a sidebar; create / reply / resolve / dismiss.
-//   4. Convert text selections in the PDF into pdf_region anchors with bbox
-//      coords in PDF points (the unit SyncTeX speaks).
-//   5. Show structured errors when the build fails.
+//   3. Display the comments queue with inline reply/resolve/dismiss forms.
+//   4. Convert text selections in the PDF into pdf_region anchors with
+//      bbox coords in PDF points (the unit SyncTeX speaks).
+//   5. Surface compile errors as a small banner above the comments list.
 //
 // All DOM construction goes through the `h()` helper, which builds DOM
 // nodes via createElement/textContent — no innerHTML on dynamic data.
-// (Static empty-state HTML uses textContent, also safe.)
 
 import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs";
 
@@ -78,6 +79,8 @@ const state = {
   ws: null,
   pendingAnchor: null,
   expanded: new Set(),
+  // {cid, mode} when an inline reply/resolve/dismiss form is open.
+  activeForm: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -225,7 +228,6 @@ function openCompose(anchor, label) {
   state.pendingAnchor = anchor;
   $("#compose-anchor").textContent = label;
   $("#compose-text").value = "";
-  $("#compose-tags").value = "";
   $("#compose-dialog").showModal();
   setTimeout(() => $("#compose-text").focus(), 50);
 }
@@ -234,11 +236,7 @@ async function submitCompose(ev) {
   ev.preventDefault();
   const text = $("#compose-text").value.trim();
   if (!text || !state.pendingAnchor) return;
-  const tags = $("#compose-tags").value
-    .split(",")
-    .map((t) => t.trim())
-    .filter(Boolean);
-  const body = { anchor: state.pendingAnchor, text, tags, author: "human" };
+  const body = { anchor: state.pendingAnchor, text, author: "human" };
   $("#compose-dialog").close();
   state.pendingAnchor = null;
   try {
@@ -313,9 +311,6 @@ function renderCommentItem(c) {
       text: anchorLabel(c.anchor),
       onclick: () => jumpToComment(c.id),
     }),
-    h("span", { class: "cmt-tags" },
-      ...(c.tags || []).map((t) => h("span", { class: "tag", text: `#${t}` })),
-    ),
   ];
 
   const head = h("div", { class: "cmt-head" }, ...headChildren);
@@ -328,6 +323,8 @@ function renderCommentItem(c) {
       ...c.thread.map(renderThreadEntry));
     const actions = h("div", { class: "cmt-actions" }, ...actionButtons(c));
     children.push(thread, actions);
+    const inlineForm = renderActiveForm(c);
+    if (inlineForm) children.push(inlineForm);
   }
 
   return h("div", {
@@ -363,18 +360,77 @@ function confirmDelete(cid) {
 
 function actionButtons(c) {
   const deleteBtn = actionBtn("cmt-delete", "Delete", () => confirmDelete(c.id));
-  if (c.status === "open") {
-    return [
-      actionBtn("cmt-reply", "Reply", () => promptReply(c.id)),
-      actionBtn("cmt-resolve", "Resolve", () => promptResolve(c.id)),
-      actionBtn("cmt-dismiss", "Dismiss", () => promptDismiss(c.id)),
-      deleteBtn,
-    ];
-  }
+  if (c.status !== "open") return [deleteBtn];
   return [
-    actionBtn("cmt-reopen", "Reopen", () => doMutation(c.id, "reopen", {})),
+    actionBtn("cmt-reply", "Reply", () => setActiveForm(c.id, "reply")),
+    actionBtn("cmt-resolve", "Resolve", () => setActiveForm(c.id, "resolve")),
+    actionBtn("cmt-dismiss", "Dismiss", () => setActiveForm(c.id, "dismiss")),
     deleteBtn,
   ];
+}
+
+function setActiveForm(cid, mode) {
+  state.activeForm = { cid, mode };
+  state.expanded.add(cid);
+  renderComments();
+}
+
+const FORM_PLACEHOLDERS = {
+  reply: "Reply…",
+  resolve: "Summary of what was changed",
+  dismiss: "Why dismiss?",
+};
+const FORM_BODY_KEY = { reply: "text", resolve: "summary", dismiss: "reason" };
+const FORM_SUBMIT_LABEL = { reply: "Post reply", resolve: "Resolve", dismiss: "Dismiss" };
+
+function renderActiveForm(c) {
+  if (!state.activeForm || state.activeForm.cid !== c.id) return null;
+  const mode = state.activeForm.mode;
+  const ta = h("textarea", {
+    class: "cmt-form-input",
+    rows: 3,
+    placeholder: FORM_PLACEHOLDERS[mode],
+  });
+  // Focus after the element is in the DOM.
+  setTimeout(() => ta.focus(), 0);
+
+  const submit = () => {
+    const text = ta.value.trim();
+    if (!text) return;
+    const body = { author: "human" };
+    body[FORM_BODY_KEY[mode]] = text;
+    state.activeForm = null;
+    doMutation(c.id, mode, body);
+  };
+  ta.addEventListener("keydown", (ev) => {
+    // Cmd/Ctrl+Enter submits; Esc cancels.
+    if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") {
+      ev.preventDefault();
+      submit();
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      state.activeForm = null;
+      renderComments();
+    }
+  });
+
+  return h("div", { class: `cmt-form mode-${mode}` },
+    ta,
+    h("div", { class: "cmt-form-actions" },
+      h("button", {
+        class: "cmt-form-cancel",
+        type: "button",
+        text: "Cancel",
+        onclick: () => { state.activeForm = null; renderComments(); },
+      }),
+      h("button", {
+        class: "cmt-form-submit",
+        type: "button",
+        text: FORM_SUBMIT_LABEL[mode],
+        onclick: submit,
+      }),
+    ),
+  );
 }
 
 function anchorLabel(anchor) {
@@ -425,23 +481,7 @@ async function doMutation(cid, action, body) {
   }
 }
 
-function promptResolve(cid) {
-  const summary = prompt("Resolve summary (what was changed)?");
-  if (!summary) return;
-  doMutation(cid, "resolve", { summary, author: "human" });
-}
-
-function promptDismiss(cid) {
-  const reason = prompt("Dismiss reason?");
-  if (!reason) return;
-  doMutation(cid, "dismiss", { reason });
-}
-
-function promptReply(cid) {
-  const text = prompt("Reply:");
-  if (!text) return;
-  doMutation(cid, "reply", { text, author: "human" });
-}
+// (Inline forms via renderActiveForm replace the old prompt() based flow.)
 
 // ---------------------------------------------------------------------------
 // Annotation overlays
@@ -483,32 +523,32 @@ function refreshAnnotationOverlays() {
 }
 
 // ---------------------------------------------------------------------------
-// Errors / paper tabs
+// Compile error banner — shows above the comment list when the build
+// fails or warns; one entry per error/warning, expandable for context.
 // ---------------------------------------------------------------------------
 
-function renderErrors() {
-  const list = $("#errors-list");
-  clear(list);
+function renderErrorBanner() {
+  const banner = $("#error-banner");
+  clear(banner);
+  if (state.errors.length === 0 && state.warnings.length === 0) {
+    banner.classList.add("hidden");
+    return;
+  }
+  banner.classList.remove("hidden");
   const items = [
     ...state.errors.map((e) => ({ ...e, level: "error" })),
     ...state.warnings.map((w) => ({ ...w, level: "warning" })),
   ];
-  if (items.length === 0) {
-    list.appendChild(placeholder("No errors or warnings."));
-    return;
-  }
   for (const e of items) {
     const children = [
-      h("div", {
-        class: "err-loc",
-        text: `${e.file || ""}${e.line ? ":" + e.line : ""}`,
-      }),
+      h("div", { class: "err-loc",
+        text: `${e.file || ""}${e.line ? ":" + e.line : ""}` }),
       h("div", { class: "err-msg", text: e.message || "" }),
     ];
     if (e.context && e.context.length > 0) {
       children.push(h("pre", { class: "err-context", text: e.context.join("\n") }));
     }
-    list.appendChild(h("div", { class: `err-item err-${e.level}` }, ...children));
+    banner.appendChild(h("div", { class: `err-item err-${e.level}` }, ...children));
   }
 }
 
@@ -552,16 +592,7 @@ function renderPaper() {
       compileText + duration),
     h("div", null,
       h("strong", { text: "Sections: " }),
-      String(p.sections?.length || 0),
-      " · ",
-      h("strong", { text: "Labels: " }),
-      String(p.labels?.length || 0),
-      " · ",
-      h("strong", { text: "Citations: " }),
-      String(p.citations?.length || 0)),
-    h("div", null,
-      h("strong", { text: "Comments: " }),
-      `${p.comments.open} open · ${p.comments.resolved} resolved · ${p.comments.dismissed} dismissed${p.comments.stale ? ` · ${p.comments.stale} stale` : ""}`),
+      String(p.sections?.length || 0)),
   );
   info.appendChild(summary);
   info.appendChild(h("h4", { text: "Sections" }));
@@ -623,7 +654,7 @@ function applyCompileResult(r) {
   state.warnings = r.warnings || [];
   $("#compile-status").textContent = r.success ? "✓ ok" : "✗ failed";
   $("#error-count").textContent = `${state.errors.length} errors`;
-  renderErrors();
+  renderErrorBanner();
 }
 
 function handleWSMessage(msg) {

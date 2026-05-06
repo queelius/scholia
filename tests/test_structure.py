@@ -1,4 +1,4 @@
-"""Tests for the slimmed structure parser (sections, labels, citations, inputs)."""
+"""Tests for the slimmed structure parser (sections only)."""
 
 from __future__ import annotations
 
@@ -7,15 +7,9 @@ from pathlib import Path
 import pytest
 
 from texwatch.structure import (
-    Citation,
     DocumentStructure,
-    InputFile,
-    Label,
     Section,
     _extract_braced,
-    _parse_citations,
-    _parse_inputs,
-    _parse_labels,
     _parse_sections,
     _strip_comment,
     find_section,
@@ -109,73 +103,6 @@ class TestParseSections:
 
 
 # ---------------------------------------------------------------------------
-# Label parsing
-# ---------------------------------------------------------------------------
-
-
-class TestParseLabels:
-    def test_simple(self):
-        result = _parse_labels(r"\label{eq:foo}", "f.tex")
-        assert result == [Label(name="eq:foo", file="f.tex", line=1)]
-
-    def test_multiple_per_line(self):
-        result = _parse_labels(r"\label{a}\label{b}", "f.tex")
-        assert {l.name for l in result} == {"a", "b"}
-
-    def test_commented_label_ignored(self):
-        assert _parse_labels(r"% \label{ignored}", "f.tex") == []
-
-
-# ---------------------------------------------------------------------------
-# Citation parsing
-# ---------------------------------------------------------------------------
-
-
-class TestParseCitations:
-    def test_cite(self):
-        result = _parse_citations(r"See \cite{ref1}.", "f.tex")
-        assert result == [Citation(key="ref1", file="f.tex", line=1)]
-
-    def test_multiple_keys(self):
-        result = _parse_citations(r"See \cite{a, b , c}.", "f.tex")
-        assert [r.key for r in result] == ["a", "b", "c"]
-
-    def test_citep_citet(self):
-        result = _parse_citations(r"\citep{x} and \citet{y}.", "f.tex")
-        assert {r.key for r in result} == {"x", "y"}
-
-    def test_commented_cite_ignored(self):
-        result = _parse_citations(r"% \cite{hidden}", "f.tex")
-        assert result == []
-
-    def test_inline_comment_strips_cite(self):
-        result = _parse_citations(r"real \cite{a} % \cite{hidden}", "f.tex")
-        assert [r.key for r in result] == ["a"]
-
-
-# ---------------------------------------------------------------------------
-# Input parsing
-# ---------------------------------------------------------------------------
-
-
-class TestParseInputs:
-    def test_input(self):
-        assert _parse_inputs(r"\input{intro}", "main.tex") == [
-            InputFile(path="intro", file="main.tex", line=1)
-        ]
-
-    def test_include(self):
-        assert _parse_inputs(r"\include{appendix}", "main.tex") == [
-            InputFile(path="appendix", file="main.tex", line=1)
-        ]
-
-    def test_commented_input_ignored(self):
-        result = _parse_inputs("% \\input{old}\n\\input{real}\n", "main.tex")
-        assert len(result) == 1
-        assert result[0].path == "real"
-
-
-# ---------------------------------------------------------------------------
 # Integration
 # ---------------------------------------------------------------------------
 
@@ -193,8 +120,6 @@ class TestParseStructure:
             "\\input{chapters/methods}\n"
             "\\end{document}\n"
         )
-        preamble = tmp_path / "preamble.tex"
-        preamble.write_text("\\usepackage{amsmath}\n")
         chapters = tmp_path / "chapters"
         chapters.mkdir()
         (chapters / "methods.tex").write_text(
@@ -209,24 +134,6 @@ class TestParseStructure:
         ds = parse_structure(tmp_path)
         titles = {s.title for s in ds.sections}
         assert {"Introduction", "Methods"} <= titles
-
-    def test_parses_labels(self, tmp_path):
-        self._setup_project(tmp_path)
-        ds = parse_structure(tmp_path)
-        names = {l.name for l in ds.labels}
-        assert {"sec:intro", "sec:methods"} <= names
-
-    def test_parses_citations(self, tmp_path):
-        self._setup_project(tmp_path)
-        ds = parse_structure(tmp_path)
-        keys = {c.key for c in ds.citations}
-        assert keys == {"ref1", "ref2", "ref3"}
-
-    def test_parses_inputs(self, tmp_path):
-        self._setup_project(tmp_path)
-        ds = parse_structure(tmp_path)
-        paths = {i.path for i in ds.inputs}
-        assert {"preamble", "chapters/methods"} <= paths
 
     def test_section_picks_up_following_label(self, tmp_path):
         self._setup_project(tmp_path)

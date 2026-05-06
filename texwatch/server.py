@@ -21,7 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from aiohttp import WSMsgType, web
+from aiohttp import web
 
 from .comments import (
     Comment,
@@ -106,8 +106,10 @@ def resolve_section_to_source(
 def structure_to_dict(
     structure: DocumentStructure, watch_dir: Path
 ) -> dict[str, list[dict[str, Any]]]:
-    """JSON-serializable view of :class:`DocumentStructure`, with end-line
-    annotations for sections.  Shared by the HTTP and MCP ``paper`` views.
+    """JSON-serializable view of :class:`DocumentStructure`.
+
+    Sections only — labels / citations / inputs are deliberately omitted;
+    Claude Code can ``Grep`` for those better than our regex.
     """
     sections: list[dict[str, Any]] = []
     for s in structure.sections:
@@ -125,12 +127,7 @@ def structure_to_dict(
                 "label": s.label,
             }
         )
-    return {
-        "sections": sections,
-        "labels": [{"name": l.name, "file": l.file, "line": l.line} for l in structure.labels],
-        "citations": [{"key": c.key, "file": c.file, "line": c.line} for c in structure.citations],
-        "inputs": [{"path": i.path, "file": i.file, "line": i.line} for i in structure.inputs],
-    }
+    return {"sections": sections}
 
 
 def resolve_pdf_region_to_source(
@@ -182,6 +179,10 @@ class TexWatchServer:
         self.synctex_data: SyncTeXData | None = None
         self.structure: DocumentStructure | None = None
         self.compiling = False
+        # Serialize do_compile so the watcher and texwatch_compile() don't
+        # race; second caller awaits the in-flight build instead of
+        # starting a parallel one.
+        self._compile_lock = asyncio.Lock()
 
         self.comments = CommentStore(self.watch_dir / ".texwatch" / "comments.json")
         self.websockets: set[web.WebSocketResponse] = set()
@@ -197,7 +198,6 @@ class TexWatchServer:
         app.router.add_static("/static/", STATIC_DIR, name="static")
         app.router.add_get("/ws", self._handle_ws)
         app.router.add_get("/pdf", self._handle_pdf)
-        app.router.add_get("/errors", self._handle_errors)
         app.router.add_get("/paper", self._handle_paper)
         app.router.add_post("/compile", self._handle_compile)
         app.router.add_get("/comments", self._handle_list_comments)
@@ -206,51 +206,51 @@ class TexWatchServer:
         app.router.add_post(r"/comments/{id}/reply", self._handle_reply_comment)
         app.router.add_post(r"/comments/{id}/resolve", self._handle_resolve_comment)
         app.router.add_post(r"/comments/{id}/dismiss", self._handle_dismiss_comment)
-        app.router.add_post(r"/comments/{id}/reopen", self._handle_reopen_comment)
         app.router.add_delete(r"/comments/{id}", self._handle_delete_comment)
         app.router.add_get("/synctex/source-to-pdf", self._handle_synctex_forward)
-        app.router.add_get("/synctex/pdf-to-source", self._handle_synctex_reverse)
         app.router.add_post("/goto", self._handle_goto)
         return app
 
     # ----- compile + watch -----
 
     async def do_compile(self) -> CompileResult:
-        self.compiling = True
-        await self.broadcast({"type": "compiling", "status": True})
-        try:
-            self.last_result = await compile_tex(
-                main_file=self.main_file,
-                compiler=self.config.compiler,
-                work_dir=self.watch_dir,
-            )
-            # Reload SyncTeX
-            if self.last_result.output_file and self.main_file.suffix.lower() == ".tex":
-                synctex_path = find_synctex_file(self.last_result.output_file)
-                if synctex_path:
-                    self.synctex_data = parse_synctex(synctex_path)
-            # Refresh structure
-            self.structure = parse_structure(self.watch_dir)
-            # Re-check staleness of open comments
-            if self.structure:
-                self.comments.check_staleness(
-                    self.watch_dir,
-                    sections_resolver=lambda title, label: resolve_section_to_source(
-                        self.structure, self.watch_dir, title, label
-                    ),
+        # Serialize: if a build is already running, await it.
+        async with self._compile_lock:
+            self.compiling = True
+            await self.broadcast({"type": "compiling", "status": True})
+            try:
+                self.last_result = await compile_tex(
+                    main_file=self.main_file,
+                    compiler=self.config.compiler,
+                    work_dir=self.watch_dir,
                 )
-            logger.info(
-                "Compile %s in %.2fs",
-                "succeeded" if self.last_result.success else "failed",
-                self.last_result.duration_seconds,
-            )
-        finally:
-            self.compiling = False
-            await self.broadcast({"type": "compiling", "status": False})
-            await self.broadcast(
-                {"type": "compiled", "result": _result_to_dict(self.last_result)}
-            )
-        return self.last_result
+                # Reload SyncTeX
+                if self.last_result.output_file and self.main_file.suffix.lower() == ".tex":
+                    synctex_path = find_synctex_file(self.last_result.output_file)
+                    if synctex_path:
+                        self.synctex_data = parse_synctex(synctex_path)
+                # Refresh structure
+                self.structure = parse_structure(self.watch_dir)
+                # Re-check staleness of open comments
+                if self.structure:
+                    self.comments.check_staleness(
+                        self.watch_dir,
+                        sections_resolver=lambda title, label: resolve_section_to_source(
+                            self.structure, self.watch_dir, title, label
+                        ),
+                    )
+                logger.info(
+                    "Compile %s in %.2fs",
+                    "succeeded" if self.last_result.success else "failed",
+                    self.last_result.duration_seconds,
+                )
+            finally:
+                self.compiling = False
+                await self.broadcast({"type": "compiling", "status": False})
+                await self.broadcast(
+                    {"type": "compiled", "result": _result_to_dict(self.last_result)}
+                )
+            return self.last_result
 
     async def on_file_change(self, changed_path: str) -> None:
         logger.info("File change (%s); recompiling…", changed_path)
@@ -274,7 +274,7 @@ class TexWatchServer:
                     pass
 
     async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse(heartbeat=30)
+        ws = web.WebSocketResponse(heartbeat=30)  # heartbeat handles ping/pong
         await ws.prepare(request)
         self.websockets.add(ws)
         # Send initial state
@@ -286,14 +286,10 @@ class TexWatchServer:
             }
         )
         try:
-            async for raw in ws:
-                if raw.type == WSMsgType.TEXT:
-                    try:
-                        msg = json.loads(raw.data)
-                    except json.JSONDecodeError:
-                        continue
-                    if msg.get("type") == "ping":
-                        await ws.send_json({"type": "pong"})
+            async for _ in ws:
+                # The viewer is read-only; we don't accept any client-sent
+                # messages.  Iteration just keeps the socket alive.
+                pass
         finally:
             self.websockets.discard(ws)
         return ws
@@ -314,17 +310,7 @@ class TexWatchServer:
             headers={"Cache-Control": "no-store"},
         )
 
-    # ----- API: errors / paper / compile -----
-
-    async def _handle_errors(self, request: web.Request) -> web.Response:
-        r = self.last_result
-        return web.json_response(
-            {
-                "success": r.success if r else None,
-                "errors": [dataclasses.asdict(e) for e in (r.errors if r else [])],
-                "warnings": [dataclasses.asdict(w) for w in (r.warnings if r else [])],
-            }
-        )
+    # ----- API: paper / compile -----
 
     async def _handle_paper(self, request: web.Request) -> web.Response:
         if self.structure is None:
@@ -360,10 +346,7 @@ class TexWatchServer:
         status = request.query.get("status")
         if status not in ("open", "resolved", "dismissed"):
             status = None  # type: ignore[assignment]
-        comments = self.comments.list(
-            status=status,  # type: ignore[arg-type]
-            tags=request.query.getall("tag", []) or None,
-        )
+        comments = self.comments.list(status=status)  # type: ignore[arg-type]
         return web.json_response(
             {"comments": [_comment_to_dict(c) for c in comments]}
         )
@@ -396,7 +379,6 @@ class TexWatchServer:
             anchor=anchor,
             text=text,
             author=data.get("author", "human"),
-            tags=data.get("tags") or [],
             resolved_source=resolved,
             snippet=snippet,
         )
@@ -431,7 +413,6 @@ class TexWatchServer:
                     file=anchor.file,
                     line_start=anchor.line_start,
                     line_end=anchor.line_end,
-                    excerpt=snippet,
                 ),
                 snippet or None,
             )
@@ -445,7 +426,6 @@ class TexWatchServer:
             snippet = capture_snippet(
                 self.watch_dir / resolved.file, resolved.line_start, resolved.line_end
             )
-            resolved.excerpt = snippet
             return resolved, snippet or None
 
         return None, None
@@ -521,10 +501,6 @@ class TexWatchServer:
             ),
         )
 
-    async def _handle_reopen_comment(self, request: web.Request) -> web.Response:
-        cid = request.match_info["id"]
-        return await self._mutate_comment(cid, lambda: self.comments.reopen(cid))
-
     async def _handle_delete_comment(self, request: web.Request) -> web.Response:
         cid = request.match_info["id"]
         if not self.comments.delete(cid):
@@ -557,21 +533,6 @@ class TexWatchServer:
                 "height": pos.height,
             }
         )
-
-    async def _handle_synctex_reverse(self, request: web.Request) -> web.Response:
-        """PDF -> source: ?page=N&y=Y -> {file, line, column}"""
-        if self.synctex_data is None:
-            return web.json_response({"error": "no SyncTeX data"}, status=404)
-        try:
-            page = int(request.query.get("page", "0"))
-            y_str = request.query.get("y")
-            y = float(y_str) if y_str is not None else None
-        except ValueError:
-            return web.json_response({"error": "invalid page/y"}, status=400)
-        src = page_to_source(self.synctex_data, page, y)
-        if src is None:
-            return web.json_response({"error": "no match"}, status=404)
-        return web.json_response({"file": src.file, "line": src.line, "column": src.column})
 
     async def _handle_goto(self, request: web.Request) -> web.Response:
         """Tell the viewer to scroll/highlight a target.

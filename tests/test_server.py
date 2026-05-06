@@ -56,8 +56,14 @@ async def test_paper_endpoint_returns_structure(client):
     data = await resp.json()
     titles = {s["title"] for s in data["sections"]}
     assert {"Introduction", "Methods"} <= titles
-    assert {l["name"] for l in data["labels"]} == {"sec:intro", "sec:methods"}
-    assert data["citations"][0]["key"] == "ref1"
+    # v0.5.0: labels/citations/inputs are no longer exposed; the agent
+    # greps for them. Only sections come back.
+    assert "labels" not in data
+    assert "citations" not in data
+    assert "inputs" not in data
+    # Sections carry the label they're attached to.
+    methods = next(s for s in data["sections"] if s["title"] == "Methods")
+    assert methods["label"] == "sec:methods"
 
 
 @pytest.mark.asyncio
@@ -88,7 +94,6 @@ async def test_create_section_anchor_resolves_to_source(client):
         json={
             "anchor": {"kind": "section", "title": "Methods"},
             "text": "expand the methods section",
-            "tags": ["structure"],
         },
     )
     assert resp.status == 201
@@ -132,7 +137,7 @@ async def test_resolve_comment(client):
 
 
 @pytest.mark.asyncio
-async def test_dismiss_then_reopen(client):
+async def test_dismiss_marks_dismissed(client):
     tc, _ = client
     resp = await tc.post("/comments", json={"anchor": {"kind": "paper"}, "text": "x"})
     cid = (await resp.json())["id"]
@@ -140,8 +145,15 @@ async def test_dismiss_then_reopen(client):
     resp = await tc.post(f"/comments/{cid}/dismiss", json={"reason": "skip"})
     assert (await resp.json())["status"] == "dismissed"
 
+
+@pytest.mark.asyncio
+async def test_reopen_endpoint_is_gone(client):
+    """v0.5.0 dropped the reopen verb."""
+    tc, _ = client
+    resp = await tc.post("/comments", json={"anchor": {"kind": "paper"}, "text": "x"})
+    cid = (await resp.json())["id"]
     resp = await tc.post(f"/comments/{cid}/reopen", json={})
-    assert (await resp.json())["status"] == "open"
+    assert resp.status == 404  # route doesn't exist
 
 
 @pytest.mark.asyncio

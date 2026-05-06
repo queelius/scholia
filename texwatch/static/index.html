@@ -37,11 +37,11 @@
     <aside id="sidebar">
       <div class="sidebar-tabs">
         <button class="tab-btn active" data-tab="comments">Comments</button>
-        <button class="tab-btn" data-tab="errors">Errors</button>
         <button class="tab-btn" data-tab="paper">Paper</button>
       </div>
 
       <div id="tab-comments" class="tab-pane active">
+        <div id="error-banner" class="error-banner hidden"></div>
         <div class="filter-row">
           <select id="comment-filter">
             <option value="open" selected>open</option>
@@ -51,10 +51,6 @@
           </select>
         </div>
         <div id="comments-list" class="comments-list"></div>
-      </div>
-
-      <div id="tab-errors" class="tab-pane">
-        <div id="errors-list" class="errors-list"><p class="placeholder">No errors.</p></div>
       </div>
 
       <div id="tab-paper" class="tab-pane">
@@ -69,9 +65,6 @@
     <h3 id="compose-title">New comment</h3>
     <p id="compose-anchor" class="compose-anchor"></p>
     <textarea id="compose-text" rows="4" required placeholder="leave a comment for Claude Code…"></textarea>
-    <div class="compose-row">
-      <input id="compose-tags" type="text" placeholder="tags (comma-separated, optional)">
-    </div>
     <div class="dialog-actions">
       <button type="button" id="compose-cancel">Cancel</button>
       <button type="submit" id="compose-submit">Post</button>

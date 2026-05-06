@@ -146,13 +146,13 @@ class ResolvedSource:
 
     For PDF region / section anchors, this is computed by the server from
     SyncTeX or document structure.  Stored alongside the comment so Claude
-    Code can read the comment without re-resolving.
+    Code can read the comment without re-resolving.  Source content lives
+    in :attr:`Comment.snippet`; we don't duplicate it here.
     """
 
     file: str
     line_start: int
     line_end: int
-    excerpt: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -163,7 +163,6 @@ class ResolvedSource:
             file=str(d.get("file", "")),
             line_start=int(d.get("line_start", 0)),
             line_end=int(d.get("line_end", 0)),
-            excerpt=str(d.get("excerpt", "")),
         )
 
 
@@ -205,7 +204,6 @@ class Comment:
     anchor: Anchor
     thread: list[ThreadEntry] = field(default_factory=list)
     status: Status = "open"
-    tags: list[str] = field(default_factory=list)
     resolved_source: ResolvedSource | None = None
     snippet: str | None = None
     created: str = field(default_factory=_now)
@@ -226,8 +224,6 @@ class Comment:
             "created": self.created,
             "updated": self.updated,
         }
-        if self.tags:
-            d["tags"] = list(self.tags)
         if self.resolved_source is not None:
             d["resolved_source"] = self.resolved_source.to_dict()
         if self.snippet is not None:
@@ -244,7 +240,6 @@ class Comment:
             anchor=anchor_from_dict(d["anchor"]),
             thread=[ThreadEntry.from_dict(e) for e in d.get("thread", [])],
             status=d.get("status", "open"),  # type: ignore[arg-type]
-            tags=list(d.get("tags", []) or []),
             resolved_source=ResolvedSource.from_dict(rs) if rs else None,
             snippet=d.get("snippet"),
             created=str(d.get("created", _now())),
@@ -426,15 +421,11 @@ class CommentStore:
     def list(
         self,
         status: Status | None = None,
-        tags: list[str] | None = None,
         include_stale: bool = True,
     ) -> list[Comment]:
         comments = self._all()
         if status is not None:
             comments = [c for c in comments if c.status == status]
-        if tags:
-            tag_set = set(tags)
-            comments = [c for c in comments if tag_set.intersection(c.tags)]
         if not include_stale:
             comments = [c for c in comments if not c.stale]
         return comments
@@ -450,7 +441,6 @@ class CommentStore:
         anchor: Anchor,
         text: str,
         author: Author = "human",
-        tags: list[str] | None = None,
         resolved_source: ResolvedSource | None = None,
         snippet: str | None = None,
     ) -> Comment:
@@ -460,7 +450,6 @@ class CommentStore:
             anchor=anchor,
             thread=[ThreadEntry(author=author, at=now, text=text)],
             status="open",
-            tags=list(tags or []),
             resolved_source=resolved_source,
             snippet=snippet,
             created=now,
@@ -480,7 +469,6 @@ class CommentStore:
         *,
         edits: list[str] | None = None,
         new_status: Status | None = None,
-        clear_stale: bool = False,
     ) -> Comment:
         """Locate a comment, append a thread entry, optionally update status."""
         with self._locked():
@@ -492,8 +480,6 @@ class CommentStore:
                     )
                     if new_status is not None:
                         c.status = new_status
-                    if clear_stale:
-                        c.stale = False
                     c.updated = _now()
                     comments[i] = c
                     self._save(comments)
@@ -528,11 +514,6 @@ class CommentStore:
     ) -> Comment:
         return self._append_entry(
             comment_id, author, reason, new_status="dismissed"
-        )
-
-    def reopen(self, comment_id: str, author: Author = "human") -> Comment:
-        return self._append_entry(
-            comment_id, author, "(reopened)", new_status="open", clear_stale=True
         )
 
     def delete(self, comment_id: str) -> bool:
@@ -629,10 +610,7 @@ class CommentStore:
         ls, le = located
         if (resolved.line_start, resolved.line_end) != (ls, le):
             c.resolved_source = ResolvedSource(
-                file=resolved.file,
-                line_start=ls,
-                line_end=le,
-                excerpt=resolved.excerpt,
+                file=resolved.file, line_start=ls, line_end=le
             )
             return False, True
         return False, False

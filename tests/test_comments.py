@@ -75,7 +75,6 @@ def test_comment_roundtrip(tmp_path: Path):
     c = store.add(
         SectionAnchor(title="Methods"),
         "expand the algorithm description",
-        tags=["structure"],
     )
     raw = json.loads((tmp_path / "comments.json").read_text())
     assert raw["version"] == 1
@@ -83,7 +82,6 @@ def test_comment_roundtrip(tmp_path: Path):
     restored = Comment.from_dict(raw["comments"][0])
     assert restored.id == c.id
     assert restored.text == "expand the algorithm description"
-    assert restored.tags == ["structure"]
     assert isinstance(restored.anchor, SectionAnchor)
     assert restored.anchor.title == "Methods"
 
@@ -162,14 +160,6 @@ def test_dismiss_marks_dismissed(store: CommentStore):
     assert dismissed.thread[-1].text == "no longer relevant"
 
 
-def test_reopen_restores_open_status(store: CommentStore):
-    c = store.add(PaperAnchor(), "x")
-    store.dismiss(c.id, "skip")
-    reopened = store.reopen(c.id)
-    assert reopened.status == "open"
-    assert reopened.stale is False
-
-
 def test_delete_removes_comment(store: CommentStore):
     c = store.add(PaperAnchor(), "x")
     assert store.delete(c.id) is True
@@ -195,15 +185,6 @@ def test_list_filter_by_status(store: CommentStore):
     resolved_ids = {c.id for c in store.list(status="resolved")}
     assert open_ids == {a.id}
     assert resolved_ids == {b.id}
-
-
-def test_list_filter_by_tags(store: CommentStore):
-    a = store.add(PaperAnchor(), "x", tags=["typo"])
-    b = store.add(PaperAnchor(), "y", tags=["structure", "math"])
-    c = store.add(PaperAnchor(), "z", tags=["math"])
-    matching = {c.id for c in store.list(tags=["math"])}
-    assert matching == {b.id, c.id}
-    assert {x.id for x in store.list(tags=["typo"])} == {a.id}
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +277,7 @@ def test_section_anchor_staleness_resolved(store: CommentStore, tmp_path: Path):
     # Resolver finds the section
     def resolver(title: str, label: str | None):
         if title == "Methods":
-            return ResolvedSource(file="paper.tex", line_start=50, line_end=75, excerpt="")
+            return ResolvedSource(file="paper.tex", line_start=50, line_end=75)
         return None
 
     newly_stale = store.check_staleness(tmp_path, sections_resolver=resolver)

@@ -1,22 +1,20 @@
 # texwatch
 
-**Pull-request-style review for LaTeX papers, with Claude Code as the author.**
+**Agentic-first PDF review for LaTeX papers, with Claude Code as the author.**
 
-You read the rendered PDF in your browser. You drop comments on paragraphs, sections, or the paper as a whole. Claude Code reads the queue, edits the source, and replies with what changed. The PDF rebuilds in front of you. Repeat until done.
+You read the rendered PDF in your browser. You drop comments on paragraphs, sections, or the paper as a whole. Claude Code reads the queue (via MCP), edits the source, and replies with what changed. The PDF rebuilds in front of you. Repeat until done.
 
 ## Why this exists
 
-texwatch v0.3.0 was a browser IDE that *also* had Claude Code integration. It tried to be a place you wrote LaTeX. It lost: VS Code, Overleaf, and Vim are all better text editors. The MCP integration was a sidecar.
+texwatch is deliberately *not* an editor, *not* an IDE, *not* an Overleaf clone. The agent (Claude Code) is already smarter at reading source, parsing LaTeX, grepping citations, and editing files than any tool we could build. So we don't try.
 
-v0.4.0 inverts the framing. **Claude Code is the only editor.** texwatch is the place you *review* its work. The browser viewer is read-only by design: you point at things, you describe what's wrong, and Claude does the rewriting.
+texwatch is a **substrate** for the agentic-first writing workflow:
 
-## What it gives you
+- A **live PDF preview** the human can watch and gesture at.
+- A **comment queue** anchored to PDF regions, sections, source ranges, or the paper as a whole.
+- A **structured-error compile oracle** the agent calls when it wants ground truth.
 
-- **A live PDF preview** that auto-rebuilds on every save (yours or Claude's).
-- **Comments anchored to PDF regions, sections, source ranges, or the paper as a whole.** Threaded: every comment is a conversation between you and Claude.
-- **Anchor durability.** When Claude edits, line numbers shift; texwatch follows the content via snippet matching and structural anchors, and flags comments as `STALE` when it can't.
-- **Structured compile errors** (file, line, message, and 5-line source context) so Claude doesn't have to grep the latexmk log.
-- **MCP tools** for paper state, recompile, and the comments queue. Claude Code reads the queue and treats each comment as a task.
+That's it. Three responsibilities. Anything that re-implements something the agent does well (file parsing, log analysis, semantic understanding) was deliberately removed.
 
 ## Install
 
@@ -24,7 +22,7 @@ Requires Python 3.10+ and `latexmk` (or `pdflatex`/`xelatex`/`lualatex`/`pandoc`
 
 ```bash
 pip install texwatch
-pip install texwatch[mcp]   # add MCP server for Claude Code
+pip install texwatch[mcp]   # adds MCP server for Claude Code
 ```
 
 ## Quick start
@@ -32,27 +30,29 @@ pip install texwatch[mcp]   # add MCP server for Claude Code
 ```bash
 cd my-paper/
 texwatch init       # writes .texwatch.yaml (configures main file, port)
-texwatch            # starts the daemon, opens at http://localhost:8765
+texwatch            # starts the daemon at http://localhost:8765
 ```
 
 In the browser:
 
 - The PDF appears on the left, the comments sidebar on the right.
-- **Select text in the PDF** → a "Comment on selection" toolbar pops up. Click it to anchor a comment to that region. SyncTeX resolves the selection back to a source line range.
-- **"+ Note"** in the top bar → paper-level comment ("the abstract is too long").
-- **Paper tab** → list of sections with **"+ comment"** buttons → section-anchored comments.
+- **Select text in the PDF** to anchor a comment to that region. SyncTeX maps the selection back to a source line range automatically.
+- **"+ Note"** in the top bar for a paper-level comment ("the abstract is too long").
+- **Paper tab** lists sections with **"+ comment"** buttons for section-level comments.
+- **Reply / Resolve / Dismiss** are inline forms in each comment, not modals.
 
 ## The Claude Code workflow
 
-Once `texwatch` is running, the MCP server auto-registers in `.mcp.json`. Claude Code sees these tools:
+`texwatch` auto-registers an MCP server in `.mcp.json` when it starts, exposing **4 tools**:
 
 | Tool | What it does |
 |---|---|
-| `texwatch_paper()` | Full structured paper state: sections (with line ranges), labels, citations, comment counts. |
+| `texwatch_paper(include_comments=True)` | Paper state in one call: sections (with line ranges), the comments queue, last-compile cache, main-file paths. |
 | `texwatch_compile()` | Recompile and return structured errors with source context. |
-| `texwatch_comments(status="open")` | Read the review queue. |
-| `texwatch_comment(action, ...)` | Add/reply/resolve/dismiss/reopen/delete. |
-| `texwatch_goto(target)` | Scroll the user's viewer to a section / page / line. |
+| `texwatch_comment(action, ...)` | `add` / `reply` / `resolve` / `dismiss` / `delete`. |
+| `texwatch_goto(target)` | Scroll the running viewer to a section / page / line / label. |
+
+Notice what's absent: there's no `texwatch_labels()`, no `texwatch_citations()`, no `texwatch_environments()`. Use `Grep`. The agent is better at it than we are.
 
 The intended dialogue:
 
@@ -60,55 +60,52 @@ The intended dialogue:
 You:    [drop 8 comments on the PDF, then in Claude Code]
         "Process the open comments."
 
-Claude: [calls texwatch_comments, reads the queue]
-        [for each one: edits source via Edit tool, then calls
-         texwatch_comment(action="resolve", id=..., summary="...", edits=[...])]
-        [calls texwatch_compile to verify]
+Claude: texwatch_paper()             # one call, sees comments + sections
+        for each open comment:
+          Read source around comment.resolved_source
+          Edit the source
+          texwatch_comment(action="resolve", id=..., summary="...")
+        texwatch_compile()           # verify the build
 
-You:    [PDF rebuilds in your browser; sidebar updates]
-        [reply to the ones that need more work]
+You:    [PDF rebuilds in your browser; sidebar updates over WebSocket]
+        [reply or dismiss anything that needs more work]
 ```
 
 ## Comment anchors
 
 Four kinds, with different staleness behavior:
 
-| Anchor | Use when | How staleness is handled |
+| Anchor | Use when | Staleness handling |
 |---|---|---|
-| `pdf_region` | You're reading the PDF and want to point at a paragraph. | SyncTeX resolves to a source range, then a content snippet is captured. If Claude rewrites the paragraph, the snippet match fails and the comment goes `STALE`. |
+| `pdf_region` | Reading the PDF and pointing at a paragraph. | SyncTeX resolves to source; a content snippet is captured; if Claude rewrites that region, the snippet match fails and the comment is flagged `STALE`. |
 | `section` | "Expand the methods section." | Resolved by section title or `\label{...}`. Stale only if the section is removed or renamed. |
-| `source_range` | You're reading source and know the lines. CLI: `--source intro.tex:42-58` | Same snippet-match as `pdf_region`. |
+| `source_range` | When the agent already knows the lines (most common from MCP). | Snippet-matched, like `pdf_region`. |
 | `paper` | Global note about the paper. | Never stale. |
 
 ## CLI
 
 ```
-texwatch                        # serve (default)
-texwatch init                   # scaffold .texwatch.yaml
-texwatch compile                # one-shot compile, structured errors
-texwatch goto "Related Work"    # tell the running viewer to scroll
-texwatch mcp                    # run the MCP server (stdio)
-
-texwatch comment add "abstract is too long" --paper
-texwatch comment add "expand this" --section "Methods"
-texwatch comment add "rephrase" --source intro.tex:42-58
-texwatch comment list [--status open|resolved|dismissed|all]
-texwatch comment show c-7f2a
-texwatch comment resolve c-7f2a "broke into two paragraphs" --edit "intro.tex:42-58 -> :42-78"
-texwatch comment dismiss c-7f2a "no longer relevant"
-texwatch comment reopen c-7f2a
-texwatch comment delete c-7f2a
+texwatch                 # serve (default)
+texwatch init            # scaffold .texwatch.yaml
+texwatch compile         # one-shot compile, structured errors
+texwatch goto "Methods"  # tell the running viewer to scroll
+texwatch mcp             # run the MCP server (stdio)
 ```
 
-Comments live in `.texwatch/comments.json`. `git add` it to keep your review history with the paper.
+That's the whole CLI. Comment management lives in the browser (for humans) and in the MCP tools (for the agent). There is no `texwatch comment add` from the shell because nobody types that.
 
-## What's intentionally missing in v0.4.0
+## What changed in v0.5.0
 
-- **No editor pane.** v0.3.0 had CodeMirror, autocomplete, snippets, file tree. Gone. Claude Code is the editor.
-- **No multi-project workspace.** One paper per `texwatch` process.
-- **No bibliography/environment/digest dashboards.** Folded into one `texwatch_paper()` MCP call. If you want richer analysis, the data is there for Claude to slice.
-- **No SQLite compile history.** Each compile result stands on its own; the comments thread captures the review history.
-- **No file-save endpoint.** Claude Code edits source files directly via its own `Edit`/`Write` tools. The watcher picks up changes automatically.
+Aggressive simplification with the agentic-first frame:
+
+- **Dropped the CLI comment surface entirely.** The agent and the browser are the only sane places to manage comments.
+- **Dropped `tags`, `reopen`, the `Errors` tab.** Tags were noise, reopen was Github-imitation, the Errors tab duplicated information the topbar already shows.
+- **Dropped `labels` / `citations` / `inputs` from `texwatch_paper()`.** Use `Grep`.
+- **Folded `texwatch_comments` into `texwatch_paper(include_comments=True)`** for one-call orientation.
+- **Inline reply / resolve / dismiss forms** in the viewer, not `prompt()` dialogs.
+- **Compile lock** prevents the watcher and `texwatch_compile()` from racing.
+
+Net code change: roughly −1200 lines across the project.
 
 ## Configuration
 
@@ -121,6 +118,8 @@ ignore: ["*_backup.tex"]
 compiler: auto       # auto | latexmk | pdflatex | xelatex | lualatex | pandoc
 port: 8765
 ```
+
+Comments live in `.texwatch/comments.json`. `git add` it to keep your review history with the paper.
 
 ## License
 
