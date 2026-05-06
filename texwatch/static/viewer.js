@@ -165,6 +165,74 @@ function attachSelectionListener() {
   document.addEventListener("selectionchange", updateSelectionToolbar);
 }
 
+// ---------------------------------------------------------------------------
+// Rectangular region selection (shift-click-drag)
+//
+// Lets the human box-select figures, equations, or any whitespace region
+// where text-layer selection doesn't reach.  Produces the same
+// pdf_region anchor shape as text selection, so comment + image-capture
+// plumbing is identical.
+// ---------------------------------------------------------------------------
+
+let regionDrag = null;  // {pageNum, pageEl, pageRect, startX, startY, overlay}
+
+function attachRegionDragListener() {
+  document.addEventListener("mousedown", onRegionDown, true);
+  document.addEventListener("mousemove", onRegionMove, true);
+  document.addEventListener("mouseup", onRegionUp, true);
+}
+
+function onRegionDown(ev) {
+  if (!ev.shiftKey || ev.button !== 0) return;
+  const pageEl = ev.target.closest(".pdf-page");
+  if (!pageEl) return;
+  ev.preventDefault();
+  // Suppress text selection while we drag.
+  window.getSelection()?.removeAllRanges();
+  const pageRect = pageEl.getBoundingClientRect();
+  const overlay = h("div", { class: "region-drag" });
+  pageEl.appendChild(overlay);
+  regionDrag = {
+    pageNum: parseInt(pageEl.dataset.page, 10),
+    pageEl,
+    pageRect,
+    startX: ev.clientX - pageRect.left,
+    startY: ev.clientY - pageRect.top,
+    overlay,
+  };
+}
+
+function onRegionMove(ev) {
+  if (!regionDrag) return;
+  const { pageRect, startX, startY, overlay } = regionDrag;
+  const x = ev.clientX - pageRect.left;
+  const y = ev.clientY - pageRect.top;
+  overlay.style.left = `${Math.min(startX, x)}px`;
+  overlay.style.top = `${Math.min(startY, y)}px`;
+  overlay.style.width = `${Math.abs(x - startX)}px`;
+  overlay.style.height = `${Math.abs(y - startY)}px`;
+}
+
+function onRegionUp(ev) {
+  if (!regionDrag) return;
+  const { pageNum, pageRect, startX, startY, overlay } = regionDrag;
+  overlay.remove();
+  const x = ev.clientX - pageRect.left;
+  const y = ev.clientY - pageRect.top;
+  regionDrag = null;
+  // Convert CSS px to PDF points.
+  const x1 = Math.min(startX, x) / state.renderScale;
+  const y1 = Math.min(startY, y) / state.renderScale;
+  const x2 = Math.max(startX, x) / state.renderScale;
+  const y2 = Math.max(startY, y) / state.renderScale;
+  // Ignore tiny drags (accidental clicks).
+  if (Math.abs(x2 - x1) < 4 || Math.abs(y2 - y1) < 4) return;
+  openCompose(
+    { kind: "pdf_region", page: pageNum, bbox: [x1, y1, x2, y2] },
+    `PDF p${pageNum}: rectangular region (${Math.round(x2 - x1)}×${Math.round(y2 - y1)} pt)`,
+  );
+}
+
 function getSelectionPdfRegion() {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
@@ -720,6 +788,7 @@ async function jumpToComment(cid) {
 
 function init() {
   attachSelectionListener();
+  attachRegionDragListener();
 
   $("#recompile-btn").addEventListener("click", () => fetch("/compile", { method: "POST" }));
   $("#paper-comment-btn").addEventListener("click", () =>

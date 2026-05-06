@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "texwatch"
-version = "0.5.0"
+version = "0.5.1"
 description = "Agentic-first review tool for LaTeX papers: live PDF preview + comment queue, designed for Claude Code as author"
 readme = "README.md"
 license = "MIT"
@@ -33,10 +33,12 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0", "httpx"]
+image = ["pymupdf>=1.23.0"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
+    "pymupdf>=1.23.0",
 ]
 
 [project.scripts]

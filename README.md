@@ -37,22 +37,26 @@ In the browser:
 
 - The PDF appears on the left, the comments sidebar on the right.
 - **Select text in the PDF** to anchor a comment to that region. SyncTeX maps the selection back to a source line range automatically.
+- **Shift-click-drag** to draw a rectangle around any region (figures, equations, whitespace) where text selection doesn't reach. Same `pdf_region` anchor; the agent can render exactly that region with `texwatch_image(comment_id=...)`.
 - **"+ Note"** in the top bar for a paper-level comment ("the abstract is too long").
 - **Paper tab** lists sections with **"+ comment"** buttons for section-level comments.
 - **Reply / Resolve / Dismiss** are inline forms in each comment, not modals.
 
 ## The Claude Code workflow
 
-`texwatch` auto-registers an MCP server in `.mcp.json` when it starts, exposing **4 tools**:
+`texwatch` auto-registers an MCP server in `.mcp.json` when it starts, exposing **5 tools**:
 
 | Tool | What it does |
 |---|---|
 | `texwatch_paper(include_comments=True)` | Paper state in one call: sections (with line ranges), the comments queue, last-compile cache, main-file paths. |
 | `texwatch_compile()` | Recompile and return structured errors with source context. |
 | `texwatch_comment(action, ...)` | `add` / `reply` / `resolve` / `dismiss` / `delete`. |
+| `texwatch_image(...)` | Render PDF region as PNG. Modes: `page=N`, `page+bbox`, `source="file:lstart-lend"`, `comment_id="c-..."`. |
 | `texwatch_goto(target)` | Scroll the running viewer to a section / page / line / label. |
 
 Notice what's absent: there's no `texwatch_labels()`, no `texwatch_citations()`, no `texwatch_environments()`. Use `Grep`. The agent is better at it than we are.
+
+**Visual review** is the killer mode of `texwatch_image`. Claude is multimodal; pure text won't tell it whether a figure caption attaches to the right figure or whether an equation rendered correctly. The `comment_id` mode is the fast path: human draws a rectangle around a figure (shift-drag in the PDF), files the comment, agent renders that region, sees what the human pointed at, fixes the LaTeX.
 
 The intended dialogue:
 

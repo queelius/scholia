@@ -240,6 +240,133 @@ async def test_goto_page_passthrough(client):
 
 
 # ---------------------------------------------------------------------------
+# /image endpoint — page / bbox / source / comment modes.
+# ---------------------------------------------------------------------------
+
+
+pytest.importorskip("fitz")
+
+
+@pytest.fixture
+async def client_with_pdf(project: Path):
+    """Like *client*, but also produces a real PDF + CompileResult so /image works."""
+    from datetime import datetime, timezone
+
+    import fitz
+    from texwatch.compiler import CompileResult
+    from texwatch.config import Config
+    from texwatch.server import TexWatchServer
+    from texwatch.structure import parse_structure
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cfg = Config(main="paper.tex", config_path=project / ".texwatch.yaml")
+    server = TexWatchServer(cfg)
+    server.structure = parse_structure(project)
+
+    # Build a tiny real PDF the server can render.
+    pdf_path = project / "paper.pdf"
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "Page 1")
+    doc.new_page().insert_text((72, 72), "Page 2")
+    doc.save(pdf_path)
+    doc.close()
+    server.last_result = CompileResult(
+        success=True,
+        output_file=pdf_path,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    test_server = TestServer(server.app)
+    test_client = TestClient(test_server)
+    await test_client.start_server()
+    try:
+        yield test_client, server
+    finally:
+        await test_client.close()
+
+
+@pytest.mark.asyncio
+async def test_image_full_page(client_with_pdf):
+    tc, _ = client_with_pdf
+    resp = await tc.get("/image?page=1&dpi=72")
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "image/png"
+    body = await resp.read()
+    assert body.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.asyncio
+async def test_image_bbox(client_with_pdf):
+    tc, _ = client_with_pdf
+    resp = await tc.get("/image?page=1&bbox=60,60,200,100&dpi=72")
+    assert resp.status == 200
+    body = await resp.read()
+    assert body.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.asyncio
+async def test_image_requires_one_target(client_with_pdf):
+    tc, _ = client_with_pdf
+    # Neither page nor source nor comment.
+    resp = await tc.get("/image")
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_image_invalid_bbox(client_with_pdf):
+    tc, _ = client_with_pdf
+    resp = await tc.get("/image?page=1&bbox=garbage")
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_image_comment_with_pdf_region(client_with_pdf):
+    """A pdf_region comment should be renderable via comment_id."""
+    tc, _ = client_with_pdf
+    resp = await tc.post(
+        "/comments",
+        json={
+            "anchor": {"kind": "pdf_region", "page": 1, "bbox": [60, 60, 200, 100]},
+            "text": "look at this",
+        },
+    )
+    cid = (await resp.json())["id"]
+    resp = await tc.get(f"/image?comment={cid}&dpi=72")
+    assert resp.status == 200
+    body = await resp.read()
+    assert body.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.asyncio
+async def test_image_comment_paper_anchor_rejects(client_with_pdf):
+    tc, _ = client_with_pdf
+    resp = await tc.post(
+        "/comments",
+        json={"anchor": {"kind": "paper"}, "text": "global"},
+    )
+    cid = (await resp.json())["id"]
+    resp = await tc.get(f"/image?comment={cid}")
+    assert resp.status == 400
+    err = await resp.json()
+    assert "paper" in err["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_image_unknown_comment(client_with_pdf):
+    tc, _ = client_with_pdf
+    resp = await tc.get("/image?comment=c-doesntexist")
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_image_no_pdf_returns_404(client):
+    """Without a successful compile (no last_result.output_file), /image is 404."""
+    tc, _ = client
+    resp = await tc.get("/image?page=1")
+    assert resp.status == 404
+
+
+# ---------------------------------------------------------------------------
 # Pure helpers (factored out of the request handlers)
 # ---------------------------------------------------------------------------
 

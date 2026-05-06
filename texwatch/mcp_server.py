@@ -27,6 +27,7 @@ from typing import Any
 
 try:
     from mcp.server.fastmcp import FastMCP
+    from mcp.types import ImageContent, TextContent
 
     HAS_MCP = True
 except ImportError:
@@ -285,6 +286,68 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
             return _err(str(exc))
 
     @mcp.tool()
+    async def texwatch_image(
+        page: int | None = None,
+        bbox: list[float] | None = None,
+        source: str | None = None,
+        comment_id: str | None = None,
+        dpi: int = 150,
+    ) -> list[ImageContent | TextContent]:
+        """Render a PDF region as PNG and return it for visual analysis.
+
+        Use exactly one of:
+          page=N                         full page
+          page=N + bbox=[x1,y1,x2,y2]    region in PDF points
+          source="file.tex:lstart-lend"  SyncTeX-resolved region
+          comment_id="c-..."             the region a comment is anchored to
+
+        Returns ImageContent (base64 PNG) on success.  Use this when text
+        alone won't tell you what's wrong: figure layout, equation
+        rendering, overfull boxes, table positioning, or to verify a fix
+        looks right.
+
+        Combine with texwatch_paper() for the workflow:
+          1. texwatch_paper()                          # see open comments
+          2. for each: texwatch_image(comment_id=...)  # see the rendered
+                                                       # region the human
+                                                       # anchored
+          3. Read source, Edit, then texwatch_compile + texwatch_image
+             again to verify visually.
+        """
+        from .comments import PdfRegionAnchor, PaperAnchor
+        from .config import get_main_file
+        from .server import _parse_source_range
+        from . import imaging
+
+        cfg, _, store = _load_project()
+        pdf_path = get_main_file(cfg).with_suffix(".pdf")
+        if not pdf_path.exists():
+            return [TextContent(type="text",
+                text=_err("no PDF on disk; run texwatch_compile() first"))]
+
+        try:
+            resolved_page, resolved_bbox = _resolve_image_target(
+                store, cfg, page, bbox, source, comment_id
+            )
+        except ValueError as exc:
+            return [TextContent(type="text", text=_err(str(exc)))]
+
+        try:
+            if resolved_bbox is None:
+                png = imaging.render_page(pdf_path, resolved_page, dpi=dpi)
+            else:
+                png = imaging.render_region(pdf_path, resolved_page, resolved_bbox, dpi=dpi)
+        except imaging.ImagingError as exc:
+            return [TextContent(type="text", text=_err(str(exc)))]
+
+        import base64
+        return [ImageContent(
+            type="image",
+            data=base64.b64encode(png).decode("ascii"),
+            mimeType="image/png",
+        )]
+
+    @mcp.tool()
     async def texwatch_goto(target: str, port: int = daemon_port) -> str:
         """Tell a running daemon to scroll the viewer to a target.
 
@@ -314,6 +377,76 @@ import re
 # Matches ``sec:methods``, ``eq:foo-bar``, ``thm:main``.  Does *not* match
 # ``Introduction: A Survey`` (space) or filenames (long prefix / has dot).
 _LABEL_LIKE = re.compile(r"^[a-zA-Z]{2,8}:[A-Za-z0-9_.\-:]+$")
+
+
+def _resolve_image_target(
+    store,
+    cfg,
+    page: int | None,
+    bbox: list[float] | None,
+    source: str | None,
+    comment_id: str | None,
+) -> tuple[int, tuple[float, float, float, float] | None]:
+    """Standalone version of TexWatchServer._resolve_image_target for the
+    MCP path (which talks to the file system, not a running daemon).
+
+    Raises ValueError with a user-facing message on bad inputs.
+    """
+    from .config import get_main_file
+    from .server import _parse_source_range, load_synctex_for_main
+    from . import imaging
+
+    primary = sum(1 for v in (page, source, comment_id) if v not in (None, ""))
+    if primary != 1:
+        raise ValueError("specify exactly one of page, source, or comment_id")
+
+    if comment_id:
+        c = store.get(comment_id)
+        if c is None:
+            raise ValueError(f"no comment {comment_id}")
+        if c.anchor.kind == "pdf_region":
+            return c.anchor.page, tuple(c.anchor.bbox)  # type: ignore[attr-defined,return-value]
+        if c.anchor.kind == "paper":
+            raise ValueError("paper anchors have no PDF region")
+        if c.resolved_source is None:
+            raise ValueError("comment is not anchored to a renderable region")
+        synctex = load_synctex_for_main(get_main_file(cfg))
+        if synctex is None:
+            raise ValueError("no SyncTeX data; cannot resolve comment region")
+        pair = imaging.resolve_source_to_region(
+            synctex,
+            c.resolved_source.file,
+            c.resolved_source.line_start,
+            c.resolved_source.line_end,
+        )
+        if pair is None:
+            raise ValueError("comment's source range has no PDF coverage")
+        return pair
+
+    if source:
+        file, ls, le = _parse_source_range(source)
+        synctex = load_synctex_for_main(get_main_file(cfg))
+        if synctex is None:
+            raise ValueError("no SyncTeX data")
+        pair = imaging.resolve_source_to_region(synctex, file, ls, le)
+        if pair is None:
+            raise ValueError("no PDF region for this source range")
+        return pair
+
+    # page (with optional bbox)
+    if page is None:
+        raise ValueError("page must be an integer")
+    resolved_bbox: tuple[float, float, float, float] | None = None
+    if bbox is not None:
+        if len(bbox) != 4:
+            raise ValueError("bbox must have exactly 4 values")
+        resolved_bbox = (
+            float(bbox[0]),
+            float(bbox[1]),
+            float(bbox[2]),
+            float(bbox[3]),
+        )
+    return int(page), resolved_bbox
 
 
 def parse_goto_target(target: str, default_file: str) -> dict[str, Any]:

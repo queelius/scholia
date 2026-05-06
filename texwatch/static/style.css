@@ -146,6 +146,15 @@ button {
   background: var(--highlight-hover);
 }
 
+/* Live rectangle while shift-dragging to select an arbitrary region. */
+.region-drag {
+  position: absolute;
+  border: 2px dashed var(--accent);
+  background: rgba(74, 111, 165, 0.10);
+  pointer-events: none;
+  z-index: 5;
+}
+
 /* ----- selection toolbar (floats above selection) ----- */
 #selection-toolbar {
   position: absolute;
