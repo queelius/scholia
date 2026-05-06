@@ -31,6 +31,7 @@ the new location or report that they have lost the thread.  We use:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -40,7 +41,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Iterator, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -279,11 +280,17 @@ def _strip_for_match(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def find_snippet(snippet: str, file: Path) -> tuple[int, int] | None:
+def find_snippet(
+    snippet: str, file: Path, near_line: int | None = None
+) -> tuple[int, int] | None:
     """Locate *snippet* in *file*, return ``(start_line, end_line)`` 1-indexed.
 
-    Tries exact match first, then whitespace-normalized match.  Returns
-    None if the snippet content can no longer be located.
+    Tries exact match first, then whitespace-normalized match.  When
+    *near_line* is provided and the snippet appears multiple times,
+    returns the occurrence whose start line is closest to it (defends
+    against re-anchoring to a duplicate after edits move the original).
+
+    Returns None if the snippet can no longer be located.
     """
     if not snippet.strip():
         return None
@@ -292,31 +299,42 @@ def find_snippet(snippet: str, file: Path) -> tuple[int, int] | None:
     except OSError:
         return None
 
-    # Exact match
-    idx = text.find(snippet)
-    if idx >= 0:
+    candidates: list[tuple[int, int]] = []
+
+    # Exact occurrences (overlapping search)
+    pos = 0
+    while True:
+        idx = text.find(snippet, pos)
+        if idx < 0:
+            break
         before = text[:idx]
         start_line = before.count("\n") + 1
         end_line = start_line + snippet.count("\n")
-        return (start_line, end_line)
+        candidates.append((start_line, end_line))
+        pos = idx + 1
 
-    # Whitespace-normalized fallback: line-by-line sliding window
-    src_lines = text.splitlines()
-    snip_lines = snippet.splitlines()
-    if not snip_lines:
-        return None
-    target = [_strip_for_match(line) for line in snip_lines]
-    target_joined = " ".join(t for t in target if t)
-    if not target_joined:
-        return None
+    if not candidates:
+        # Whitespace-normalized fallback: line-by-line sliding window
+        src_lines = text.splitlines()
+        snip_lines = snippet.splitlines()
+        if not snip_lines:
+            return None
+        target_joined = " ".join(t for t in (_strip_for_match(line) for line in snip_lines) if t)
+        if not target_joined:
+            return None
+        n = len(snip_lines)
+        for i in range(len(src_lines) - n + 1):
+            joined = " ".join(
+                w for w in (_strip_for_match(line) for line in src_lines[i : i + n]) if w
+            )
+            if joined == target_joined:
+                candidates.append((i + 1, i + n))
 
-    n = len(snip_lines)
-    for i in range(0, len(src_lines) - n + 1):
-        window = [_strip_for_match(line) for line in src_lines[i : i + n]]
-        joined = " ".join(w for w in window if w)
-        if joined == target_joined:
-            return (i + 1, i + n)
-    return None
+    if not candidates:
+        return None
+    if len(candidates) == 1 or near_line is None:
+        return candidates[0]
+    return min(candidates, key=lambda c: abs(c[0] - near_line))
 
 
 # ---------------------------------------------------------------------------
@@ -332,16 +350,45 @@ class CommentStore:
 
     Comments live in ``<watch_dir>/.texwatch/comments.json``.  The file
     is small (one paper, typically <1k comments), so we read/write the
-    whole file on each operation; concurrent writers are not supported.
+    whole file on each operation.
 
-    Atomic writes use a temp file + rename to avoid partial writes.
+    Concurrency is real: the daemon, the MCP server, and the CLI may all
+    mutate the store at the same time.  Each read-modify-write cycle is
+    serialized with an exclusive ``fcntl.flock`` on a sibling ``.lock``
+    file (POSIX only — on Windows the lock is a no-op and the last-writer-
+    wins risk is documented).  The actual data write is atomic via temp
+    file + ``os.replace``.
     """
 
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_path = self.path.with_name(self.path.name + ".lock")
         if not self.path.exists():
             self._write({"version": STORE_VERSION, "comments": []})
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Serialize read-modify-write across processes.
+
+        Held only for the duration of one mutation; readers do not lock
+        because the atomic rename guarantees they see a complete file.
+        """
+        try:
+            import fcntl
+        except ImportError:
+            # Windows: no flock; accept last-writer-wins.  Most papers
+            # have one writer at a time anyway.
+            yield
+            return
+        # 'a' so concurrent processes share the same descriptor target
+        # without truncating each other.
+        with open(self._lock_path, "a") as lock_fd:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -419,22 +466,38 @@ class CommentStore:
             created=now,
             updated=now,
         )
-        all_comments = self._all()
-        all_comments.append(comment)
-        self._save(all_comments)
+        with self._locked():
+            all_comments = self._all()
+            all_comments.append(comment)
+            self._save(all_comments)
         return comment
 
-    def _update(
-        self, comment_id: str, mutator
+    def _append_entry(
+        self,
+        comment_id: str,
+        author: Author,
+        text: str,
+        *,
+        edits: list[str] | None = None,
+        new_status: Status | None = None,
+        clear_stale: bool = False,
     ) -> Comment:
-        comments = self._all()
-        for i, c in enumerate(comments):
-            if c.id == comment_id:
-                mutator(c)
-                c.updated = _now()
-                comments[i] = c
-                self._save(comments)
-                return c
+        """Locate a comment, append a thread entry, optionally update status."""
+        with self._locked():
+            comments = self._all()
+            for i, c in enumerate(comments):
+                if c.id == comment_id:
+                    c.thread.append(
+                        ThreadEntry(author=author, at=_now(), text=text, edits=list(edits or []))
+                    )
+                    if new_status is not None:
+                        c.status = new_status
+                    if clear_stale:
+                        c.stale = False
+                    c.updated = _now()
+                    comments[i] = c
+                    self._save(comments)
+                    return c
         raise KeyError(f"comment {comment_id!r} not found")
 
     def reply(
@@ -444,11 +507,7 @@ class CommentStore:
         author: Author,
         edits: list[str] | None = None,
     ) -> Comment:
-        def mutate(c: Comment) -> None:
-            c.thread.append(
-                ThreadEntry(author=author, at=_now(), text=text, edits=list(edits or []))
-            )
-        return self._update(comment_id, mutate)
+        return self._append_entry(comment_id, author, text, edits=edits)
 
     def resolve(
         self,
@@ -457,12 +516,9 @@ class CommentStore:
         edits: list[str] | None = None,
         author: Author = "claude",
     ) -> Comment:
-        def mutate(c: Comment) -> None:
-            c.thread.append(
-                ThreadEntry(author=author, at=_now(), text=summary, edits=list(edits or []))
-            )
-            c.status = "resolved"
-        return self._update(comment_id, mutate)
+        return self._append_entry(
+            comment_id, author, summary, edits=edits, new_status="resolved"
+        )
 
     def dismiss(
         self,
@@ -470,29 +526,23 @@ class CommentStore:
         reason: str,
         author: Author = "human",
     ) -> Comment:
-        def mutate(c: Comment) -> None:
-            c.thread.append(
-                ThreadEntry(author=author, at=_now(), text=reason)
-            )
-            c.status = "dismissed"
-        return self._update(comment_id, mutate)
+        return self._append_entry(
+            comment_id, author, reason, new_status="dismissed"
+        )
 
     def reopen(self, comment_id: str, author: Author = "human") -> Comment:
-        def mutate(c: Comment) -> None:
-            c.thread.append(
-                ThreadEntry(author=author, at=_now(), text="(reopened)")
-            )
-            c.status = "open"
-            c.stale = False
-        return self._update(comment_id, mutate)
+        return self._append_entry(
+            comment_id, author, "(reopened)", new_status="open", clear_stale=True
+        )
 
     def delete(self, comment_id: str) -> bool:
-        comments = self._all()
-        before = len(comments)
-        comments = [c for c in comments if c.id != comment_id]
-        if len(comments) == before:
-            return False
-        self._save(comments)
+        with self._locked():
+            comments = self._all()
+            before = len(comments)
+            comments = [c for c in comments if c.id != comment_id]
+            if len(comments) == before:
+                return False
+            self._save(comments)
         return True
 
     # ----- staleness -----
@@ -511,65 +561,78 @@ class CommentStore:
         Returns the list of comment IDs that became stale on this pass
         (i.e. were not stale before, but are now).
         """
-        comments = self._all()
-        newly_stale: list[str] = []
-        changed = False
+        with self._locked():
+            comments = self._all()
+            newly_stale: list[str] = []
+            changed = False
 
-        for c in comments:
-            if c.status != "open":
-                continue
-            was_stale = c.stale
-            new_stale = False
-            modified = False  # tracks resolved_source updates separate from stale flag
+            for c in comments:
+                if c.status != "open":
+                    continue
+                was_stale = c.stale
+                new_stale, modified = self._recheck_anchor(c, watch_dir, sections_resolver)
 
-            if c.anchor.kind == "paper":
-                # Paper anchors never go stale
-                pass
-
-            elif c.anchor.kind == "section":
-                anchor = c.anchor  # SectionAnchor
-                resolved = None
-                if sections_resolver is not None:
-                    resolved = sections_resolver(anchor.title, anchor.label)
-                if resolved is None:
-                    new_stale = True
-                elif c.resolved_source != resolved:
-                    c.resolved_source = resolved
+                if new_stale != was_stale:
+                    c.stale = new_stale
                     modified = True
+                    if new_stale:
+                        newly_stale.append(c.id)
+                if modified:
+                    changed = True
 
-            elif c.anchor.kind in ("source_range", "pdf_region"):
-                # Use the snippet if present
-                resolved = c.resolved_source
-                if c.snippet and resolved is not None:
-                    file_path = watch_dir / resolved.file
-                    if file_path.is_file():
-                        located = find_snippet(c.snippet, file_path)
-                        if located is None:
-                            new_stale = True
-                        else:
-                            ls, le = located
-                            if (resolved.line_start, resolved.line_end) != (ls, le):
-                                c.resolved_source = ResolvedSource(
-                                    file=resolved.file,
-                                    line_start=ls,
-                                    line_end=le,
-                                    excerpt=resolved.excerpt,
-                                )
-                                modified = True
-                    else:
-                        new_stale = True
-                # without a snippet we can't verify; leave alone
-
-            if new_stale != was_stale:
-                c.stale = new_stale
-                modified = True
-                if new_stale:
-                    newly_stale.append(c.id)
-
-            if modified:
-                changed = True
-
-        if changed:
-            self._save(comments)
+            if changed:
+                self._save(comments)
 
         return newly_stale
+
+    @staticmethod
+    def _recheck_anchor(
+        c: Comment,
+        watch_dir: Path,
+        sections_resolver,
+    ) -> tuple[bool, bool]:
+        """Re-resolve a single comment.  Returns (is_stale, modified_resolved)."""
+        kind = c.anchor.kind
+
+        if kind == "paper":
+            # Paper anchors never go stale.
+            return False, False
+
+        if kind == "section":
+            anchor = c.anchor  # SectionAnchor
+            resolved = (
+                sections_resolver(anchor.title, anchor.label)
+                if sections_resolver is not None
+                else None
+            )
+            if resolved is None:
+                return True, False
+            if c.resolved_source != resolved:
+                c.resolved_source = resolved
+                return False, True
+            return False, False
+
+        # source_range / pdf_region: use the captured snippet to relocate.
+        resolved = c.resolved_source
+        if not c.snippet or resolved is None:
+            # Can't verify without a snippet; leave alone.
+            return False, False
+        file_path = watch_dir / resolved.file
+        if not file_path.is_file():
+            return True, False
+        # Prefer the match closest to the previous line range; defends
+        # against re-anchoring to a duplicate when the same snippet
+        # appears multiple times in the file.
+        located = find_snippet(c.snippet, file_path, near_line=resolved.line_start)
+        if located is None:
+            return True, False
+        ls, le = located
+        if (resolved.line_start, resolved.line_end) != (ls, le):
+            c.resolved_source = ResolvedSource(
+                file=resolved.file,
+                line_start=ls,
+                line_end=le,
+                excerpt=resolved.excerpt,
+            )
+            return False, True
+        return False, False

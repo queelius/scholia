@@ -353,24 +353,27 @@ function renderThreadEntry(entry) {
   return h("div", { class: `thread-entry author-${entry.author}` }, ...children);
 }
 
+function actionBtn(cls, label, onclick) {
+  return h("button", { class: cls, type: "button", text: label, onclick });
+}
+
+function confirmDelete(cid) {
+  if (confirm(`Permanently delete ${cid}?`)) doMutation(cid, "delete", {});
+}
+
 function actionButtons(c) {
+  const deleteBtn = actionBtn("cmt-delete", "Delete", () => confirmDelete(c.id));
   if (c.status === "open") {
     return [
-      h("button", { class: "cmt-reply", type: "button", text: "Reply",
-        onclick: () => promptReply(c.id) }),
-      h("button", { class: "cmt-resolve", type: "button", text: "Resolve",
-        onclick: () => promptResolve(c.id) }),
-      h("button", { class: "cmt-dismiss", type: "button", text: "Dismiss",
-        onclick: () => promptDismiss(c.id) }),
-      h("button", { class: "cmt-delete", type: "button", text: "Delete",
-        onclick: () => { if (confirm(`Permanently delete ${c.id}?`)) doMutation(c.id, "delete", {}); } }),
+      actionBtn("cmt-reply", "Reply", () => promptReply(c.id)),
+      actionBtn("cmt-resolve", "Resolve", () => promptResolve(c.id)),
+      actionBtn("cmt-dismiss", "Dismiss", () => promptDismiss(c.id)),
+      deleteBtn,
     ];
   }
   return [
-    h("button", { class: "cmt-reopen", type: "button", text: "Reopen",
-      onclick: () => doMutation(c.id, "reopen", {}) }),
-    h("button", { class: "cmt-delete", type: "button", text: "Delete",
-      onclick: () => { if (confirm(`Permanently delete ${c.id}?`)) doMutation(c.id, "delete", {}); } }),
+    actionBtn("cmt-reopen", "Reopen", () => doMutation(c.id, "reopen", {})),
+    deleteBtn,
   ];
 }
 
@@ -615,6 +618,14 @@ function connectWS() {
   ws.onclose = () => setTimeout(connectWS, 2000);
 }
 
+function applyCompileResult(r) {
+  state.errors = r.errors || [];
+  state.warnings = r.warnings || [];
+  $("#compile-status").textContent = r.success ? "✓ ok" : "✗ failed";
+  $("#error-count").textContent = `${state.errors.length} errors`;
+  renderErrors();
+}
+
 function handleWSMessage(msg) {
   switch (msg.type) {
     case "compiling":
@@ -622,11 +633,7 @@ function handleWSMessage(msg) {
       break;
     case "compiled": {
       const r = msg.result || {};
-      state.errors = r.errors || [];
-      state.warnings = r.warnings || [];
-      $("#compile-status").textContent = r.success ? "✓ ok" : "✗ failed";
-      $("#error-count").textContent = `${state.errors.length} errors`;
-      renderErrors();
+      applyCompileResult(r);
       if (r.success) loadPdf();
       refreshPaper();
       break;
@@ -637,13 +644,7 @@ function handleWSMessage(msg) {
       refreshComments();
       break;
     case "state":
-      if (msg.result) {
-        state.errors = msg.result.errors || [];
-        state.warnings = msg.result.warnings || [];
-        $("#compile-status").textContent = msg.result.success ? "✓ ok" : "✗ failed";
-        $("#error-count").textContent = `${state.errors.length} errors`;
-        renderErrors();
-      }
+      if (msg.result) applyCompileResult(msg.result);
       break;
     case "goto":
       if (msg.page) jumpToPage(msg.page);

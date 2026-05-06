@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -160,16 +161,25 @@ def _relative(path: Path, watch_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _iter_code_lines(content: str) -> Iterator[tuple[int, str]]:
+    """Yield ``(line_no, code_line)`` skipping comment-only lines.
+
+    Each yielded line has its inline ``%`` comment stripped.  Line numbers
+    are 1-indexed.
+    """
+    for line_no, raw_line in enumerate(content.splitlines(), start=1):
+        if raw_line.lstrip().startswith("%"):
+            continue
+        yield line_no, _strip_comment(raw_line)
+
+
 def _parse_sections(content: str, rel_path: str) -> list[Section]:
     """Extract section headings (and the immediately-following label, if any)."""
     sections: list[Section] = []
     lines = content.splitlines()
     n = len(lines)
 
-    for line_no, raw_line in enumerate(lines, start=1):
-        if raw_line.lstrip().startswith("%"):
-            continue
-        line = _strip_comment(raw_line)
+    for line_no, line in _iter_code_lines(content):
         for m in _SECTION_PREFIX_RE.finditer(line):
             pos = m.end()
             while pos < len(line) and line[pos] in " \t":
@@ -201,43 +211,29 @@ def _parse_sections(content: str, rel_path: str) -> list[Section]:
 
 
 def _parse_labels(content: str, rel_path: str) -> list[Label]:
-    labels: list[Label] = []
-    for line_no, raw_line in enumerate(content.splitlines(), start=1):
-        if raw_line.lstrip().startswith("%"):
-            continue
-        line = _strip_comment(raw_line)
-        for m in _LABEL_RE.finditer(line):
-            labels.append(Label(name=m.group(1).strip(), file=rel_path, line=line_no))
-    return labels
+    return [
+        Label(name=m.group(1).strip(), file=rel_path, line=line_no)
+        for line_no, line in _iter_code_lines(content)
+        for m in _LABEL_RE.finditer(line)
+    ]
 
 
 def _parse_citations(content: str, rel_path: str) -> list[Citation]:
-    citations: list[Citation] = []
-    for line_no, raw_line in enumerate(content.splitlines(), start=1):
-        if raw_line.lstrip().startswith("%"):
-            continue
-        line = _strip_comment(raw_line)
-        for m in _CITE_RE.finditer(line):
-            for key in m.group(1).split(","):
-                key = key.strip()
-                if key:
-                    citations.append(
-                        Citation(key=key, file=rel_path, line=line_no)
-                    )
-    return citations
+    return [
+        Citation(key=key, file=rel_path, line=line_no)
+        for line_no, line in _iter_code_lines(content)
+        for m in _CITE_RE.finditer(line)
+        for raw_key in m.group(1).split(",")
+        if (key := raw_key.strip())
+    ]
 
 
 def _parse_inputs(content: str, rel_path: str) -> list[InputFile]:
-    inputs: list[InputFile] = []
-    for line_no, raw_line in enumerate(content.splitlines(), start=1):
-        if raw_line.lstrip().startswith("%"):
-            continue
-        line = _strip_comment(raw_line)
-        for m in _INPUT_RE.finditer(line):
-            inputs.append(
-                InputFile(path=m.group(1).strip(), file=rel_path, line=line_no)
-            )
-    return inputs
+    return [
+        InputFile(path=m.group(1).strip(), file=rel_path, line=line_no)
+        for line_no, line in _iter_code_lines(content)
+        for m in _INPUT_RE.finditer(line)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -285,28 +281,18 @@ def find_section(
 
     target: Section | None = None
     if label:
-        for s in sections:
-            if s.label == label:
-                target = s
-                break
+        target = next((s for s in sections if s.label == label), None)
     if target is None and title is not None:
-        for s in sections:
-            if s.title == title:
-                target = s
-                break
+        target = next((s for s in sections if s.title == title), None)
         if target is None:
             lc = title.lower()
-            for s in sections:
-                if s.title.lower() == lc:
-                    target = s
-                    break
+            target = next((s for s in sections if s.title.lower() == lc), None)
     if target is None:
         return None
 
-    # Determine end line: next section in the same file, or EOF
-    same_file_after = [s for s in sections if s.file == target.file and s.line > target.line]
-    if same_file_after:
-        end_line = min(s.line for s in same_file_after) - 1
-    else:
-        end_line = -1  # caller should treat as "to EOF"
+    # End line: line before the next section in the same file, or EOF (-1).
+    next_lines = [
+        s.line for s in sections if s.file == target.file and s.line > target.line
+    ]
+    end_line = min(next_lines) - 1 if next_lines else -1
     return (target.file, target.line, end_line)

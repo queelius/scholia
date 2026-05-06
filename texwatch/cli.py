@@ -22,12 +22,12 @@ from .comments import (
     CommentStore,
     PaperAnchor,
     PdfRegionAnchor,
+    ResolvedSource,
     SectionAnchor,
     SourceRangeAnchor,
     capture_snippet,
 )
 from .config import Config, create_config, find_config, load_config
-from .structure import find_section, parse_structure
 
 
 # ---------------------------------------------------------------------------
@@ -126,33 +126,21 @@ def _compile_result_dict(result) -> dict:
 
 
 def cmd_goto(args: argparse.Namespace) -> int:
+    import urllib.request
+
+    from .mcp_server import parse_goto_target
+
     cfg = load_config()
     port = args.port or cfg.port
-    target = args.target
+    body = parse_goto_target(args.target, default_file=cfg.main)
 
-    body: dict = {}
-    # Heuristics: page numbers (pN), file:line, or section title
-    if target.startswith("p") and target[1:].isdigit():
-        body["page"] = int(target[1:])
-    elif target.isdigit():
-        body["line"] = int(target)
-        body["file"] = cfg.main
-    elif ":" in target and target.rsplit(":", 1)[1].isdigit():
-        file, line = target.rsplit(":", 1)
-        body["file"] = file
-        body["line"] = int(line)
-    else:
-        body["section"] = target
-
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/goto",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        import urllib.request
-
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/goto",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         with urllib.request.urlopen(req, timeout=5) as resp:
             print(resp.read().decode())
         return 0
@@ -180,18 +168,77 @@ def cmd_mcp(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _store_for_cwd() -> CommentStore:
-    cfg = load_config()
-    if cfg.config_path:
-        watch_dir = cfg.config_path.parent
-    else:
-        watch_dir = Path.cwd()
-    return CommentStore(watch_dir / ".texwatch" / "comments.json")
-
-
 def _watch_dir() -> Path:
     cfg = load_config()
     return cfg.config_path.parent if cfg.config_path else Path.cwd()
+
+
+def _store_for_cwd() -> CommentStore:
+    return CommentStore(_watch_dir() / ".texwatch" / "comments.json")
+
+
+def _parse_source_arg(arg: str) -> tuple[str, int, int]:
+    """Parse a ``FILE:LSTART-LEND`` (or ``FILE:LINE``) source spec."""
+    file, lines = arg.rsplit(":", 1)
+    ls_str, _, le_str = lines.partition("-")
+    ls = int(ls_str)
+    le = int(le_str) if le_str else ls
+    return file, ls, le
+
+
+def _parse_pdf_arg(arg: str) -> tuple[int, tuple[float, float, float, float]]:
+    """Parse a ``PAGE:X1,Y1,X2,Y2`` PDF region spec."""
+    page_str, bbox_str = arg.split(":", 1)
+    x1, y1, x2, y2 = (float(v) for v in bbox_str.split(","))
+    return int(page_str), (x1, y1, x2, y2)
+
+
+def _build_add_anchor(
+    args: argparse.Namespace, watch_dir: Path
+) -> tuple[object | None, ResolvedSource | None, str | None, int]:
+    """Build the anchor + resolved source + snippet from cli args.
+
+    Returns (anchor, resolved_source, snippet, exit_code).  When exit_code
+    is non-zero the caller should bail and return it; otherwise *anchor*
+    is non-None.
+    """
+    from .server import resolve_section_to_source
+    from .structure import parse_structure
+
+    if args.paper:
+        return PaperAnchor(), None, None, 0
+
+    if args.section is not None:
+        anchor = SectionAnchor(title=args.section, label=args.label)
+        resolved = resolve_section_to_source(
+            parse_structure(watch_dir), watch_dir, args.section, args.label
+        )
+        if resolved is None:
+            print(f"warning: no section matching {args.section!r}", file=sys.stderr)
+        return anchor, resolved, None, 0
+
+    if args.source is not None:
+        try:
+            file, ls, le = _parse_source_arg(args.source)
+        except (ValueError, IndexError):
+            print("--source must be FILE:LSTART-LEND (e.g. intro.tex:42-58)", file=sys.stderr)
+            return None, None, None, 1
+        snippet = capture_snippet(watch_dir / file, ls, le) or None
+        resolved = ResolvedSource(
+            file=file, line_start=ls, line_end=le, excerpt=snippet or ""
+        )
+        return SourceRangeAnchor(file=file, line_start=ls, line_end=le), resolved, snippet, 0
+
+    if args.pdf is not None:
+        try:
+            page, bbox = _parse_pdf_arg(args.pdf)
+        except (ValueError, IndexError):
+            print("--pdf must be PAGE:X1,Y1,X2,Y2 (PDF points)", file=sys.stderr)
+            return None, None, None, 1
+        return PdfRegionAnchor(page=page, bbox=bbox), None, None, 0
+
+    print("one of --paper/--section/--source/--pdf is required", file=sys.stderr)
+    return None, None, None, 1
 
 
 def cmd_comment_add(args: argparse.Namespace) -> int:
@@ -203,75 +250,23 @@ def cmd_comment_add(args: argparse.Namespace) -> int:
         --source <file>:<lstart>-<lend>   explicit source range
         --pdf <page>:<x1>,<y1>,<x2>,<y2>  PDF region (advanced)
     """
-    text = args.text
-    tags = args.tag or []
-
-    anchor = None
-    resolved = None
-    snippet = None
     watch_dir = _watch_dir()
+    anchor, resolved, snippet, rc = _build_add_anchor(args, watch_dir)
+    if rc != 0 or anchor is None:
+        return rc
 
-    if args.paper:
-        anchor = PaperAnchor()
-    elif args.section is not None:
-        anchor = SectionAnchor(title=args.section, label=args.label)
-        # Try to resolve immediately for convenience
-        structure = parse_structure(watch_dir)
-        match = find_section(structure, title=args.section, label=args.label)
-        if match is None:
-            print(f"warning: no section matching {args.section!r}", file=sys.stderr)
-        else:
-            from .comments import ResolvedSource
-
-            file, ls, le = match
-            if le < 0:
-                try:
-                    le = len((watch_dir / file).read_text(errors="replace").splitlines())
-                except OSError:
-                    le = ls
-            resolved = ResolvedSource(file=file, line_start=ls, line_end=le)
-    elif args.source is not None:
-        try:
-            file, lines = args.source.rsplit(":", 1)
-            ls_str, le_str = (lines.split("-") + [None])[:2]
-            ls = int(ls_str)
-            le = int(le_str) if le_str else ls
-        except (ValueError, IndexError):
-            print("--source must be FILE:LSTART-LEND (e.g. intro.tex:42-58)", file=sys.stderr)
-            return 1
-        anchor = SourceRangeAnchor(file=file, line_start=ls, line_end=le)
-        snippet = capture_snippet(watch_dir / file, ls, le) or None
-        from .comments import ResolvedSource
-
-        resolved = ResolvedSource(file=file, line_start=ls, line_end=le, excerpt=snippet or "")
-    elif args.pdf is not None:
-        try:
-            page_str, bbox_str = args.pdf.split(":", 1)
-            page = int(page_str)
-            x1, y1, x2, y2 = (float(v) for v in bbox_str.split(","))
-        except (ValueError, IndexError):
-            print(
-                "--pdf must be PAGE:X1,Y1,X2,Y2 (PDF points)", file=sys.stderr
-            )
-            return 1
-        anchor = PdfRegionAnchor(page=page, bbox=(x1, y1, x2, y2))
-    else:
-        print("one of --paper/--section/--source/--pdf is required", file=sys.stderr)
-        return 1
-
-    store = _store_for_cwd()
-    comment = store.add(
+    comment = _store_for_cwd().add(
         anchor=anchor,
-        text=text,
+        text=args.text,
         author=args.author,
-        tags=tags,
+        tags=args.tag or [],
         resolved_source=resolved,
         snippet=snippet,
     )
     if args.json:
         print(json.dumps(comment.to_dict(), indent=2))
     else:
-        print(f"{comment.id}  {anchor_summary(anchor)}  {text}")
+        print(f"{comment.id}  {anchor_summary(anchor)}  {args.text}")
     return 0
 
 
@@ -326,47 +321,44 @@ def cmd_comment_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_comment_resolve(args: argparse.Namespace) -> int:
-    store = _store_for_cwd()
+def _print_or_missing(args: argparse.Namespace, action, past_tense: str) -> int:
+    """Run *action* (no-arg) on the comment store; print success or "no comment"."""
     try:
-        c = store.resolve(
-            args.id,
-            summary=args.summary,
-            edits=args.edit or [],
-            author=args.author,
-        )
+        c = action()
     except KeyError:
         print(f"no comment {args.id}", file=sys.stderr)
         return 1
-    print(f"resolved {c.id}")
+    print(f"{past_tense} {c.id}")
     return 0
+
+
+def cmd_comment_resolve(args: argparse.Namespace) -> int:
+    store = _store_for_cwd()
+    return _print_or_missing(
+        args,
+        lambda: store.resolve(
+            args.id, summary=args.summary, edits=args.edit or [], author=args.author
+        ),
+        "resolved",
+    )
 
 
 def cmd_comment_dismiss(args: argparse.Namespace) -> int:
     store = _store_for_cwd()
-    try:
-        c = store.dismiss(args.id, reason=args.reason, author=args.author)
-    except KeyError:
-        print(f"no comment {args.id}", file=sys.stderr)
-        return 1
-    print(f"dismissed {c.id}")
-    return 0
+    return _print_or_missing(
+        args, lambda: store.dismiss(args.id, reason=args.reason, author=args.author), "dismissed"
+    )
 
 
 def cmd_comment_reopen(args: argparse.Namespace) -> int:
     store = _store_for_cwd()
-    try:
-        c = store.reopen(args.id, author=args.author)
-    except KeyError:
-        print(f"no comment {args.id}", file=sys.stderr)
-        return 1
-    print(f"reopened {c.id}")
-    return 0
+    return _print_or_missing(
+        args, lambda: store.reopen(args.id, author=args.author), "reopened"
+    )
 
 
 def cmd_comment_delete(args: argparse.Namespace) -> int:
-    store = _store_for_cwd()
-    if store.delete(args.id):
+    if _store_for_cwd().delete(args.id):
         print(f"deleted {args.id}")
         return 0
     print(f"no comment {args.id}", file=sys.stderr)

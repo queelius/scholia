@@ -27,7 +27,6 @@ from typing import Any
 
 try:
     from mcp.server.fastmcp import FastMCP
-    from mcp.types import TextContent
 
     HAS_MCP = True
 except ImportError:
@@ -74,43 +73,85 @@ def _result_to_dict(result) -> dict[str, Any]:
     }
 
 
-def _structure_to_paper_dict(structure, watch_dir: Path) -> dict[str, Any]:
-    from .structure import find_section
+def _err(message: str) -> str:
+    return json.dumps({"error": message})
 
-    sections_with_ends: list[dict] = []
-    for s in structure.sections:
-        match = find_section(structure, title=s.title, label=s.label)
-        line_end = match[2] if match else -1
-        if line_end < 0:
-            try:
-                line_end = len(
-                    (watch_dir / s.file).read_text(errors="replace").splitlines()
-                )
-            except OSError:
-                line_end = s.line
-        sections_with_ends.append(
-            {
-                "level": s.level,
-                "title": s.title,
-                "file": s.file,
-                "line": s.line,
-                "line_end": line_end,
-                "label": s.label,
-            }
+
+def _ok(payload: Any) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _comment_add(
+    store,
+    cfg,
+    watch_dir: Path,
+    text: str | None,
+    anchor: dict[str, Any] | None,
+    author: str,
+    tags: list[str] | None,
+) -> str:
+    """Implementation of ``texwatch_comment(action="add", ...)``.
+
+    Resolves source-bearing anchors via the same helpers the HTTP server
+    uses, so the two surfaces produce identical ``resolved_source``
+    metadata.  For ``pdf_region`` anchors, loads the cached SyncTeX file
+    next to the rendered PDF (no daemon required).
+    """
+    from .comments import ResolvedSource, anchor_from_dict, capture_snippet
+    from .config import get_main_file
+    from .server import (
+        load_synctex_for_main,
+        resolve_pdf_region_to_source,
+        resolve_section_to_source,
+    )
+    from .structure import parse_structure
+
+    if not text or not anchor:
+        return _err("add requires text and anchor")
+
+    a = anchor_from_dict(anchor)
+    resolved: ResolvedSource | None = None
+    snippet: str | None = None
+    kind = anchor.get("kind")
+
+    if kind == "source_range":
+        file = anchor["file"]
+        ls = int(anchor["line_start"])
+        le = int(anchor["line_end"])
+        snippet = capture_snippet(watch_dir / file, ls, le) or None
+        resolved = ResolvedSource(
+            file=file, line_start=ls, line_end=le, excerpt=snippet or ""
         )
+    elif kind == "section":
+        resolved = resolve_section_to_source(
+            parse_structure(watch_dir), watch_dir, anchor.get("title"), anchor.get("label")
+        )
+    elif kind == "pdf_region":
+        synctex = load_synctex_for_main(get_main_file(cfg))
+        bbox = anchor.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+        resolved = resolve_pdf_region_to_source(
+            synctex,
+            int(anchor.get("page", 1)),
+            (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+        )
+        if resolved is not None:
+            snippet = (
+                capture_snippet(
+                    watch_dir / resolved.file, resolved.line_start, resolved.line_end
+                )
+                or None
+            )
+            resolved.excerpt = snippet or ""
 
-    return {
-        "sections": sections_with_ends,
-        "labels": [{"name": l.name, "file": l.file, "line": l.line} for l in structure.labels],
-        "citations": [{"key": c.key, "file": c.file, "line": c.line} for c in structure.citations],
-        "inputs": [{"path": i.path, "file": i.file, "line": i.line} for i in structure.inputs],
-    }
-
-
-def _build_anchor(anchor_dict: dict[str, Any]):
-    from .comments import anchor_from_dict
-
-    return anchor_from_dict(anchor_dict)
+    comment = store.add(
+        anchor=a,
+        text=text,
+        author=author,
+        tags=tags or [],
+        resolved_source=resolved,
+        snippet=snippet,
+    )
+    return _ok(comment.to_dict())
 
 
 # ---------------------------------------------------------------------------
@@ -130,36 +171,33 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         This is the "what does my paper look like right now" oracle.  Call
         once per session to orient.
         """
-        from .compiler import compile_tex
         from .config import get_main_file
+        from .server import structure_to_dict
         from .structure import parse_structure
 
         cfg, watch_dir, store = _load_project()
         structure = parse_structure(watch_dir)
 
-        # Try to find an existing compile output without re-running latexmk
-        # (we only return what's cached on disk; use texwatch_compile() to
-        # actively trigger a build).
-        main = get_main_file(cfg)
-        pdf_path = main.with_suffix(".pdf")
-        cached = {"pdf_exists": pdf_path.exists(), "pdf_path": str(pdf_path)}
+        # Read cached compile output (use texwatch_compile() to trigger a build).
+        pdf_path = get_main_file(cfg).with_suffix(".pdf")
+        open_comments = store.list(status="open")
 
-        comment_summary = {
-            "open": len(store.list(status="open")),
-            "resolved": len(store.list(status="resolved")),
-            "dismissed": len(store.list(status="dismissed")),
-            "stale": sum(1 for c in store.list(status="open") if c.stale),
-        }
-
-        return json.dumps(
+        return _ok(
             {
                 "main_file": cfg.main,
                 "watch_dir": str(watch_dir),
-                **_structure_to_paper_dict(structure, watch_dir),
-                "compile_cache": cached,
-                "comments": comment_summary,
-            },
-            indent=2,
+                **structure_to_dict(structure, watch_dir),
+                "compile_cache": {
+                    "pdf_exists": pdf_path.exists(),
+                    "pdf_path": str(pdf_path),
+                },
+                "comments": {
+                    "open": len(open_comments),
+                    "resolved": len(store.list(status="resolved")),
+                    "dismissed": len(store.list(status="dismissed")),
+                    "stale": sum(1 for c in open_comments if c.stale),
+                },
+            }
         )
 
     @mcp.tool()
@@ -171,12 +209,13 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         re-reading the full latexmk log.
         """
         from .compiler import compile_tex
-        from .config import get_main_file, get_watch_dir
+        from .config import get_main_file
 
         cfg, watch_dir, _ = _load_project()
-        main = get_main_file(cfg)
-        result = await compile_tex(main, compiler=cfg.compiler, work_dir=watch_dir)
-        return json.dumps(_result_to_dict(result), indent=2)
+        result = await compile_tex(
+            get_main_file(cfg), compiler=cfg.compiler, work_dir=watch_dir
+        )
+        return _ok(_result_to_dict(result))
 
     @mcp.tool()
     async def texwatch_comments(
@@ -191,14 +230,9 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         Each comment has an anchor (paper / section / source_range / pdf_region),
         a thread of entries, an optional resolved_source, and a stale flag.
         """
-        cfg, watch_dir, store = _load_project()
-        s = None if status == "all" else status
-        comments = store.list(status=s, tags=tags)
-        return json.dumps(
-            {"comments": [c.to_dict() for c in comments]},
-            indent=2,
-            ensure_ascii=False,
-        )
+        _, _, store = _load_project()
+        comments = store.list(status=None if status == "all" else status, tags=tags)
+        return _ok({"comments": [c.to_dict() for c in comments]})
 
     @mcp.tool()
     async def texwatch_comment(
@@ -231,87 +265,44 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         Edits is a list of strings describing what was changed when resolving:
           ["intro.tex:42-58 -> :42-78", "added theorem 2.1"]
         """
-        from .comments import ResolvedSource, capture_snippet
-        from .structure import find_section, parse_structure
-
         cfg, watch_dir, store = _load_project()
 
+        # Each handler returns the JSON response or an error string.
+        # We share the KeyError -> "not found" trap across all branches.
         try:
             if action == "add":
-                if not text or not anchor:
-                    return json.dumps({"error": "add requires text and anchor"})
-                a = _build_anchor(anchor)
-                # Resolve and capture snippet for source/section anchors
-                resolved: ResolvedSource | None = None
-                snippet: str | None = None
-                if anchor["kind"] == "source_range":
-                    file = anchor["file"]
-                    ls = int(anchor["line_start"])
-                    le = int(anchor["line_end"])
-                    snippet = capture_snippet(watch_dir / file, ls, le) or None
-                    resolved = ResolvedSource(file=file, line_start=ls, line_end=le, excerpt=snippet or "")
-                elif anchor["kind"] == "section":
-                    structure = parse_structure(watch_dir)
-                    match = find_section(
-                        structure, title=anchor.get("title"), label=anchor.get("label")
-                    )
-                    if match is not None:
-                        f, ls, le = match
-                        if le < 0:
-                            try:
-                                le = len(
-                                    (watch_dir / f).read_text(errors="replace").splitlines()
-                                )
-                            except OSError:
-                                le = ls
-                        resolved = ResolvedSource(file=f, line_start=ls, line_end=le)
-
-                comment = store.add(
-                    anchor=a,
-                    text=text,
-                    author=author,
-                    tags=tags or [],
-                    resolved_source=resolved,
-                    snippet=snippet,
-                )
-                return json.dumps(comment.to_dict(), indent=2)
-
+                return _comment_add(store, cfg, watch_dir, text, anchor, author, tags)
             if action == "reply":
                 if not id or not text:
-                    return json.dumps({"error": "reply requires id and text"})
-                c = store.reply(id, text=text, author=author, edits=edits or [])
-                return json.dumps(c.to_dict(), indent=2)
-
+                    return _err("reply requires id and text")
+                return _ok(
+                    store.reply(id, text=text, author=author, edits=edits or []).to_dict()
+                )
             if action == "resolve":
                 if not id or not summary:
-                    return json.dumps({"error": "resolve requires id and summary"})
-                c = store.resolve(id, summary=summary, edits=edits or [], author=author)
-                return json.dumps(c.to_dict(), indent=2)
-
+                    return _err("resolve requires id and summary")
+                return _ok(
+                    store.resolve(
+                        id, summary=summary, edits=edits or [], author=author
+                    ).to_dict()
+                )
             if action == "dismiss":
                 if not id or not reason:
-                    return json.dumps({"error": "dismiss requires id and reason"})
-                c = store.dismiss(id, reason=reason, author=author)
-                return json.dumps(c.to_dict(), indent=2)
-
+                    return _err("dismiss requires id and reason")
+                return _ok(store.dismiss(id, reason=reason, author=author).to_dict())
             if action == "reopen":
                 if not id:
-                    return json.dumps({"error": "reopen requires id"})
-                c = store.reopen(id, author=author)
-                return json.dumps(c.to_dict(), indent=2)
-
+                    return _err("reopen requires id")
+                return _ok(store.reopen(id, author=author).to_dict())
             if action == "delete":
                 if not id:
-                    return json.dumps({"error": "delete requires id"})
-                ok = store.delete(id)
-                return json.dumps({"deleted": id, "ok": ok})
-
-            return json.dumps({"error": f"unknown action: {action}"})
-
+                    return _err("delete requires id")
+                return _ok({"deleted": id, "ok": store.delete(id)})
+            return _err(f"unknown action: {action}")
         except KeyError as exc:
-            return json.dumps({"error": f"comment not found: {exc}"})
-        except (ValueError, KeyError, TypeError) as exc:
-            return json.dumps({"error": str(exc)})
+            return _err(f"comment not found: {exc}")
+        except (ValueError, TypeError) as exc:
+            return _err(str(exc))
 
     @mcp.tool()
     async def texwatch_goto(target: str, port: int = daemon_port) -> str:
@@ -323,30 +314,48 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         try:
             import httpx
         except ImportError:
-            return json.dumps({"error": "httpx not installed; install texwatch[mcp]"})
+            return _err("httpx not installed; install texwatch[mcp]")
 
-        body: dict[str, Any] = {}
-        if target.startswith("p") and target[1:].isdigit():
-            body["page"] = int(target[1:])
-        elif target.isdigit():
-            cfg, _, _ = _load_project()
-            body["line"] = int(target)
-            body["file"] = cfg.main
-        elif ":" in target and target.rsplit(":", 1)[1].isdigit():
-            file, line = target.rsplit(":", 1)
-            body["file"] = file
-            body["line"] = int(line)
-        else:
-            body["section"] = target
-
+        cfg, _, _ = _load_project()
+        body = parse_goto_target(target, default_file=cfg.main)
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.post(f"http://127.0.0.1:{port}/goto", json=body)
                 return resp.text
         except Exception as exc:
-            return json.dumps({"error": f"daemon at port {port} not reachable: {exc}"})
+            return _err(f"daemon at port {port} not reachable: {exc}")
 
     return mcp
+
+
+import re
+
+# A LaTeX-style label: short alpha prefix + colon + identifier without spaces.
+# Matches ``sec:methods``, ``eq:foo-bar``, ``thm:main``.  Does *not* match
+# ``Introduction: A Survey`` (space) or filenames (long prefix / has dot).
+_LABEL_LIKE = re.compile(r"^[a-zA-Z]{2,8}:[A-Za-z0-9_.\-:]+$")
+
+
+def parse_goto_target(target: str, default_file: str) -> dict[str, Any]:
+    """Convert a CLI/MCP goto target string into a request body for ``/goto``.
+
+    Recognized forms (in order):
+      ``pN``         -> ``{"page": N}``
+      ``N``          -> ``{"line": N, "file": default_file}``
+      ``FILE:N``     -> ``{"file": FILE, "line": N}``  (right-hand side digits)
+      ``sec:foo``    -> ``{"label": "sec:foo"}``       (LaTeX label syntax)
+      anything else  -> ``{"section": target}``
+    """
+    if target.startswith("p") and target[1:].isdigit():
+        return {"page": int(target[1:])}
+    if target.isdigit():
+        return {"line": int(target), "file": default_file}
+    if ":" in target and target.rsplit(":", 1)[1].isdigit():
+        file, line = target.rsplit(":", 1)
+        return {"file": file, "line": int(line)}
+    if _LABEL_LIKE.match(target):
+        return {"label": target}
+    return {"section": target}
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ import asyncio
 import dataclasses
 import json
 import logging
-from datetime import datetime, timezone
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,10 @@ STATIC_DIR = Path(__file__).parent / "static"
 # ---------------------------------------------------------------------------
 
 
+def _comment_to_dict(c: Comment) -> dict[str, Any]:
+    return c.to_dict()
+
+
 def _result_to_dict(r: CompileResult | None) -> dict[str, Any] | None:
     if r is None:
         return None
@@ -73,31 +77,63 @@ def _result_to_dict(r: CompileResult | None) -> dict[str, Any] | None:
     }
 
 
-def _comment_to_dict(c: Comment) -> dict[str, Any]:
-    return c.to_dict()
+def _eof_line(path: Path, fallback: int) -> int:
+    """Total line count of *path*, or *fallback* on failure."""
+    try:
+        return len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return fallback
 
 
-def _section_resolver_factory(structure: DocumentStructure, watch_dir: Path):
-    """Create a sections_resolver for CommentStore.check_staleness."""
+def resolve_section_to_source(
+    structure: DocumentStructure, watch_dir: Path, title: str | None, label: str | None
+) -> ResolvedSource | None:
+    """Look up a section in *structure* and return a fully-resolved source range.
 
-    def resolver(title: str, label: str | None) -> ResolvedSource | None:
-        match = find_section(structure, title=title, label=label)
-        if match is None:
-            return None
-        file, line_start, line_end = match
+    Returns None when no matching section exists.  When the section runs to
+    end-of-file (``line_end < 0`` from :func:`find_section`), reads the file
+    to compute the true EOF line.
+    """
+    match = find_section(structure, title=title, label=label)
+    if match is None:
+        return None
+    file, line_start, line_end = match
+    if line_end < 0:
+        line_end = _eof_line(watch_dir / file, line_start)
+    return ResolvedSource(file=file, line_start=line_start, line_end=line_end)
+
+
+def structure_to_dict(
+    structure: DocumentStructure, watch_dir: Path
+) -> dict[str, list[dict[str, Any]]]:
+    """JSON-serializable view of :class:`DocumentStructure`, with end-line
+    annotations for sections.  Shared by the HTTP and MCP ``paper`` views.
+    """
+    sections: list[dict[str, Any]] = []
+    for s in structure.sections:
+        match = find_section(structure, title=s.title, label=s.label)
+        line_end = match[2] if match else -1
         if line_end < 0:
-            # "to EOF" — read file to find actual EOF line
-            path = watch_dir / file
-            try:
-                line_end = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
-            except OSError:
-                line_end = line_start
-        return ResolvedSource(file=file, line_start=line_start, line_end=line_end)
+            line_end = _eof_line(watch_dir / s.file, s.line)
+        sections.append(
+            {
+                "level": s.level,
+                "title": s.title,
+                "file": s.file,
+                "line": s.line,
+                "line_end": line_end,
+                "label": s.label,
+            }
+        )
+    return {
+        "sections": sections,
+        "labels": [{"name": l.name, "file": l.file, "line": l.line} for l in structure.labels],
+        "citations": [{"key": c.key, "file": c.file, "line": c.line} for c in structure.citations],
+        "inputs": [{"path": i.path, "file": i.file, "line": i.line} for i in structure.inputs],
+    }
 
-    return resolver
 
-
-def _resolve_pdf_region_to_source(
+def resolve_pdf_region_to_source(
     synctex: SyncTeXData | None,
     page: int,
     bbox: tuple[float, float, float, float],
@@ -105,13 +141,28 @@ def _resolve_pdf_region_to_source(
     """Use SyncTeX to map a PDF bbox center to a source range."""
     if synctex is None:
         return None
-    # Use bbox centroid y for resolution
     _, y1, _, y2 = bbox
-    y_center = (y1 + y2) / 2
-    src = page_to_source(synctex, page, y_center)
+    src = page_to_source(synctex, page, (y1 + y2) / 2)
     if src is None:
         return None
     return ResolvedSource(file=src.file, line_start=src.line, line_end=src.line)
+
+
+def load_synctex_for_main(main_file: Path) -> SyncTeXData | None:
+    """Find and parse the .synctex.gz next to *main_file*'s rendered PDF.
+
+    Returns None if no PDF/SyncTeX exists yet (first compile hasn't run,
+    or the compiler doesn't produce SyncTeX, e.g. pandoc).  Useful for
+    out-of-process callers (the MCP server) that need to do PDF-region
+    resolution without owning the daemon's state.
+    """
+    pdf_path = main_file.with_suffix(".pdf")
+    if not pdf_path.exists():
+        return None
+    synctex_path = find_synctex_file(pdf_path)
+    if synctex_path is None:
+        return None
+    return parse_synctex(synctex_path)
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +235,8 @@ class TexWatchServer:
             if self.structure:
                 self.comments.check_staleness(
                     self.watch_dir,
-                    sections_resolver=_section_resolver_factory(
-                        self.structure, self.watch_dir
+                    sections_resolver=lambda title, label: resolve_section_to_source(
+                        self.structure, self.watch_dir, title, label
                     ),
                 )
             logger.info(
@@ -215,6 +266,12 @@ class TexWatchServer:
                 await ws.send_json(msg)
             except Exception:
                 self.websockets.discard(ws)
+                # Best-effort close so the underlying socket releases its
+                # fd / task; a flaky reconnect loop would otherwise leak.
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
 
     async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=30)
@@ -260,11 +317,12 @@ class TexWatchServer:
     # ----- API: errors / paper / compile -----
 
     async def _handle_errors(self, request: web.Request) -> web.Response:
+        r = self.last_result
         return web.json_response(
             {
-                "success": self.last_result.success if self.last_result else None,
-                "errors": [dataclasses.asdict(e) for e in (self.last_result.errors if self.last_result else [])],
-                "warnings": [dataclasses.asdict(w) for w in (self.last_result.warnings if self.last_result else [])],
+                "success": r.success if r else None,
+                "errors": [dataclasses.asdict(e) for e in (r.errors if r else [])],
+                "warnings": [dataclasses.asdict(w) for w in (r.warnings if r else [])],
             }
         )
 
@@ -272,60 +330,25 @@ class TexWatchServer:
         if self.structure is None:
             self.structure = parse_structure(self.watch_dir)
 
-        # Compute end_line for each section
-        sections_with_ends: list[dict[str, Any]] = []
-        for s in self.structure.sections:
-            match = find_section(self.structure, title=s.title, label=s.label)
-            line_end = match[2] if match else -1
-            if line_end < 0:
-                # to EOF
-                try:
-                    abs_path = self.watch_dir / s.file
-                    line_end = len(
-                        abs_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                    )
-                except OSError:
-                    line_end = s.line
-            sections_with_ends.append(
-                {
-                    "level": s.level,
-                    "title": s.title,
-                    "file": s.file,
-                    "line": s.line,
-                    "line_end": line_end,
-                    "label": s.label,
-                }
-            )
-
-        comment_summary = {
-            "open": len(self.comments.list(status="open")),
-            "resolved": len(self.comments.list(status="resolved")),
-            "dismissed": len(self.comments.list(status="dismissed")),
-            "stale": sum(1 for c in self.comments.list(status="open") if c.stale),
-        }
-
         return web.json_response(
             {
                 "main_file": self.config.main,
                 "watch_dir": str(self.watch_dir),
                 "compiling": self.compiling,
                 "last_compile": _result_to_dict(self.last_result),
-                "sections": sections_with_ends,
-                "labels": [
-                    {"name": l.name, "file": l.file, "line": l.line}
-                    for l in self.structure.labels
-                ],
-                "citations": [
-                    {"key": c.key, "file": c.file, "line": c.line}
-                    for c in self.structure.citations
-                ],
-                "inputs": [
-                    {"path": i.path, "file": i.file, "line": i.line}
-                    for i in self.structure.inputs
-                ],
-                "comments": comment_summary,
+                **structure_to_dict(self.structure, self.watch_dir),
+                "comments": self._comment_summary(),
             }
         )
+
+    def _comment_summary(self) -> dict[str, int]:
+        open_comments = self.comments.list(status="open")
+        return {
+            "open": len(open_comments),
+            "resolved": len(self.comments.list(status="resolved")),
+            "dismissed": len(self.comments.list(status="dismissed")),
+            "stale": sum(1 for c in open_comments if c.stale),
+        }
 
     async def _handle_compile(self, request: web.Request) -> web.Response:
         result = await self.do_compile()
@@ -335,13 +358,12 @@ class TexWatchServer:
 
     async def _handle_list_comments(self, request: web.Request) -> web.Response:
         status = request.query.get("status")
-        tags = request.query.getall("tag", [])
-        kwargs: dict[str, Any] = {}
-        if status in ("open", "resolved", "dismissed"):
-            kwargs["status"] = status
-        if tags:
-            kwargs["tags"] = tags
-        comments = self.comments.list(**kwargs)
+        if status not in ("open", "resolved", "dismissed"):
+            status = None  # type: ignore[assignment]
+        comments = self.comments.list(
+            status=status,  # type: ignore[arg-type]
+            tags=request.query.getall("tag", []) or None,
+        )
         return web.json_response(
             {"comments": [_comment_to_dict(c) for c in comments]}
         )
@@ -354,16 +376,12 @@ class TexWatchServer:
         return web.json_response(_comment_to_dict(c))
 
     async def _handle_create_comment(self, request: web.Request) -> web.Response:
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        data, err = await self._read_json(request)
+        if err is not None:
+            return err
 
         anchor_d = data.get("anchor")
         text = data.get("text", "").strip()
-        author = data.get("author", "human")
-        tags = data.get("tags") or []
-
         if not anchor_d or not text:
             return web.json_response(
                 {"error": "anchor and text are required"}, status=400
@@ -373,28 +391,41 @@ class TexWatchServer:
         except (ValueError, KeyError, TypeError) as exc:
             return web.json_response({"error": f"invalid anchor: {exc}"}, status=400)
 
-        # Resolve to source location and capture snippet
         resolved, snippet = self._resolve_anchor(anchor)
-
         comment = self.comments.add(
             anchor=anchor,
             text=text,
-            author=author,
-            tags=tags,
+            author=data.get("author", "human"),
+            tags=data.get("tags") or [],
             resolved_source=resolved,
             snippet=snippet,
         )
         await self.broadcast({"type": "comment_added", "comment": _comment_to_dict(comment)})
         return web.json_response(_comment_to_dict(comment), status=201)
 
-    def _resolve_anchor(self, anchor) -> tuple[ResolvedSource | None, str | None]:
-        """Resolve a freshly-created anchor to (source location, snippet)."""
+    def _resolve_anchor(self, anchor: Any) -> tuple[ResolvedSource | None, str | None]:
+        """Resolve a freshly-created anchor to (source location, snippet).
+
+        Section anchors don't store a snippet (they re-resolve via the
+        structure parser); paper anchors carry no source location at all.
+        """
         if isinstance(anchor, PaperAnchor):
             return None, None
 
+        if isinstance(anchor, SectionAnchor):
+            if self.structure is None:
+                self.structure = parse_structure(self.watch_dir)
+            return (
+                resolve_section_to_source(
+                    self.structure, self.watch_dir, anchor.title, anchor.label
+                ),
+                None,
+            )
+
         if isinstance(anchor, SourceRangeAnchor):
-            file_path = self.watch_dir / anchor.file
-            snippet = capture_snippet(file_path, anchor.line_start, anchor.line_end)
+            snippet = capture_snippet(
+                self.watch_dir / anchor.file, anchor.line_start, anchor.line_end
+            )
             return (
                 ResolvedSource(
                     file=anchor.file,
@@ -405,112 +436,98 @@ class TexWatchServer:
                 snippet or None,
             )
 
-        if isinstance(anchor, SectionAnchor):
-            if self.structure is None:
-                self.structure = parse_structure(self.watch_dir)
-            match = find_section(self.structure, title=anchor.title, label=anchor.label)
-            if match is None:
-                return None, None
-            file, line_start, line_end = match
-            if line_end < 0:
-                path = self.watch_dir / file
-                try:
-                    line_end = len(
-                        path.read_text(encoding="utf-8", errors="replace").splitlines()
-                    )
-                except OSError:
-                    line_end = line_start
-            # Section anchors don't store a snippet — they re-resolve via
-            # the structure parser instead.
-            return (
-                ResolvedSource(file=file, line_start=line_start, line_end=line_end),
-                None,
-            )
-
         if isinstance(anchor, PdfRegionAnchor):
-            resolved = _resolve_pdf_region_to_source(self.synctex_data, anchor.page, anchor.bbox)
+            resolved = resolve_pdf_region_to_source(
+                self.synctex_data, anchor.page, anchor.bbox
+            )
             if resolved is None:
                 return None, None
-            file_path = self.watch_dir / resolved.file
-            snippet = capture_snippet(file_path, resolved.line_start, resolved.line_end)
+            snippet = capture_snippet(
+                self.watch_dir / resolved.file, resolved.line_start, resolved.line_end
+            )
             resolved.excerpt = snippet
             return resolved, snippet or None
 
         return None, None
 
+    async def _read_json(self, request: web.Request) -> tuple[dict[str, Any] | None, web.Response | None]:
+        """Decode the request JSON body or return a 400 error response."""
+        try:
+            return await request.json(), None
+        except json.JSONDecodeError:
+            return None, web.json_response({"error": "invalid JSON"}, status=400)
+
+    async def _mutate_comment(
+        self,
+        cid: str,
+        action: Callable[[], Comment],
+    ) -> web.Response:
+        """Run *action* (a no-arg call into the store), broadcast, return the updated comment."""
+        try:
+            updated = action()
+        except KeyError:
+            return web.json_response({"error": f"no comment {cid}"}, status=404)
+        await self.broadcast({"type": "comment_updated", "comment": _comment_to_dict(updated)})
+        return web.json_response(_comment_to_dict(updated))
+
     async def _handle_reply_comment(self, request: web.Request) -> web.Response:
         cid = request.match_info["id"]
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        data, err = await self._read_json(request)
+        if err is not None:
+            return err
         text = (data.get("text") or "").strip()
         if not text:
             return web.json_response({"error": "text is required"}, status=400)
-        try:
-            updated = self.comments.reply(
+        return await self._mutate_comment(
+            cid,
+            lambda: self.comments.reply(
                 cid,
                 text=text,
                 author=data.get("author", "human"),
                 edits=data.get("edits") or [],
-            )
-        except KeyError:
-            return web.json_response({"error": f"no comment {cid}"}, status=404)
-        await self.broadcast({"type": "comment_updated", "comment": _comment_to_dict(updated)})
-        return web.json_response(_comment_to_dict(updated))
+            ),
+        )
 
     async def _handle_resolve_comment(self, request: web.Request) -> web.Response:
         cid = request.match_info["id"]
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        data, err = await self._read_json(request)
+        if err is not None:
+            return err
         summary = (data.get("summary") or "").strip()
         if not summary:
             return web.json_response({"error": "summary is required"}, status=400)
-        try:
-            updated = self.comments.resolve(
+        return await self._mutate_comment(
+            cid,
+            lambda: self.comments.resolve(
                 cid,
                 summary=summary,
                 edits=data.get("edits") or [],
                 author=data.get("author", "claude"),
-            )
-        except KeyError:
-            return web.json_response({"error": f"no comment {cid}"}, status=404)
-        await self.broadcast({"type": "comment_updated", "comment": _comment_to_dict(updated)})
-        return web.json_response(_comment_to_dict(updated))
+            ),
+        )
 
     async def _handle_dismiss_comment(self, request: web.Request) -> web.Response:
         cid = request.match_info["id"]
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        data, err = await self._read_json(request)
+        if err is not None:
+            return err
         reason = (data.get("reason") or "").strip()
         if not reason:
             return web.json_response({"error": "reason is required"}, status=400)
-        try:
-            updated = self.comments.dismiss(
+        return await self._mutate_comment(
+            cid,
+            lambda: self.comments.dismiss(
                 cid, reason=reason, author=data.get("author", "human")
-            )
-        except KeyError:
-            return web.json_response({"error": f"no comment {cid}"}, status=404)
-        await self.broadcast({"type": "comment_updated", "comment": _comment_to_dict(updated)})
-        return web.json_response(_comment_to_dict(updated))
+            ),
+        )
 
     async def _handle_reopen_comment(self, request: web.Request) -> web.Response:
         cid = request.match_info["id"]
-        try:
-            updated = self.comments.reopen(cid)
-        except KeyError:
-            return web.json_response({"error": f"no comment {cid}"}, status=404)
-        await self.broadcast({"type": "comment_updated", "comment": _comment_to_dict(updated)})
-        return web.json_response(_comment_to_dict(updated))
+        return await self._mutate_comment(cid, lambda: self.comments.reopen(cid))
 
     async def _handle_delete_comment(self, request: web.Request) -> web.Response:
         cid = request.match_info["id"]
-        ok = self.comments.delete(cid)
-        if not ok:
+        if not self.comments.delete(cid):
             return web.json_response({"error": f"no comment {cid}"}, status=404)
         await self.broadcast({"type": "comment_deleted", "id": cid})
         return web.json_response({"deleted": cid})
@@ -559,40 +576,72 @@ class TexWatchServer:
     async def _handle_goto(self, request: web.Request) -> web.Response:
         """Tell the viewer to scroll/highlight a target.
 
-        Body: {"section": "...", "line": N, "page": N, "file": "..."} (one of section/line/page).
-        Broadcasts a goto event over the WebSocket.
+        Body keys (use exactly one of section/label/line/page):
+            section  section title (case-insensitive title match)
+            label    \\label{...} value
+            line + file  source line number in *file*
+            page     PDF page number
+
+        Returns 200 with ``{page}`` when SyncTeX resolved a page, or 200
+        with ``{file, line, page: null}`` when a section/label matched a
+        source location but SyncTeX is unavailable (caller can still
+        report or open in editor).  404 only when nothing matches.
         """
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        data, err = await self._read_json(request)
+        if err is not None:
+            return err
 
         section = data.get("section")
+        label = data.get("label")
         line = data.get("line")
         page = data.get("page")
         file = data.get("file")
 
-        target_page: int | None = None
-
-        if section and self.structure is not None:
-            match = find_section(self.structure, title=str(section), label=str(section))
-            if match and self.synctex_data is not None:
-                f, ls, _ = match
-                pos = source_to_page(self.synctex_data, f, ls)
-                if pos:
-                    target_page = pos.page
-        elif line and file and self.synctex_data is not None:
-            pos = source_to_page(self.synctex_data, str(file), int(line))
-            if pos:
-                target_page = pos.page
-        elif page is not None:
+        # Direct page request.
+        if page is not None:
             target_page = int(page)
+            await self.broadcast({"type": "goto", "page": target_page})
+            return web.json_response({"page": target_page})
 
-        if target_page is None:
+        # Resolve section/label to a source range.
+        resolved_file: str | None = None
+        resolved_line: int | None = None
+
+        if section or label:
+            if self.structure is None:
+                self.structure = parse_structure(self.watch_dir)
+            match = find_section(
+                self.structure,
+                title=section if section else None,
+                label=label if label else None,
+            )
+            if match:
+                resolved_file, resolved_line, _ = match
+        elif line and file:
+            resolved_file, resolved_line = str(file), int(line)
+
+        if resolved_file is None or resolved_line is None:
             return web.json_response({"error": "could not resolve target"}, status=404)
 
-        await self.broadcast({"type": "goto", "page": target_page})
-        return web.json_response({"page": target_page})
+        # Try to map to a PDF page via SyncTeX.
+        target_page = None
+        if self.synctex_data is not None:
+            pos = source_to_page(self.synctex_data, resolved_file, resolved_line)
+            if pos:
+                target_page = pos.page
+
+        # Broadcast whatever we know — viewer scrolls if there's a page.
+        await self.broadcast(
+            {
+                "type": "goto",
+                "page": target_page,
+                "file": resolved_file,
+                "line": resolved_line,
+            }
+        )
+        return web.json_response(
+            {"page": target_page, "file": resolved_file, "line": resolved_line}
+        )
 
     # ----- lifecycle -----
 

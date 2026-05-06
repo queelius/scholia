@@ -259,6 +259,32 @@ def test_find_snippet_missing(tmp_path: Path):
     assert find_snippet("nowhere to be found\nat all", f) is None
 
 
+def test_find_snippet_near_line_picks_closest(tmp_path: Path):
+    """When the same snippet appears twice, near_line breaks the tie."""
+    f = tmp_path / "intro.tex"
+    f.write_text(
+        "preamble line\n"   # 1
+        "\\item foo\n"       # 2  (first occurrence)
+        "filler\n"           # 3
+        "\\item foo\n"       # 4
+        "filler\n"           # 5
+        "\\item foo\n"       # 6  (third occurrence)
+        "tail\n"             # 7
+    )
+    snippet = "\\item foo"
+    assert find_snippet(snippet, f, near_line=1) == (2, 2)
+    assert find_snippet(snippet, f, near_line=5) == (4, 4)
+    assert find_snippet(snippet, f, near_line=999) == (6, 6)
+    # Without near_line, returns the first occurrence
+    assert find_snippet(snippet, f) == (2, 2)
+
+
+def test_find_snippet_near_line_irrelevant_when_unique(tmp_path: Path):
+    f = tmp_path / "intro.tex"
+    f.write_text("only one\nbeta gamma\nonly one\n")
+    assert find_snippet("beta gamma", f, near_line=999) == (2, 2)
+
+
 # ---------------------------------------------------------------------------
 # Staleness — section anchors
 # ---------------------------------------------------------------------------
@@ -392,3 +418,42 @@ def test_store_recovers_from_corrupt_file(tmp_path: Path):
     # New writes should work after a corrupt-file recovery
     c = store.add(PaperAnchor(), "fresh start")
     assert store.list() == [c]
+
+
+def test_store_creates_sibling_lock_file(tmp_path: Path):
+    path = tmp_path / "comments.json"
+    store = CommentStore(path)
+    store.add(PaperAnchor(), "x")
+    assert (tmp_path / "comments.json.lock").exists()
+
+
+def test_store_concurrent_writers_no_lost_updates(tmp_path: Path):
+    """fcntl.flock serializes mutations from multiple processes.
+
+    Spawn two processes that each insert N comments into the same store
+    in a tight loop; afterward the file must contain 2N comments and
+    valid JSON.  Without locking, the read-modify-write cycle of one
+    process clobbers the other.
+    """
+    import multiprocessing as mp
+    import sys
+    if sys.platform == "win32":
+        return  # no fcntl
+
+    def _worker(path_str: str, n: int):
+        from texwatch.comments import CommentStore, PaperAnchor
+        store = CommentStore(Path(path_str))
+        for i in range(n):
+            store.add(PaperAnchor(), f"msg {i}")
+
+    path = tmp_path / "comments.json"
+    CommentStore(path)  # initialize
+    n = 25
+    p1 = mp.Process(target=_worker, args=(str(path), n))
+    p2 = mp.Process(target=_worker, args=(str(path), n))
+    p1.start(); p2.start()
+    p1.join(timeout=15); p2.join(timeout=15)
+    assert p1.exitcode == 0 and p2.exitcode == 0
+
+    final = CommentStore(path)
+    assert len(final.list()) == 2 * n

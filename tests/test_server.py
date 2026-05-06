@@ -179,3 +179,113 @@ async def test_get_unknown_comment_returns_404(client):
     tc, _ = client
     resp = await tc.get("/comments/c-doesntexist")
     assert resp.status == 404
+
+
+# ---------------------------------------------------------------------------
+# /goto disambiguates section vs label and returns matched-but-no-page
+# when SyncTeX is unavailable.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_goto_section_match_without_synctex(client):
+    """No PDF compiled yet, so synctex_data is None.  /goto should still
+    resolve a section title to a source location and return 200 with
+    page=null instead of 404."""
+    tc, _ = client
+    resp = await tc.post("/goto", json={"section": "Methods"})
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["page"] is None
+    assert data["file"] == "paper.tex"
+    assert data["line"] == 6  # \section{Methods}
+
+
+@pytest.mark.asyncio
+async def test_goto_label_distinct_from_section_title(client):
+    """Passing label='sec:methods' must match by label, not by title."""
+    tc, _ = client
+    resp = await tc.post("/goto", json={"label": "sec:methods"})
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["file"] == "paper.tex"
+    assert data["line"] == 6
+
+
+@pytest.mark.asyncio
+async def test_goto_unknown_section_returns_404(client):
+    tc, _ = client
+    resp = await tc.post("/goto", json={"section": "Nonexistent"})
+    assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_goto_page_passthrough(client):
+    tc, _ = client
+    resp = await tc.post("/goto", json={"page": 3})
+    assert resp.status == 200
+    assert (await resp.json())["page"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (factored out of the request handlers)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_goto_target_recognizes_page_form():
+    from texwatch.mcp_server import parse_goto_target
+
+    assert parse_goto_target("p3", default_file="paper.tex") == {"page": 3}
+
+
+def test_parse_goto_target_recognizes_bare_line_with_default_file():
+    from texwatch.mcp_server import parse_goto_target
+
+    assert parse_goto_target("42", default_file="paper.tex") == {
+        "line": 42,
+        "file": "paper.tex",
+    }
+
+
+def test_parse_goto_target_recognizes_file_line():
+    from texwatch.mcp_server import parse_goto_target
+
+    assert parse_goto_target("intro.tex:7", default_file="paper.tex") == {
+        "file": "intro.tex",
+        "line": 7,
+    }
+
+
+def test_parse_goto_target_falls_back_to_section():
+    from texwatch.mcp_server import parse_goto_target
+
+    assert parse_goto_target("Methods", default_file="paper.tex") == {
+        "section": "Methods"
+    }
+
+
+def test_resolve_section_to_source_handles_eof(project):
+    from texwatch.server import resolve_section_to_source
+    from texwatch.structure import parse_structure
+
+    structure = parse_structure(project)
+    rs = resolve_section_to_source(
+        structure, project, title="Methods", label="sec:methods"
+    )
+    assert rs is not None
+    assert rs.file == "paper.tex"
+    assert rs.line_start == 6  # \section{Methods}
+    # End line should be the last line of the file (computed from EOF).
+    total_lines = len((project / "paper.tex").read_text().splitlines())
+    assert rs.line_end == total_lines
+
+
+def test_resolve_section_to_source_returns_none_for_unknown(project):
+    from texwatch.server import resolve_section_to_source
+    from texwatch.structure import parse_structure
+
+    structure = parse_structure(project)
+    assert (
+        resolve_section_to_source(structure, project, title="Nonexistent", label=None)
+        is None
+    )
