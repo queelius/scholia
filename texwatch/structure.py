@@ -118,13 +118,14 @@ def _resolve_input(arg: str, parent_dir: Path, watch_dir: Path) -> Path | None:
     LaTeX appends `.tex` if missing, and resolves relative to either the
     parent file's directory or the project root.  We try both.
     """
-    candidates: list[Path] = []
-    for base in (parent_dir, watch_dir):
-        for suffix in ("", ".tex"):
-            p = (base / (arg + suffix)).resolve()
-            if p.is_file():
-                return p
-            candidates.append(p)
+    candidates = [
+        (base / (arg + suffix)).resolve()
+        for base in (parent_dir, watch_dir)
+        for suffix in ("", ".tex")
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
     logger.debug("structure: could not resolve \\input{%s}; tried %s", arg, candidates)
     return None
 
@@ -147,11 +148,10 @@ def _files_reachable_from(main_file: Path, watch_dir: Path) -> list[Path]:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for line_no, raw_line in enumerate(content.splitlines(), start=1):
+        for raw_line in content.splitlines():
             if raw_line.lstrip().startswith("%"):
                 continue
-            line = _strip_comment(raw_line)
-            for m in _INPUT_RE.finditer(line):
+            for m in _INPUT_RE.finditer(_strip_comment(raw_line)):
                 resolved = _resolve_input(m.group(1).strip(), path.parent, watch_dir)
                 if resolved is not None and resolved not in seen:
                     stack.append(resolved)

@@ -366,6 +366,31 @@ async def test_image_no_pdf_returns_404(client):
     assert resp.status == 404
 
 
+def test_clamp_dpi_in_range():
+    from texwatch.server import _clamp_dpi
+    assert _clamp_dpi(150) == 150
+    assert _clamp_dpi("96") == 96
+
+
+def test_clamp_dpi_caps_extreme_values():
+    """Without clamping, ?dpi=10000 would let any caller allocate
+    multi-gigabyte pixmaps and OOM the daemon."""
+    from texwatch.server import _clamp_dpi
+    assert _clamp_dpi(10000) == 600
+    assert _clamp_dpi(0) == 36
+    assert _clamp_dpi("99999") == 600
+
+
+@pytest.mark.asyncio
+async def test_image_extreme_dpi_clamped(client_with_pdf):
+    """A request with dpi=99999 must succeed (clamped down) rather than OOM."""
+    tc, _ = client_with_pdf
+    resp = await tc.get("/image?page=1&dpi=99999")
+    assert resp.status == 200
+    body = await resp.read()
+    assert body.startswith(b"\x89PNG\r\n\x1a\n")
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers (factored out of the request handlers)
 # ---------------------------------------------------------------------------

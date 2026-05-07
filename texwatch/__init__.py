@@ -1,3 +1,3 @@
 """texwatch — agentic-first review tool for LaTeX papers."""
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"

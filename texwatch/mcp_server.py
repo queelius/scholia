@@ -82,6 +82,41 @@ def _ok(payload: Any) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+# In-process SyncTeX cache for the MCP server.  Each call to texwatch_image
+# / _comment_add would otherwise re-parse the .synctex.gz from disk; on a
+# 50+ page paper that is tens of MB of gzipped data per call.  Keyed by
+# the synctex file's mtime so a recompile transparently invalidates.
+_synctex_cache: dict[Path, tuple[float, Any]] = {}
+
+
+def _load_synctex_cached(main_file: Path):
+    """Load and cache SyncTeX for *main_file*'s rendered PDF.
+
+    Cache key is the SyncTeX file path; cache entry is (mtime, data).
+    A rebuild that bumps mtime invalidates the entry on next call.
+    """
+    from .server import load_synctex_for_main
+    from .synctex import find_synctex_file
+
+    pdf_path = main_file.with_suffix(".pdf")
+    if not pdf_path.exists():
+        return None
+    synctex_path = find_synctex_file(pdf_path)
+    if synctex_path is None:
+        return None
+    try:
+        mtime = synctex_path.stat().st_mtime
+    except OSError:
+        return None
+    cached = _synctex_cache.get(synctex_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    data = load_synctex_for_main(main_file)
+    if data is not None:
+        _synctex_cache[synctex_path] = (mtime, data)
+    return data
+
+
 def _comment_add(
     store,
     cfg,
@@ -128,7 +163,7 @@ def _comment_add(
             anchor.get("label"),
         )
     elif kind == "pdf_region":
-        synctex = load_synctex_for_main(get_main_file(cfg))
+        synctex = _load_synctex_cached(get_main_file(cfg))
         bbox = anchor.get("bbox") or [0.0, 0.0, 0.0, 0.0]
         resolved = resolve_pdf_region_to_source(
             synctex,
@@ -318,10 +353,11 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
           3. Read source, Edit, then texwatch_compile + texwatch_image
              again to verify visually.
         """
-        from .comments import PdfRegionAnchor, PaperAnchor
-        from .config import get_main_file
-        from .server import _parse_source_range
+        import base64
+
         from . import imaging
+        from .config import get_main_file
+        from .server import _clamp_dpi, _parse_source_range
 
         cfg, _, store = _load_project()
         pdf_path = get_main_file(cfg).with_suffix(".pdf")
@@ -329,22 +365,42 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
             return [TextContent(type="text",
                 text=_err("no PDF on disk; run texwatch_compile() first"))]
 
+        parsed_bbox: tuple[float, float, float, float] | None = None
+        if bbox is not None:
+            if len(bbox) != 4:
+                return [TextContent(type="text",
+                    text=_err("bbox must have exactly 4 values"))]
+            parsed_bbox = (float(bbox[0]), float(bbox[1]),
+                           float(bbox[2]), float(bbox[3]))
+        parsed_source = _parse_source_range(source) if source else None
+
+        clamped_dpi = _clamp_dpi(dpi)
+        synctex = _load_synctex_cached(get_main_file(cfg))
+
         try:
-            resolved_page, resolved_bbox = _resolve_image_target(
-                store, cfg, page, bbox, source, comment_id
+            resolved_page, resolved_bbox = imaging.resolve_image_target(
+                synctex=synctex,
+                comment_lookup=store.get,
+                page=page,
+                bbox=parsed_bbox,
+                source=parsed_source,
+                comment_id=comment_id,
             )
-        except ValueError as exc:
-            return [TextContent(type="text", text=_err(str(exc)))]
-
-        try:
             if resolved_bbox is None:
-                png = imaging.render_page(pdf_path, resolved_page, dpi=dpi)
+                png = await asyncio.to_thread(
+                    imaging.render_page, pdf_path, resolved_page, clamped_dpi
+                )
             else:
-                png = imaging.render_region(pdf_path, resolved_page, resolved_bbox, dpi=dpi)
-        except imaging.ImagingError as exc:
+                png = await asyncio.to_thread(
+                    imaging.render_region,
+                    pdf_path,
+                    resolved_page,
+                    resolved_bbox,
+                    clamped_dpi,
+                )
+        except (ValueError, imaging.ImagingError) as exc:
             return [TextContent(type="text", text=_err(str(exc)))]
 
-        import base64
         return [ImageContent(
             type="image",
             data=base64.b64encode(png).decode("ascii"),
@@ -381,76 +437,6 @@ import re
 # Matches ``sec:methods``, ``eq:foo-bar``, ``thm:main``.  Does *not* match
 # ``Introduction: A Survey`` (space) or filenames (long prefix / has dot).
 _LABEL_LIKE = re.compile(r"^[a-zA-Z]{2,8}:[A-Za-z0-9_.\-:]+$")
-
-
-def _resolve_image_target(
-    store,
-    cfg,
-    page: int | None,
-    bbox: list[float] | None,
-    source: str | None,
-    comment_id: str | None,
-) -> tuple[int, tuple[float, float, float, float] | None]:
-    """Standalone version of TexWatchServer._resolve_image_target for the
-    MCP path (which talks to the file system, not a running daemon).
-
-    Raises ValueError with a user-facing message on bad inputs.
-    """
-    from .config import get_main_file
-    from .server import _parse_source_range, load_synctex_for_main
-    from . import imaging
-
-    primary = sum(1 for v in (page, source, comment_id) if v not in (None, ""))
-    if primary != 1:
-        raise ValueError("specify exactly one of page, source, or comment_id")
-
-    if comment_id:
-        c = store.get(comment_id)
-        if c is None:
-            raise ValueError(f"no comment {comment_id}")
-        if c.anchor.kind == "pdf_region":
-            return c.anchor.page, tuple(c.anchor.bbox)  # type: ignore[attr-defined,return-value]
-        if c.anchor.kind == "paper":
-            raise ValueError("paper anchors have no PDF region")
-        if c.resolved_source is None:
-            raise ValueError("comment is not anchored to a renderable region")
-        synctex = load_synctex_for_main(get_main_file(cfg))
-        if synctex is None:
-            raise ValueError("no SyncTeX data; cannot resolve comment region")
-        pair = imaging.resolve_source_to_region(
-            synctex,
-            c.resolved_source.file,
-            c.resolved_source.line_start,
-            c.resolved_source.line_end,
-        )
-        if pair is None:
-            raise ValueError("comment's source range has no PDF coverage")
-        return pair
-
-    if source:
-        file, ls, le = _parse_source_range(source)
-        synctex = load_synctex_for_main(get_main_file(cfg))
-        if synctex is None:
-            raise ValueError("no SyncTeX data")
-        pair = imaging.resolve_source_to_region(synctex, file, ls, le)
-        if pair is None:
-            raise ValueError("no PDF region for this source range")
-        return pair
-
-    # page (with optional bbox)
-    if page is None:
-        raise ValueError("page must be an integer")
-    resolved_bbox: tuple[float, float, float, float] | None = None
-    if bbox is not None:
-        if len(bbox) != 4:
-            raise ValueError("bbox must have exactly 4 values")
-        resolved_bbox = (
-            float(bbox[0]),
-            float(bbox[1]),
-            float(bbox[2]),
-            float(bbox[3]),
-        )
-    return int(page), resolved_bbox
 
 
 def parse_goto_target(target: str, default_file: str) -> dict[str, Any]:

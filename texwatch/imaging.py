@@ -17,10 +17,8 @@ from pathlib import Path
 
 try:
     import fitz  # pymupdf
-
-    HAS_PYMUPDF = True
 except ImportError:
-    HAS_PYMUPDF = False
+    fitz = None  # type: ignore[assignment]
 
 from .synctex import SyncTeXData
 
@@ -31,12 +29,25 @@ class ImagingError(RuntimeError):
     """Raised when rendering can't proceed (missing dep, bad inputs, etc)."""
 
 
-def _check_dep() -> None:
-    if not HAS_PYMUPDF:
+def _open_pdf(pdf_path: Path, page: int):
+    """Open *pdf_path*, validate *page*, return ``(doc, page_obj)``.
+
+    Caller owns ``doc.close()``.  Raises :class:`ImagingError` on missing
+    pymupdf, missing file, or out-of-range page.
+    """
+    if fitz is None:
         raise ImagingError(
             "PDF imaging requires pymupdf. "
             "Install with: pip install 'texwatch[image]'"
         )
+    if not pdf_path.exists():
+        raise ImagingError(f"PDF not found: {pdf_path}")
+    doc = fitz.open(pdf_path)
+    n = len(doc)
+    if page < 1 or page > n:
+        doc.close()
+        raise ImagingError(f"page {page} out of range (1..{n})")
+    return doc, doc[page - 1]
 
 
 # ---------------------------------------------------------------------------
@@ -56,15 +67,9 @@ def render_page(pdf_path: Path, page: int, dpi: int = 150) -> bytes:
     Raises:
         ImagingError: pymupdf missing, or *page* out of range.
     """
-    _check_dep()
-    if not pdf_path.exists():
-        raise ImagingError(f"PDF not found: {pdf_path}")
-    doc = fitz.open(pdf_path)
+    doc, page_obj = _open_pdf(pdf_path, page)
     try:
-        if page < 1 or page > len(doc):
-            raise ImagingError(f"page {page} out of range (1..{len(doc)})")
-        pix = doc[page - 1].get_pixmap(dpi=dpi)
-        return pix.tobytes("png")
+        return page_obj.get_pixmap(dpi=dpi).tobytes("png")
     finally:
         doc.close()
 
@@ -83,26 +88,19 @@ def render_region(
     A small *margin* is added around the crop so the rendered region
     has visible breathing room.
     """
-    _check_dep()
-    if not pdf_path.exists():
-        raise ImagingError(f"PDF not found: {pdf_path}")
-    doc = fitz.open(pdf_path)
+    doc, page_obj = _open_pdf(pdf_path, page)
     try:
-        if page < 1 or page > len(doc):
-            raise ImagingError(f"page {page} out of range (1..{len(doc)})")
-        p = doc[page - 1]
         x1, y1, x2, y2 = bbox
         # Clip to page bounds; pymupdf will raise on out-of-page rects.
         rect = fitz.Rect(
             max(0.0, x1 - margin),
             max(0.0, y1 - margin),
-            min(p.rect.width, x2 + margin),
-            min(p.rect.height, y2 + margin),
+            min(page_obj.rect.width, x2 + margin),
+            min(page_obj.rect.height, y2 + margin),
         )
         if rect.is_empty or rect.is_infinite:
-            raise ImagingError(f"empty bbox after clip: {tuple(bbox)} on {p.rect}")
-        pix = p.get_pixmap(dpi=dpi, clip=rect)
-        return pix.tobytes("png")
+            raise ImagingError(f"empty bbox after clip: {tuple(bbox)} on {page_obj.rect}")
+        return page_obj.get_pixmap(dpi=dpi, clip=rect).tobytes("png")
     finally:
         doc.close()
 
@@ -110,6 +108,64 @@ def render_region(
 # ---------------------------------------------------------------------------
 # SyncTeX -> region resolution
 # ---------------------------------------------------------------------------
+
+
+def resolve_image_target(
+    *,
+    synctex: SyncTeXData | None,
+    comment_lookup,
+    page: int | None,
+    bbox: tuple[float, float, float, float] | None,
+    source: tuple[str, int, int] | None,
+    comment_id: str | None,
+) -> tuple[int, tuple[float, float, float, float] | None]:
+    """Map ``(page | source | comment_id)`` to ``(page, optional bbox)``.
+
+    Shared by the HTTP ``/image`` endpoint and the ``texwatch_image`` MCP
+    tool.  Inputs are pre-parsed primitives; *comment_lookup* is a
+    callable ``cid -> Comment | None`` so callers can supply either a
+    daemon's :class:`CommentStore` or a freshly-loaded one.
+
+    Raises :class:`ValueError` with a user-facing message on bad inputs.
+    """
+    primary = sum(1 for v in (page, source, comment_id) if v not in (None, ""))
+    if primary != 1:
+        raise ValueError("specify exactly one of page, source, or comment")
+
+    if comment_id:
+        c = comment_lookup(comment_id)
+        if c is None:
+            raise ValueError(f"no comment {comment_id}")
+        if c.anchor.kind == "pdf_region":
+            return c.anchor.page, tuple(c.anchor.bbox)  # type: ignore[attr-defined,return-value]
+        if c.anchor.kind == "paper":
+            raise ValueError("paper anchors have no PDF region")
+        if c.resolved_source is None:
+            raise ValueError("comment is not anchored to a renderable region")
+        if synctex is None:
+            raise ValueError("no SyncTeX data; cannot resolve comment region")
+        pair = resolve_source_to_region(
+            synctex,
+            c.resolved_source.file,
+            c.resolved_source.line_start,
+            c.resolved_source.line_end,
+        )
+        if pair is None:
+            raise ValueError("comment's source range has no PDF coverage")
+        return pair
+
+    if source is not None:
+        if synctex is None:
+            raise ValueError("no SyncTeX data")
+        pair = resolve_source_to_region(synctex, *source)
+        if pair is None:
+            raise ValueError("no PDF region for this source range")
+        return pair
+
+    # page mode (with optional bbox)
+    if page is None:
+        raise ValueError("page must be an integer")
+    return page, bbox
 
 
 def resolve_source_to_region(

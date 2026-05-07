@@ -97,6 +97,18 @@ def _parse_source_range(spec: str) -> tuple[str, int, int]:
     return file, ls, le
 
 
+def _clamp_dpi(value: str | int, default: int = 150) -> int:
+    """Parse and clamp a DPI value to a sane render range.
+
+    Rendering at unbounded DPI is a denial-of-service vector
+    (``?dpi=10000`` allocates a multi-gigabyte pixmap).  Clamp to a
+    range that covers screen viewing (~96–150) up to high-detail
+    extraction (~600).
+    """
+    n = int(value) if not isinstance(value, int) else value
+    return max(36, min(n, 600))
+
+
 def _parse_bbox(spec: str) -> tuple[float, float, float, float]:
     """Parse ``x1,y1,x2,y2`` in PDF points."""
     try:
@@ -638,7 +650,10 @@ class TexWatchServer:
             page=N&bbox=x1,y1,x2,y2         region in PDF points
             source=FILE:LSTART-LEND         SyncTeX-resolved region
             comment=cid                     anchor of an existing comment
-            dpi=N                           render DPI (default 150)
+            dpi=N                           render DPI (default 150, clamped to [36, 600])
+
+        Rendering runs on a worker thread so the event loop stays free
+        for WebSocket heartbeats and concurrent /compile requests.
         """
         from . import imaging
 
@@ -648,23 +663,20 @@ class TexWatchServer:
             )
 
         try:
-            dpi = int(request.query.get("dpi", "150"))
+            dpi = _clamp_dpi(request.query.get("dpi", "150"))
         except ValueError:
             return web.json_response({"error": "invalid dpi"}, status=400)
 
+        pdf_path = self.last_result.output_file
         try:
             page, bbox = self._resolve_image_target(request)
-        except ValueError as exc:
-            return web.json_response({"error": str(exc)}, status=400)
-
-        try:
             if bbox is None:
-                png = imaging.render_page(self.last_result.output_file, page, dpi=dpi)
+                png = await asyncio.to_thread(imaging.render_page, pdf_path, page, dpi)
             else:
-                png = imaging.render_region(
-                    self.last_result.output_file, page, bbox, dpi=dpi
+                png = await asyncio.to_thread(
+                    imaging.render_region, pdf_path, page, bbox, dpi
                 )
-        except imaging.ImagingError as exc:
+        except (ValueError, imaging.ImagingError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
         return web.Response(
@@ -687,55 +699,21 @@ class TexWatchServer:
         source_str = request.query.get("source")
         comment_id = request.query.get("comment")
 
-        # Mutually exclusive: page (with optional bbox) | source | comment
-        primary = sum(1 for v in (page_str, source_str, comment_id) if v)
-        if primary != 1:
-            raise ValueError("specify exactly one of page, source, or comment")
-
-        if comment_id:
-            c = self.comments.get(comment_id)
-            if c is None:
-                raise ValueError(f"no comment {comment_id}")
-            return self._comment_to_image_target(c)
-
-        if source_str:
-            file, ls, le = _parse_source_range(source_str)
-            if self.synctex_data is None:
-                raise ValueError("no SyncTeX data")
-            pair = imaging.resolve_source_to_region(self.synctex_data, file, ls, le)
-            if pair is None:
-                raise ValueError("no PDF region for this source range")
-            return pair
-
-        # page mode (with optional bbox)
         try:
-            page = int(page_str)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+            page = int(page_str) if page_str else None
+        except ValueError:
             raise ValueError("page must be an integer")
         bbox = _parse_bbox(bbox_str) if bbox_str else None
-        return page, bbox
+        source = _parse_source_range(source_str) if source_str else None
 
-    def _comment_to_image_target(
-        self, c: Comment
-    ) -> tuple[int, tuple[float, float, float, float] | None]:
-        """Resolve a comment's anchor to (page, bbox)."""
-        from . import imaging
-
-        if c.anchor.kind == "pdf_region":
-            anchor = c.anchor  # type: ignore[assignment]
-            return anchor.page, tuple(anchor.bbox)  # type: ignore[return-value,attr-defined]
-        if c.resolved_source and self.synctex_data is not None:
-            pair = imaging.resolve_source_to_region(
-                self.synctex_data,
-                c.resolved_source.file,
-                c.resolved_source.line_start,
-                c.resolved_source.line_end,
-            )
-            if pair is not None:
-                return pair
-        if c.anchor.kind == "paper":
-            raise ValueError("paper anchors have no PDF region")
-        raise ValueError("comment is not anchored to a renderable region")
+        return imaging.resolve_image_target(
+            synctex=self.synctex_data,
+            comment_lookup=self.comments.get,
+            page=page,
+            bbox=bbox,
+            source=source,
+            comment_id=comment_id,
+        )
 
     # ----- lifecycle -----
 

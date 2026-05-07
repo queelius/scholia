@@ -153,6 +153,93 @@ class TestParseStructure:
 
 
 # ---------------------------------------------------------------------------
+# main_file mode: walks via \input/\include, ignores unbuilt siblings
+# ---------------------------------------------------------------------------
+
+
+class TestParseStructureMainFile:
+    def test_recursive_input_chain(self, tmp_path: Path):
+        """main -> chap1 -> sub1 should pick up sections from all three."""
+        (tmp_path / "main.tex").write_text(
+            "\\section{Top}\n\\input{chap1}\n"
+        )
+        (tmp_path / "chap1.tex").write_text(
+            "\\section{Chap 1}\n\\input{sub1}\n"
+        )
+        (tmp_path / "sub1.tex").write_text("\\subsection{Sub 1}\n")
+        ds = parse_structure(tmp_path, tmp_path / "main.tex")
+        titles = {s.title for s in ds.sections}
+        assert titles == {"Top", "Chap 1", "Sub 1"}
+
+    def test_unbuilt_sibling_excluded(self, tmp_path: Path):
+        """A .tex file in the same dir but not \\input'd must be skipped.
+
+        This is the v0.5.2 bug: paper-full-proofs.tex sat next to
+        paper.tex; rglob walked both; sections from the unbuilt variant
+        leaked into the agent's view.
+        """
+        (tmp_path / "paper.tex").write_text("\\section{Real}\n")
+        (tmp_path / "paper-variant.tex").write_text(
+            "\\section{Should Not Appear}\n"
+        )
+        ds = parse_structure(tmp_path, tmp_path / "paper.tex")
+        files = {s.file for s in ds.sections}
+        assert files == {"paper.tex"}
+        assert "paper-variant.tex" not in files
+
+    def test_cycle_terminates(self, tmp_path: Path):
+        """a \\input{b}, b \\input{a} must not infinite-loop."""
+        (tmp_path / "a.tex").write_text("\\section{A}\n\\input{b}\n")
+        (tmp_path / "b.tex").write_text("\\section{B}\n\\input{a}\n")
+        ds = parse_structure(tmp_path, tmp_path / "a.tex")
+        titles = {s.title for s in ds.sections}
+        assert titles == {"A", "B"}
+
+    def test_missing_input_does_not_crash(self, tmp_path: Path):
+        (tmp_path / "main.tex").write_text(
+            "\\section{Real}\n\\input{nonexistent}\n"
+        )
+        ds = parse_structure(tmp_path, tmp_path / "main.tex")
+        assert {s.title for s in ds.sections} == {"Real"}
+
+    def test_input_in_subdir(self, tmp_path: Path):
+        (tmp_path / "main.tex").write_text(
+            "\\section{Top}\n\\input{chapters/intro}\n"
+        )
+        chapters = tmp_path / "chapters"
+        chapters.mkdir()
+        (chapters / "intro.tex").write_text("\\section{Introduction}\n")
+        ds = parse_structure(tmp_path, tmp_path / "main.tex")
+        assert {s.title for s in ds.sections} == {"Top", "Introduction"}
+        files = {s.file for s in ds.sections}
+        assert "chapters/intro.tex" in files
+
+    def test_explicit_extension(self, tmp_path: Path):
+        (tmp_path / "main.tex").write_text(
+            "\\section{Top}\n\\input{intro.tex}\n"
+        )
+        (tmp_path / "intro.tex").write_text("\\section{Intro}\n")
+        ds = parse_structure(tmp_path, tmp_path / "main.tex")
+        assert {s.title for s in ds.sections} == {"Top", "Intro"}
+
+    def test_commented_input_ignored(self, tmp_path: Path):
+        """\\input inside a comment line must not be followed."""
+        (tmp_path / "main.tex").write_text(
+            "\\section{Top}\n% \\input{would-be-evil}\n"
+        )
+        (tmp_path / "would-be-evil.tex").write_text("\\section{Evil}\n")
+        ds = parse_structure(tmp_path, tmp_path / "main.tex")
+        assert {s.title for s in ds.sections} == {"Top"}
+
+    def test_missing_main_file_falls_back_to_glob(self, tmp_path: Path):
+        """When main_file doesn't exist on disk, fall back to the legacy
+        rglob walk rather than returning nothing."""
+        (tmp_path / "a.tex").write_text("\\section{A}\n")
+        ds = parse_structure(tmp_path, tmp_path / "missing.tex")
+        assert {s.title for s in ds.sections} == {"A"}
+
+
+# ---------------------------------------------------------------------------
 # find_section
 # ---------------------------------------------------------------------------
 
