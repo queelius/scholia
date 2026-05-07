@@ -419,6 +419,95 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         )]
 
     @mcp.tool()
+    async def scholia_audit(focus: str | None = None) -> str:
+        """Workflow primer for agent-initiated review.
+
+        scholia is bidirectional: comments aren't just human→agent.  When
+        the human says "review my methods section," the agent should
+        read the paper and file *its own* comments back as
+        ``author="claude"`` — these show up in the sidebar with a
+        distinct visual treatment so the human can step through them
+        like any other queue.
+
+        This tool returns *guidance*, not state.  It does no work itself.
+        The agent then uses the existing tools to do the review:
+
+          1. scholia_paper()
+                 -> sections, last compile, current open comments
+          2. For relevant sections / pages:
+               - Read or Grep the source
+               - scholia_image(source="file.tex:N-M") to see rendering
+               - scholia_image(page=N) for a full page
+          3. File findings:
+               scholia_comment(
+                 action="add",
+                 anchor={...},                  # section/source/pdf/paper
+                 text="<concise observation>",
+                 suggestion={"old":..., "new":...},   # when concrete
+                 author="claude",
+               )
+          4. Skip nitpicks and high-confidence-low-value findings.
+
+        Args:
+            focus: optional theme.  ``"math"``, ``"prose"``,
+                ``"citations"``, ``"consistency"``, or None (general).
+
+        Returns guidance JSON that can be printed back to the agent's
+        context as a prompt scaffold.
+        """
+        guidance = {
+            "math": (
+                "Look for: undefined symbols and notation drift between "
+                "sections; theorem statements that don't match their "
+                "proofs; missing assumptions; equation references to "
+                "labels that don't exist; sign errors; bounds that "
+                "should be strict vs. non-strict."
+            ),
+            "prose": (
+                "Look for: paragraphs that bury the contribution; "
+                "passive voice where active is clearer; redundant "
+                "exposition; weak transitions; abstract phrasing where "
+                "concrete examples would land; overlong sentences; "
+                "ambiguous antecedents."
+            ),
+            "citations": (
+                "Look for: claims missing citations; citations that "
+                "don't support the claim; references in the bib but not "
+                "cited; cited references that don't appear in the bib; "
+                "outdated work where a more recent reference exists."
+            ),
+            "consistency": (
+                "Look for: notation that drifts between sections; "
+                "definitions used before introduced; cross-references "
+                "to nonexistent labels; theorem numbers that don't "
+                "match their text; figure/table captions that describe "
+                "the wrong content."
+            ),
+        }
+        focus_text = guidance.get(focus or "", "General editorial pass: prioritize clarity, correctness, and contribution-framing over polish.")
+        return _ok({
+            "focus": focus or "general",
+            "guidance": focus_text,
+            "workflow": [
+                "1. scholia_paper() — see sections + open comments + last compile",
+                "2. For each candidate region: Read/Grep source, scholia_image() for visuals",
+                "3. scholia_comment(action='add', author='claude', anchor=..., text=..., suggestion=...)",
+                "4. Surface high-confidence findings only; skip nitpicks",
+            ],
+            "anchor_guidance": {
+                "paper": "global concerns (abstract length, contribution framing)",
+                "section": "section-level structure or coverage",
+                "source_range": "specific lines (preferred when concrete)",
+                "pdf_region": "visual issues only an image conveys",
+            },
+            "tip": (
+                "Use suggestion={old, new} when proposing a concrete "
+                "rewrite; the human can apply it with one gesture and "
+                "you save a round-trip."
+            ),
+        })
+
+    @mcp.tool()
     async def scholia_goto(target: str, port: int = daemon_port) -> str:
         """Tell a running daemon to scroll the viewer to a target.
 
