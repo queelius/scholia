@@ -149,7 +149,21 @@ def resolve_image_target(
             raise ValueError(f"no comment {comment_id}")
         if isinstance(c.anchor, PaperAnchor):
             raise ValueError("paper anchors have no PDF region")
+        # Prefer the comment's pre-resolved source location.  The anchor
+        # itself may not carry enough context here (section anchors
+        # need the document structure, which the comment_id caller
+        # doesn't have); the comment was resolved at creation time and
+        # that resolution is what we want.
         target = c.anchor.image_target(ctx)
+        if target is None and c.resolved_source is not None:
+            if synctex is None:
+                raise ValueError("no SyncTeX data; cannot resolve comment region")
+            target = resolve_source_to_region(
+                synctex,
+                c.resolved_source.file,
+                c.resolved_source.line_start,
+                c.resolved_source.line_end,
+            )
         if target is None:
             if synctex is None:
                 raise ValueError("no SyncTeX data; cannot resolve comment region")
