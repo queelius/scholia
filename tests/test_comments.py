@@ -1,4 +1,4 @@
-"""Tests for texwatch.comments — anchors, threads, staleness."""
+"""Tests for scholia.comments — anchors, threads, staleness."""
 
 from __future__ import annotations
 
@@ -7,11 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from texwatch.comments import (
+from scholia.comments import (
     Comment,
     CommentStore,
     PaperAnchor,
     PdfRegionAnchor,
+    ResolveContext,
     ResolvedSource,
     SectionAnchor,
     SourceRangeAnchor,
@@ -60,9 +61,103 @@ def test_paper_anchor_roundtrip():
     assert anchor_from_dict(a.to_dict()) == a
 
 
+# ---------------------------------------------------------------------------
+# Anchor.resolve_source / .image_target — methods that own the dispatch
+# that used to live in three switch statements.
+# ---------------------------------------------------------------------------
+
+
+def test_paper_anchor_resolves_to_none(tmp_path: Path):
+    ctx = ResolveContext(watch_dir=tmp_path)
+    assert PaperAnchor().resolve_source(ctx) is None
+    assert PaperAnchor().image_target(ctx) is None
+
+
+def test_source_range_anchor_resolves_to_self(tmp_path: Path):
+    ctx = ResolveContext(watch_dir=tmp_path)
+    a = SourceRangeAnchor(file="intro.tex", line_start=10, line_end=20)
+    rs = a.resolve_source(ctx)
+    assert rs == ResolvedSource(file="intro.tex", line_start=10, line_end=20)
+
+
+def test_pdf_region_image_target_returns_self(tmp_path: Path):
+    ctx = ResolveContext(watch_dir=tmp_path)
+    a = PdfRegionAnchor(page=3, bbox=(10.0, 20.0, 100.0, 50.0))
+    assert a.image_target(ctx) == (3, (10.0, 20.0, 100.0, 50.0))
+
+
+def test_section_anchor_resolves_via_structure(tmp_path: Path):
+    """SectionAnchor.resolve_source uses ctx.structure."""
+    from scholia.structure import DocumentStructure, Section
+
+    structure = DocumentStructure(
+        sections=[
+            Section(level="section", title="Methods", file="paper.tex", line=42),
+            Section(level="section", title="Results", file="paper.tex", line=80),
+        ]
+    )
+    (tmp_path / "paper.tex").write_text("\n" * 100)
+    ctx = ResolveContext(watch_dir=tmp_path, structure=structure)
+    rs = SectionAnchor(title="Methods").resolve_source(ctx)
+    assert rs is not None
+    assert rs.file == "paper.tex"
+    assert rs.line_start == 42
+    assert rs.line_end == 79  # one before the next section
+
+
+def test_section_anchor_returns_none_without_structure(tmp_path: Path):
+    ctx = ResolveContext(watch_dir=tmp_path, structure=None)
+    assert SectionAnchor(title="Methods").resolve_source(ctx) is None
+
+
+def test_pdf_region_anchor_returns_none_without_synctex(tmp_path: Path):
+    ctx = ResolveContext(watch_dir=tmp_path, synctex=None)
+    a = PdfRegionAnchor(page=1, bbox=(0, 0, 100, 100))
+    assert a.resolve_source(ctx) is None
+
+
 def test_anchor_from_dict_unknown_kind():
     with pytest.raises(ValueError, match="Unknown anchor kind"):
         anchor_from_dict({"kind": "invalid"})
+
+
+# ---------------------------------------------------------------------------
+# SuggestedEdit (the structured rewrite that rides alongside a comment)
+# ---------------------------------------------------------------------------
+
+
+def test_suggested_edit_roundtrip():
+    from scholia.comments import SuggestedEdit
+
+    s = SuggestedEdit(old="The frumious bandersnatch", new="The slithy tove")
+    assert s.to_dict() == {"old": "The frumious bandersnatch", "new": "The slithy tove"}
+    assert SuggestedEdit.from_dict(s.to_dict()) == s
+
+
+def test_comment_with_suggestion_persists(tmp_path: Path):
+    from scholia.comments import SuggestedEdit
+
+    store = CommentStore(tmp_path / "comments.json")
+    c = store.add(
+        PaperAnchor(),
+        "tighten this",
+        suggestion=SuggestedEdit(old="historically, masked failure data", new="masked failure data"),
+    )
+    raw = json.loads((tmp_path / "comments.json").read_text())
+    sugg = raw["comments"][0]["suggestion"]
+    assert sugg == {"old": "historically, masked failure data", "new": "masked failure data"}
+
+    # Round-trip through Comment.from_dict
+    restored = Comment.from_dict(raw["comments"][0])
+    assert restored.suggestion == c.suggestion
+
+
+def test_comment_without_suggestion_omits_field(tmp_path: Path):
+    """Backward-compat: a comment without a suggestion has no `suggestion` key."""
+    store = CommentStore(tmp_path / "comments.json")
+    store.add(PaperAnchor(), "no rewrite proposed")
+    raw = json.loads((tmp_path / "comments.json").read_text())
+    assert "suggestion" not in raw["comments"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +517,7 @@ def test_store_concurrent_writers_no_lost_updates(tmp_path: Path):
         return  # no fcntl
 
     def _worker(path_str: str, n: int):
-        from texwatch.comments import CommentStore, PaperAnchor
+        from scholia.comments import CommentStore, PaperAnchor
         store = CommentStore(Path(path_str))
         for i in range(n):
             store.add(PaperAnchor(), f"msg {i}")

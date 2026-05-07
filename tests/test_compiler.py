@@ -2,7 +2,7 @@
 
 import pytest
 
-from texwatch.compiler import (
+from scholia.compiler import (
     CompileMessage,
     CompileResult,
     _detect_compiler,

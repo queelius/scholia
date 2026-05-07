@@ -101,7 +101,7 @@ def _get_compiler_command(compiler: str, main_file: Path, work_dir: Path) -> lis
     main_file_relative = main_file.relative_to(work_dir) if main_file.is_absolute() else main_file
 
     # Defence-in-depth: reject paths that look like flags or path-traversal.
-    # A malicious .texwatch.yaml could set main: "--shell-escape paper.tex"
+    # A malicious .scholia.yaml could set main: "--shell-escape paper.tex"
     # which latexmk would parse as a flag, enabling \write18 RCE via a
     # supply-chain compromise of the config file.
     rel_str = str(main_file_relative)

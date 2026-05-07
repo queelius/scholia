@@ -1,0 +1,3 @@
+"""scholia — agentic-first review tool for LaTeX papers."""
+
+__version__ = "0.6.0"

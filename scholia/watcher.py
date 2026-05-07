@@ -148,7 +148,7 @@ class TexFileHandler(FileSystemEventHandler):
             self.debounce_seconds = min(3.0, last_compile_seconds * 0.2)
 
 
-class TexWatcher:
+class Scholiaer:
     """Watch TeX files for changes and trigger recompilation."""
 
     def __init__(

@@ -1,15 +1,15 @@
-"""texwatch command-line interface (v0.5.0).
+"""scholia command-line interface (v0.5.0).
 
 Subcommands:
     serve      run the daemon (default if no subcommand)
-    init       scaffold .texwatch.yaml
+    init       scaffold .scholia.yaml
     compile    one-shot compile, print structured errors
     goto       tell a running daemon to scroll the viewer
     mcp        run the MCP server (stdio transport)
 
 Comment management lives in the browser (for humans) and the MCP tools
 (for the agent).  The CLI deliberately does not expose comment commands
-because nobody types ``texwatch comment add ...`` from a shell.
+because nobody types ``scholia comment add ...`` from a shell.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     cfg = load_config(main_file=getattr(args, "main", None))
     port = args.port or cfg.port
-    print(f"texwatch v0.5.0  serving {cfg.main} at http://127.0.0.1:{port}", file=sys.stderr)
+    print(f"scholia v0.5.0  serving {cfg.main} at http://127.0.0.1:{port}", file=sys.stderr)
     run_server(cfg, port=port)
     return 0
 
@@ -163,7 +163,7 @@ def cmd_mcp(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="texwatch",
+        prog="scholia",
         description=(
             "Live PDF preview + review-style commenting for LaTeX papers, "
             "designed for Claude Code as the author. Run with no arguments to "
@@ -179,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--main", help="main .tex file (overrides config)")
     p.set_defaults(func=cmd_serve)
 
-    p = sub.add_parser("init", help="scaffold .texwatch.yaml")
+    p = sub.add_parser("init", help="scaffold .scholia.yaml")
     p.add_argument("--main", default="paper.tex")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)

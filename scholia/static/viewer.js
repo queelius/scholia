@@ -1,4 +1,4 @@
-// texwatch v0.5.0 viewer
+// scholia v0.5.0 viewer
 //
 // The browser is read-only by design.  The human is a reviewer; the
 // agent is the author.  The viewer's job:
@@ -293,10 +293,17 @@ function updateSelectionToolbar() {
 // Compose dialog
 // ---------------------------------------------------------------------------
 
-function openCompose(anchor, label) {
+function openCompose(anchor, label, selectionText = "") {
   state.pendingAnchor = anchor;
   $("#compose-anchor").textContent = label;
   $("#compose-text").value = "";
+  // Pre-populate the "original" field with the selected text when the
+  // human gestured at a specific PDF region; otherwise leave blank.
+  $("#compose-suggestion-old").value = selectionText || "";
+  $("#compose-suggestion-new").value = "";
+  // Auto-expand the suggestion section if we have a candidate; the
+  // human only has to fill in the replacement.
+  $("#compose-suggestion-details").open = !!selectionText;
   $("#compose-dialog").showModal();
   setTimeout(() => $("#compose-text").focus(), 50);
 }
@@ -306,6 +313,12 @@ async function submitCompose(ev) {
   const text = $("#compose-text").value.trim();
   if (!text || !state.pendingAnchor) return;
   const body = { anchor: state.pendingAnchor, text, author: "human" };
+  // Only include a suggestion if both fields have content.
+  const suggestionOld = $("#compose-suggestion-old").value.trim();
+  const suggestionNew = $("#compose-suggestion-new").value.trim();
+  if (suggestionOld && suggestionNew) {
+    body.suggestion = { old: suggestionOld, new: suggestionNew };
+  }
   $("#compose-dialog").close();
   state.pendingAnchor = null;
   try {
@@ -386,6 +399,9 @@ function renderCommentItem(c) {
   const preview = h("div", { class: "cmt-preview", text: c.thread[0]?.text || "" });
 
   const children = [head, preview];
+  if (c.suggestion) {
+    children.push(renderSuggestion(c.suggestion));
+  }
 
   if (expanded) {
     const thread = h("div", { class: "cmt-thread" },
@@ -400,6 +416,20 @@ function renderCommentItem(c) {
     class: `cmt status-${c.status}`,
     data: { commentId: c.id },
   }, ...children);
+}
+
+function renderSuggestion(s) {
+  // Compact two-line diff view: "old → new".  Long content wraps via CSS.
+  return h("div", { class: "cmt-suggestion" },
+    h("div", { class: "sugg-old", title: "current text" },
+      h("span", { class: "sugg-marker", text: "−" }),
+      h("span", { class: "sugg-text", text: s.old }),
+    ),
+    h("div", { class: "sugg-new", title: "proposed replacement" },
+      h("span", { class: "sugg-marker", text: "+" }),
+      h("span", { class: "sugg-text", text: s.new }),
+    ),
+  );
 }
 
 function renderThreadEntry(entry) {
@@ -803,6 +833,7 @@ function init() {
     openCompose(
       { kind: "pdf_region", page: region.page, bbox: region.bbox },
       `PDF p${region.page}: "${region.text.slice(0, 80)}${region.text.length > 80 ? "…" : ""}"`,
+      region.text,  // pre-fill the "Original" field with the selected text
     );
   });
 

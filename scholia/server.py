@@ -1,4 +1,4 @@
-"""aiohttp web server for texwatch v0.4.0.
+"""aiohttp web server for scholia v0.4.0.
 
 Single paper, no workspace abstraction.  Three responsibilities:
 
@@ -48,7 +48,7 @@ from .synctex import (
     parse_synctex,
     source_to_page,
 )
-from .watcher import TexWatcher
+from .watcher import Scholiaer
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,23 @@ def _clamp_dpi(value: str | int, default: int = 150) -> int:
     """
     n = int(value) if not isinstance(value, int) else value
     return max(36, min(n, 600))
+
+
+def _suggestion_from_dict(d: Any) -> "SuggestedEdit | None":
+    """Build a SuggestedEdit from a dict, or None if absent/malformed.
+
+    Lenient: missing keys default to empty strings.  An empty old/new
+    pair is treated as "no suggestion" so the agent doesn't see a
+    SuggestedEdit({old: '', new: ''}).
+    """
+    from .comments import SuggestedEdit
+
+    if not isinstance(d, dict):
+        return None
+    sugg = SuggestedEdit.from_dict(d)
+    if not sugg.old and not sugg.new:
+        return None
+    return sugg
 
 
 def _parse_bbox(spec: str) -> tuple[float, float, float, float]:
@@ -202,7 +219,7 @@ def load_synctex_for_main(main_file: Path) -> SyncTeXData | None:
 # ---------------------------------------------------------------------------
 
 
-class TexWatchServer:
+class ScholiaServer:
     """Single-paper watch + serve + comment store."""
 
     def __init__(self, config: Config):
@@ -214,14 +231,14 @@ class TexWatchServer:
         self.synctex_data: SyncTeXData | None = None
         self.structure: DocumentStructure | None = None
         self.compiling = False
-        # Serialize do_compile so the watcher and texwatch_compile() don't
+        # Serialize do_compile so the watcher and scholia_compile() don't
         # race; second caller awaits the in-flight build instead of
         # starting a parallel one.
         self._compile_lock = asyncio.Lock()
 
-        self.comments = CommentStore(self.watch_dir / ".texwatch" / "comments.json")
+        self.comments = CommentStore(self.watch_dir / ".scholia" / "comments.json")
         self.websockets: set[web.WebSocketResponse] = set()
-        self.watcher: TexWatcher | None = None
+        self.watcher: Scholiaer | None = None
 
         self.app = self._build_app()
 
@@ -411,12 +428,14 @@ class TexWatchServer:
             return web.json_response({"error": f"invalid anchor: {exc}"}, status=400)
 
         resolved, snippet = self._resolve_anchor(anchor)
+        suggestion = _suggestion_from_dict(data.get("suggestion"))
         comment = self.comments.add(
             anchor=anchor,
             text=text,
             author=data.get("author", "human"),
             resolved_source=resolved,
             snippet=snippet,
+            suggestion=suggestion,
         )
         await self.broadcast({"type": "comment_added", "comment": _comment_to_dict(comment)})
         return web.json_response(_comment_to_dict(comment), status=201)
@@ -424,47 +443,39 @@ class TexWatchServer:
     def _resolve_anchor(self, anchor: Any) -> tuple[ResolvedSource | None, str | None]:
         """Resolve a freshly-created anchor to (source location, snippet).
 
-        Section anchors don't store a snippet (they re-resolve via the
-        structure parser); paper anchors carry no source location at all.
+        Dispatch lives on the anchors themselves
+        (:meth:`Anchor.resolve_source`).  We capture a snippet only for
+        anchors that need content-addressed staleness (source / pdf
+        region) — section anchors re-resolve via the structure parser
+        on every recheck, so they don't need a content snapshot.
         """
+        from .comments import ResolveContext
+
         if isinstance(anchor, PaperAnchor):
             return None, None
 
+        # Lazy-load structure for section resolution.
+        if isinstance(anchor, SectionAnchor) and self.structure is None:
+            self.structure = parse_structure(self.watch_dir, self.main_file)
+
+        ctx = ResolveContext(
+            watch_dir=self.watch_dir,
+            structure=self.structure,
+            synctex=self.synctex_data,
+        )
+        resolved = anchor.resolve_source(ctx)
+        if resolved is None:
+            return None, None
+
+        # Section anchors are structurally re-resolvable; everything
+        # else falls back to snippet matching.
         if isinstance(anchor, SectionAnchor):
-            if self.structure is None:
-                self.structure = parse_structure(self.watch_dir, self.main_file)
-            return (
-                resolve_section_to_source(
-                    self.structure, self.watch_dir, anchor.title, anchor.label
-                ),
-                None,
-            )
+            return resolved, None
 
-        if isinstance(anchor, SourceRangeAnchor):
-            snippet = capture_snippet(
-                self.watch_dir / anchor.file, anchor.line_start, anchor.line_end
-            )
-            return (
-                ResolvedSource(
-                    file=anchor.file,
-                    line_start=anchor.line_start,
-                    line_end=anchor.line_end,
-                ),
-                snippet or None,
-            )
-
-        if isinstance(anchor, PdfRegionAnchor):
-            resolved = resolve_pdf_region_to_source(
-                self.synctex_data, anchor.page, anchor.bbox
-            )
-            if resolved is None:
-                return None, None
-            snippet = capture_snippet(
-                self.watch_dir / resolved.file, resolved.line_start, resolved.line_end
-            )
-            return resolved, snippet or None
-
-        return None, None
+        snippet = capture_snippet(
+            self.watch_dir / resolved.file, resolved.line_start, resolved.line_end
+        )
+        return resolved, snippet or None
 
     async def _read_json(self, request: web.Request) -> tuple[dict[str, Any] | None, web.Response | None]:
         """Decode the request JSON body or return a 400 error response."""
@@ -713,6 +724,7 @@ class TexWatchServer:
             bbox=bbox,
             source=source,
             comment_id=comment_id,
+            watch_dir=self.watch_dir,
         )
 
     # ----- lifecycle -----
@@ -722,7 +734,7 @@ class TexWatchServer:
         await self.do_compile()
         # Start watcher
         loop = asyncio.get_running_loop()
-        self.watcher = TexWatcher(
+        self.watcher = Scholiaer(
             watch_dir=self.watch_dir,
             watch_patterns=self.config.watch,
             ignore_patterns=self.config.ignore,
@@ -734,7 +746,7 @@ class TexWatchServer:
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", port)
         await site.start()
-        logger.info("texwatch serving on http://127.0.0.1:%d", port)
+        logger.info("scholia serving on http://127.0.0.1:%d", port)
         # Run until cancelled
         try:
             await asyncio.Event().wait()
@@ -746,7 +758,7 @@ class TexWatchServer:
 
 def run(config: Config, port: int) -> None:
     """Synchronous entry point: build server, run until KeyboardInterrupt."""
-    server = TexWatchServer(config)
+    server = ScholiaServer(config)
     try:
         asyncio.run(server.start(port))
     except KeyboardInterrupt:

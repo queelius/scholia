@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from texwatch.watcher import TexFileHandler, TexWatcher
+from scholia.watcher import TexFileHandler, Scholiaer
 
 
 class TestTexFileHandler:
@@ -344,13 +344,13 @@ class TestTexFileHandler:
         loop.close()
 
 
-class TestTexWatcher:
-    """Tests for TexWatcher class."""
+class TestScholiaer:
+    """Tests for Scholiaer class."""
 
     def test_init(self, tmp_path):
-        """Test TexWatcher initialization."""
+        """Test Scholiaer initialization."""
         callback = AsyncMock()
-        watcher = TexWatcher(
+        watcher = Scholiaer(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],
@@ -365,7 +365,7 @@ class TestTexWatcher:
     def test_start_stop(self, tmp_path):
         """Test starting and stopping watcher."""
         callback = AsyncMock()
-        watcher = TexWatcher(
+        watcher = Scholiaer(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],
@@ -384,7 +384,7 @@ class TestTexWatcher:
 
     def test_is_running_property(self, tmp_path):
         """Test is_running property."""
-        watcher = TexWatcher(
+        watcher = Scholiaer(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],
@@ -403,7 +403,7 @@ class TestTexWatcher:
     def test_stop_cancels_pending_task(self, tmp_path):
         """Test that stop() cancels any pending debounce task."""
         callback = AsyncMock()
-        watcher = TexWatcher(
+        watcher = Scholiaer(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],
@@ -427,7 +427,7 @@ class TestTexWatcher:
 
     def test_is_running_false_after_stop(self, tmp_path):
         """Test is_running returns False after stop."""
-        watcher = TexWatcher(
+        watcher = Scholiaer(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],

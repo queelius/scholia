@@ -1,32 +1,32 @@
 ---
-name: texwatch
+name: scholia
 description: Use when working on TeX/LaTeX documents to view PDF output, navigate to lines, or check compile status
 ---
 
-# texwatch - TeX File Watcher Integration
+# scholia - TeX File Watcher Integration
 
-This skill provides integration with the texwatch tool for TeX/LaTeX document editing.
+This skill provides integration with the scholia tool for TeX/LaTeX document editing.
 
 ## Quick Reference
 
 ```bash
-# Check if texwatch is running and get status
-texwatch status
+# Check if scholia is running and get status
+scholia status
 
 # Navigate PDF to a specific line
-texwatch goto 42
+scholia goto 42
 
 # Navigate to a specific page
-texwatch goto p5
+scholia goto p5
 
 # Navigate to a section by name
-texwatch goto "Introduction"
+scholia goto "Introduction"
 
 # Force recompile
-texwatch compile
+scholia compile
 
 # Capture PDF page as PNG
-texwatch capture output.png --page 1 --dpi 150
+scholia capture output.png --page 1 --dpi 150
 ```
 
 ## Commands
@@ -36,8 +36,8 @@ texwatch capture output.png --page 1 --dpi 150
 Get the current compile state, errors, warnings, and viewer position:
 
 ```bash
-texwatch status
-texwatch status --json
+scholia status
+scholia status --json
 ```
 
 This shows:
@@ -52,20 +52,20 @@ This shows:
 Jump the PDF viewer to show where a specific source line renders:
 
 ```bash
-texwatch goto <target>
+scholia goto <target>
 ```
 
 Examples:
-- `texwatch goto 42` - Go to line 42 of the main file
-- `texwatch goto p3` - Go to page 3
-- `texwatch goto "Introduction"` - Go to section matching "Introduction"
+- `scholia goto 42` - Go to line 42 of the main file
+- `scholia goto p3` - Go to page 3
+- `scholia goto "Introduction"` - Go to section matching "Introduction"
 
 ### View Errors
 
 When compilation fails or produces warnings:
 
 ```bash
-texwatch status --json | jq '.errors'
+scholia status --json | jq '.errors'
 ```
 
 Or use the `/errors` endpoint for errors with source context:
@@ -79,7 +79,7 @@ curl localhost:8765/errors
 Trigger recompilation manually (normally automatic on file save):
 
 ```bash
-texwatch compile
+scholia compile
 ```
 
 ### Capture PDF Page
@@ -87,13 +87,13 @@ texwatch compile
 Screenshot a PDF page to a PNG file:
 
 ```bash
-texwatch capture output.png
-texwatch capture output.png --page 2 --dpi 300
+scholia capture output.png
+scholia capture output.png --page 2 --dpi 300
 ```
 
 ## MCP Tools
 
-texwatch provides an MCP (Model Context Protocol) server that allows Claude Code to interact with the running texwatch instance directly.
+scholia provides an MCP (Model Context Protocol) server that allows Claude Code to interact with the running scholia instance directly.
 
 ### Setup
 
@@ -102,8 +102,8 @@ Add to `.claude/.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "texwatch": {
-      "command": "texwatch",
+    "scholia": {
+      "command": "scholia",
       "args": ["mcp"],
       "env": {}
     }
@@ -116,8 +116,8 @@ Or with a custom port:
 ```json
 {
   "mcpServers": {
-    "texwatch": {
-      "command": "texwatch",
+    "scholia": {
+      "command": "scholia",
       "args": ["mcp", "--port", "9000"],
       "env": {}
     }
@@ -129,22 +129,22 @@ Or with a custom port:
 
 | Tool | Description |
 |------|-------------|
-| `texwatch_status` | Compilation status, errors, warnings |
-| `texwatch_context` | What the user is looking at (editor + viewer + section) |
-| `texwatch_errors` | Errors with source context lines |
-| `texwatch_structure` | Paper outline: sections, TODOs, inputs, word count |
-| `texwatch_goto` | Navigate to line, page, or section |
-| `texwatch_compile` | Trigger recompilation |
-| `texwatch_capture` | Screenshot current PDF page as PNG |
-| `texwatch_source` | Read source file content |
+| `scholia_status` | Compilation status, errors, warnings |
+| `scholia_context` | What the user is looking at (editor + viewer + section) |
+| `scholia_errors` | Errors with source context lines |
+| `scholia_structure` | Paper outline: sections, TODOs, inputs, word count |
+| `scholia_goto` | Navigate to line, page, or section |
+| `scholia_compile` | Trigger recompilation |
+| `scholia_capture` | Screenshot current PDF page as PNG |
+| `scholia_source` | Read source file content |
 
 All tools accept `port` (default: 8765) and `project` (optional) parameters.
 
-#### texwatch_status
+#### scholia_status
 
 Returns JSON with compile state, errors, warnings, viewer position, and editor state.
 
-#### texwatch_context
+#### scholia_context
 
 Returns a combined snapshot of what the user is currently working on:
 - Editor position (file and line)
@@ -153,11 +153,11 @@ Returns a combined snapshot of what the user is currently working on:
 - Error and warning counts
 - Word count
 
-#### texwatch_errors
+#### scholia_errors
 
 Returns errors and warnings from the last compilation, including source context lines around each error.
 
-#### texwatch_structure
+#### scholia_structure
 
 Returns the full document structure:
 - Sections (with level, title, file, line)
@@ -165,18 +165,18 @@ Returns the full document structure:
 - Input/include files
 - Word count
 
-#### texwatch_goto
+#### scholia_goto
 
 Navigate the PDF viewer. Accepts exactly one of:
 - `line`: Jump to where a source line renders in the PDF
 - `page`: Jump to a specific page number
 - `section`: Jump to a section by name (case-insensitive substring match)
 
-#### texwatch_compile
+#### scholia_compile
 
 Triggers a recompilation and returns the result including success status, errors, and warnings.
 
-#### texwatch_capture
+#### scholia_capture
 
 Screenshots the current PDF page as a PNG image. Parameters:
 - `page`: Page number (default: viewer's current page)
@@ -184,7 +184,7 @@ Screenshots the current PDF page as a PNG image. Parameters:
 
 Returns the image as base64-encoded PNG data.
 
-#### texwatch_source
+#### scholia_source
 
 Reads source file content from the project. Parameters:
 - `file`: File path relative to project root (default: main file)
@@ -194,28 +194,28 @@ Reads source file content from the project. Parameters:
 ### Starting a Session
 
 1. Navigate to your TeX project directory
-2. Run `texwatch serve` (or just `texwatch` if .texwatch.yaml exists)
+2. Run `scholia serve` (or just `scholia` if .scholia.yaml exists)
 3. Open http://localhost:8765 in a browser
 4. Edit .tex files - PDF auto-reloads on save
 
 ### Using with Claude Code
 
 When editing TeX files:
-1. Use `texwatch_context` to understand what the user is looking at
-2. Use `texwatch_errors` to check for compile errors with context
-3. Use `texwatch_structure` to understand the document outline
-4. Use `texwatch_goto` to navigate the viewer to specific locations
-5. Use `texwatch_capture` to see what the PDF looks like
+1. Use `scholia_context` to understand what the user is looking at
+2. Use `scholia_errors` to check for compile errors with context
+3. Use `scholia_structure` to understand the document outline
+4. Use `scholia_goto` to navigate the viewer to specific locations
+5. Use `scholia_capture` to see what the PDF looks like
 
 ### SyncTeX Navigation
 
 - Click anywhere in the PDF to see the corresponding source line in the status bar
-- Use `texwatch goto <line>` to jump from source to PDF position
+- Use `scholia goto <line>` to jump from source to PDF position
 - The viewer reports visible source line ranges for context
 
 ## Configuration
 
-texwatch uses `.texwatch.yaml` in the project root:
+scholia uses `.scholia.yaml` in the project root:
 
 ```yaml
 main: main.tex
@@ -228,7 +228,7 @@ compiler: latexmk  # or pdflatex, xelatex, lualatex
 port: 8765
 ```
 
-Create with: `texwatch init`
+Create with: `scholia init`
 
 ## API Reference
 
@@ -252,16 +252,16 @@ All per-project endpoints are also available under `/p/{project_name}/`.
 
 ## Troubleshooting
 
-**"No texwatch instance running"**
-- Start texwatch: `texwatch serve`
+**"No scholia instance running"**
+- Start scholia: `scholia serve`
 
 **"Compiler not found"**
 - Install latexmk: `sudo apt install latexmk` or `brew install latexmk`
-- Or use a different compiler in .texwatch.yaml
+- Or use a different compiler in .scholia.yaml
 
 **PDF not updating**
-- Check for compile errors: `texwatch status`
-- Force recompile: `texwatch compile`
+- Check for compile errors: `scholia status`
+- Force recompile: `scholia compile`
 - Check browser console for WebSocket issues
 
 **Navigation not working**
@@ -269,6 +269,6 @@ All per-project endpoints are also available under `/p/{project_name}/`.
 - Check that .synctex.gz file exists next to the PDF
 
 **MCP server not connecting**
-- Ensure texwatch HTTP server is running: `texwatch serve`
-- Check the port matches: `texwatch status -p 8765`
-- Install MCP dependencies: `pip install texwatch[mcp]`
+- Ensure scholia HTTP server is running: `scholia serve`
+- Check the port matches: `scholia status -p 8765`
+- Install MCP dependencies: `pip install scholia[mcp]`

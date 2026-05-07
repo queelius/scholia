@@ -1,4 +1,4 @@
-/* texwatch v0.5.0 — viewer + comments sidebar
+/* scholia v0.5.0 — viewer + comments sidebar
    Design priority: get out of the way of the PDF, make comments scannable. */
 
 :root {
@@ -334,6 +334,66 @@ button {
 .cmt-actions .cmt-resolve { background: var(--ok); color: white; border: none; }
 .cmt-actions .cmt-dismiss { background: var(--bg); }
 .cmt-actions .cmt-delete { color: var(--err); }
+
+/* ----- suggested rewrite (structured edit shown alongside text) ----- */
+.cmt-suggestion {
+  margin: 0.4rem 0;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.cmt-suggestion .sugg-old,
+.cmt-suggestion .sugg-new {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.3rem 0.5rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.cmt-suggestion .sugg-old { background: rgba(183, 56, 56, 0.08); }
+.cmt-suggestion .sugg-new {
+  background: rgba(58, 122, 58, 0.08);
+  border-top: 1px solid var(--border);
+}
+.cmt-suggestion .sugg-marker {
+  color: var(--fg-dim);
+  font-weight: bold;
+  flex-shrink: 0;
+  width: 1ch;
+}
+.cmt-suggestion .sugg-text { flex: 1; }
+
+/* ----- compose-dialog suggestion section (collapsible) ----- */
+.compose-suggestion {
+  border-top: 1px dashed var(--border);
+  padding-top: 0.5rem;
+}
+.compose-suggestion summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--fg-dim);
+  user-select: none;
+}
+.compose-suggestion[open] summary { color: var(--fg); }
+.compose-suggestion .compose-field-label {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--fg-dim);
+  margin: 0.4rem 0 0.15rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.compose-suggestion textarea {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  padding: 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  resize: vertical;
+}
 
 /* ----- inline comment form (reply / resolve / dismiss) ----- */
 .cmt-form {

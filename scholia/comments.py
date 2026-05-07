@@ -1,6 +1,6 @@
 """Comment thread storage for paper review.
 
-texwatch v0.4.0 reframes the tool as a code-review-style commenting system
+scholia v0.4.0 reframes the tool as a code-review-style commenting system
 for LaTeX papers: the human is the reviewer, Claude Code is the author.
 This module provides the data model, JSON-backed storage, and anchor-
 durability logic.
@@ -53,6 +53,9 @@ logger = logging.getLogger(__name__)
 
 AnchorKind = Literal["pdf_region", "section", "source_range", "paper"]
 
+# bbox in PDF points: (x1, y1, x2, y2) with top-left origin.
+BBox = tuple[float, float, float, float]
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -64,13 +67,54 @@ def _new_id() -> str:
 
 
 @dataclass
+class ResolveContext:
+    """Inputs anchors need to resolve themselves.
+
+    Anchors are dumb data; resolution requires either the parsed
+    document structure (for section anchors) or SyncTeX data (for PDF
+    regions, and for converting source ranges to image regions).
+    Callers assemble whichever pieces are available; anchors gracefully
+    return None when missing.
+    """
+
+    watch_dir: Path
+    structure: Any | None = None  # forward-ref to DocumentStructure
+    synctex: Any | None = None    # forward-ref to SyncTeXData
+
+
+def _source_anchor_to_image_target(anchor, ctx: ResolveContext) -> tuple[int, BBox] | None:
+    """Helper: source/section anchors produce image targets via SyncTeX."""
+    rs = anchor.resolve_source(ctx)
+    if rs is None or ctx.synctex is None:
+        return None
+    from . import imaging  # lazy: imaging is an optional dep
+    return imaging.resolve_source_to_region(
+        ctx.synctex, rs.file, rs.line_start, rs.line_end
+    )
+
+
+@dataclass
 class PdfRegionAnchor:
     page: int
-    bbox: tuple[float, float, float, float]  # (x1, y1, x2, y2) PDF points
+    bbox: BBox  # (x1, y1, x2, y2) PDF points
     kind: Literal["pdf_region"] = "pdf_region"
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "page": self.page, "bbox": list(self.bbox)}
+
+    def resolve_source(self, ctx: ResolveContext) -> "ResolvedSource | None":
+        if ctx.synctex is None:
+            return None
+        from .synctex import page_to_source
+        _, y1, _, y2 = self.bbox
+        src = page_to_source(ctx.synctex, self.page, (y1 + y2) / 2)
+        if src is None:
+            return None
+        return ResolvedSource(file=src.file, line_start=src.line, line_end=src.line)
+
+    def image_target(self, ctx: ResolveContext) -> tuple[int, BBox] | None:
+        # PDF anchors carry their own coordinates; no SyncTeX needed.
+        return self.page, self.bbox
 
 
 @dataclass
@@ -84,6 +128,26 @@ class SectionAnchor:
         if self.label is not None:
             d["label"] = self.label
         return d
+
+    def resolve_source(self, ctx: ResolveContext) -> "ResolvedSource | None":
+        if ctx.structure is None:
+            return None
+        from .structure import find_section
+        match = find_section(ctx.structure, title=self.title, label=self.label)
+        if match is None:
+            return None
+        file, line_start, line_end = match
+        if line_end < 0:
+            try:
+                line_end = len(
+                    (ctx.watch_dir / file).read_text(encoding="utf-8", errors="replace").splitlines()
+                )
+            except OSError:
+                line_end = line_start
+        return ResolvedSource(file=file, line_start=line_start, line_end=line_end)
+
+    def image_target(self, ctx: ResolveContext) -> tuple[int, BBox] | None:
+        return _source_anchor_to_image_target(self, ctx)
 
 
 @dataclass
@@ -101,6 +165,16 @@ class SourceRangeAnchor:
             "line_end": self.line_end,
         }
 
+    def resolve_source(self, ctx: ResolveContext) -> "ResolvedSource | None":
+        # Already a literal source range; the file existence check is
+        # left to staleness, not creation.
+        return ResolvedSource(
+            file=self.file, line_start=self.line_start, line_end=self.line_end
+        )
+
+    def image_target(self, ctx: ResolveContext) -> tuple[int, BBox] | None:
+        return _source_anchor_to_image_target(self, ctx)
+
 
 @dataclass
 class PaperAnchor:
@@ -108,6 +182,12 @@ class PaperAnchor:
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind}
+
+    def resolve_source(self, ctx: ResolveContext) -> "ResolvedSource | None":
+        return None
+
+    def image_target(self, ctx: ResolveContext) -> tuple[int, BBox] | None:
+        return None
 
 
 Anchor = PdfRegionAnchor | SectionAnchor | SourceRangeAnchor | PaperAnchor
@@ -176,6 +256,32 @@ Status = Literal["open", "resolved", "dismissed"]
 
 
 @dataclass
+class SuggestedEdit:
+    """A concrete rewrite proposed alongside a comment.
+
+    When a reviewer says "rephrase this to be tighter," it's much faster
+    for the agent to read a structured ``{old, new}`` than to parse the
+    intent out of prose.  ``old`` should be a verbatim slice of the
+    rendered text or source the comment anchors to; ``new`` is the
+    proposed replacement.
+
+    The agent can either apply the suggestion verbatim, modify it, or
+    discuss it via ``reply``.  ``old`` is advisory: the agent should
+    locate it in the source itself rather than trusting line numbers.
+    """
+
+    old: str
+    new: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"old": self.old, "new": self.new}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SuggestedEdit":
+        return cls(old=str(d.get("old", "")), new=str(d.get("new", "")))
+
+
+@dataclass
 class ThreadEntry:
     author: Author
     at: str
@@ -206,6 +312,7 @@ class Comment:
     status: Status = "open"
     resolved_source: ResolvedSource | None = None
     snippet: str | None = None
+    suggestion: SuggestedEdit | None = None
     created: str = field(default_factory=_now)
     updated: str = field(default_factory=_now)
     stale: bool = False
@@ -228,6 +335,8 @@ class Comment:
             d["resolved_source"] = self.resolved_source.to_dict()
         if self.snippet is not None:
             d["snippet"] = self.snippet
+        if self.suggestion is not None:
+            d["suggestion"] = self.suggestion.to_dict()
         if self.stale:
             d["stale"] = True
         return d
@@ -235,6 +344,7 @@ class Comment:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Comment":
         rs = d.get("resolved_source")
+        sugg = d.get("suggestion")
         return cls(
             id=str(d["id"]),
             anchor=anchor_from_dict(d["anchor"]),
@@ -242,6 +352,7 @@ class Comment:
             status=d.get("status", "open"),  # type: ignore[arg-type]
             resolved_source=ResolvedSource.from_dict(rs) if rs else None,
             snippet=d.get("snippet"),
+            suggestion=SuggestedEdit.from_dict(sugg) if sugg else None,
             created=str(d.get("created", _now())),
             updated=str(d.get("updated", _now())),
             stale=bool(d.get("stale", False)),
@@ -343,7 +454,7 @@ STORE_VERSION = 1
 class CommentStore:
     """JSON-backed comment storage.
 
-    Comments live in ``<watch_dir>/.texwatch/comments.json``.  The file
+    Comments live in ``<watch_dir>/.scholia/comments.json``.  The file
     is small (one paper, typically <1k comments), so we read/write the
     whole file on each operation.
 
@@ -443,6 +554,7 @@ class CommentStore:
         author: Author = "human",
         resolved_source: ResolvedSource | None = None,
         snippet: str | None = None,
+        suggestion: SuggestedEdit | None = None,
     ) -> Comment:
         now = _now()
         comment = Comment(
@@ -452,6 +564,7 @@ class CommentStore:
             status="open",
             resolved_source=resolved_source,
             snippet=snippet,
+            suggestion=suggestion,
             created=now,
             updated=now,
         )

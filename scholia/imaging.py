@@ -1,12 +1,12 @@
 """PDF page / region rendering via pymupdf.
 
-Used by the ``/image`` HTTP endpoint and the ``texwatch_image`` MCP tool
+Used by the ``/image`` HTTP endpoint and the ``scholia_image`` MCP tool
 to give Claude a visual on the rendered output.  Rendering is the one
 job the agent genuinely can't do for itself: PDF rendering nuances
 (figure placement, equation typesetting, overfull-box wrap, table
 spacing) only show up in the actual PDF.
 
-pymupdf is an optional dependency (``pip install texwatch[image]``).
+pymupdf is an optional dependency (``pip install scholia[image]``).
 We surface a friendly message when it's missing rather than crashing.
 """
 
@@ -38,7 +38,7 @@ def _open_pdf(pdf_path: Path, page: int):
     if fitz is None:
         raise ImagingError(
             "PDF imaging requires pymupdf. "
-            "Install with: pip install 'texwatch[image]'"
+            "Install with: pip install 'scholia[image]'"
         )
     if not pdf_path.exists():
         raise ImagingError(f"PDF not found: {pdf_path}")
@@ -118,51 +118,55 @@ def resolve_image_target(
     bbox: tuple[float, float, float, float] | None,
     source: tuple[str, int, int] | None,
     comment_id: str | None,
+    watch_dir: Path | None = None,
 ) -> tuple[int, tuple[float, float, float, float] | None]:
     """Map ``(page | source | comment_id)`` to ``(page, optional bbox)``.
 
-    Shared by the HTTP ``/image`` endpoint and the ``texwatch_image`` MCP
-    tool.  Inputs are pre-parsed primitives; *comment_lookup* is a
-    callable ``cid -> Comment | None`` so callers can supply either a
-    daemon's :class:`CommentStore` or a freshly-loaded one.
+    For ``comment_id``, dispatch goes through ``anchor.image_target``;
+    each anchor type knows how to render itself.  ``page``/``source`` are
+    direct constructions of an anchor + render.
 
     Raises :class:`ValueError` with a user-facing message on bad inputs.
     """
+    from .comments import (
+        PaperAnchor,
+        ResolveContext,
+        SourceRangeAnchor,
+    )
+
     primary = sum(1 for v in (page, source, comment_id) if v not in (None, ""))
     if primary != 1:
         raise ValueError("specify exactly one of page, source, or comment")
+
+    ctx = ResolveContext(
+        watch_dir=watch_dir or Path("."),
+        synctex=synctex,
+    )
 
     if comment_id:
         c = comment_lookup(comment_id)
         if c is None:
             raise ValueError(f"no comment {comment_id}")
-        if c.anchor.kind == "pdf_region":
-            return c.anchor.page, tuple(c.anchor.bbox)  # type: ignore[attr-defined,return-value]
-        if c.anchor.kind == "paper":
+        if isinstance(c.anchor, PaperAnchor):
             raise ValueError("paper anchors have no PDF region")
-        if c.resolved_source is None:
-            raise ValueError("comment is not anchored to a renderable region")
-        if synctex is None:
-            raise ValueError("no SyncTeX data; cannot resolve comment region")
-        pair = resolve_source_to_region(
-            synctex,
-            c.resolved_source.file,
-            c.resolved_source.line_start,
-            c.resolved_source.line_end,
-        )
-        if pair is None:
-            raise ValueError("comment's source range has no PDF coverage")
-        return pair
+        target = c.anchor.image_target(ctx)
+        if target is None:
+            if synctex is None:
+                raise ValueError("no SyncTeX data; cannot resolve comment region")
+            raise ValueError("comment's anchor has no PDF coverage")
+        return target
 
     if source is not None:
-        if synctex is None:
-            raise ValueError("no SyncTeX data")
-        pair = resolve_source_to_region(synctex, *source)
-        if pair is None:
+        # Synthesize a SourceRangeAnchor and dispatch through its method.
+        anchor = SourceRangeAnchor(file=source[0], line_start=source[1], line_end=source[2])
+        target = anchor.image_target(ctx)
+        if target is None:
+            if synctex is None:
+                raise ValueError("no SyncTeX data")
             raise ValueError("no PDF region for this source range")
-        return pair
+        return target
 
-    # page mode (with optional bbox)
+    # page mode (with optional bbox); no anchor dispatch needed.
     if page is None:
         raise ValueError("page must be an integer")
     return page, bbox
