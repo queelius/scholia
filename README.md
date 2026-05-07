@@ -38,41 +38,49 @@ In the browser:
 - The PDF appears on the left, the comments sidebar on the right.
 - **Select text in the PDF** to anchor a comment to that region. SyncTeX maps the selection back to a source line range automatically.
 - **Shift-click-drag** to draw a rectangle around any region (figures, equations, whitespace) where text selection doesn't reach. Same `pdf_region` anchor; the agent can render exactly that region with `scholia_image(comment_id=...)`.
+- **Suggest a rewrite** alongside any comment: the compose dialog has an optional `{old, new}` block. When you select text first, "old" pre-fills with the selected text, so you only type the replacement. The agent gets a structured edit it can apply directly.
 - **"+ Note"** in the top bar for a paper-level comment ("the abstract is too long").
 - **Paper tab** lists sections with **"+ comment"** buttons for section-level comments.
 - **Reply / Resolve / Dismiss** are inline forms in each comment, not modals.
 
 ## The Claude Code workflow
 
-`scholia` auto-registers an MCP server in `.mcp.json` when it starts, exposing **5 tools**:
+`scholia` auto-registers an MCP server in `.mcp.json` when it starts, exposing **6 tools**:
 
 | Tool | What it does |
 |---|---|
 | `scholia_paper(include_comments=True)` | Paper state in one call: sections (with line ranges), the comments queue, last-compile cache, main-file paths. |
 | `scholia_compile()` | Recompile and return structured errors with source context. |
-| `scholia_comment(action, ...)` | `add` / `reply` / `resolve` / `dismiss` / `delete`. |
+| `scholia_comment(action, ...)` | `add` / `reply` / `resolve` / `dismiss` / `delete`. Optional `suggestion={"old", "new"}` on add. |
 | `scholia_image(...)` | Render PDF region as PNG. Modes: `page=N`, `page+bbox`, `source="file:lstart-lend"`, `comment_id="c-..."`. |
+| `scholia_audit(focus=...)` | Workflow primer for agent-initiated review. Returns guidance; the agent then files comments back as `author="claude"`. |
 | `scholia_goto(target)` | Scroll the running viewer to a section / page / line / label. |
 
 Notice what's absent: there's no `scholia_labels()`, no `scholia_citations()`, no `scholia_environments()`. Use `Grep`. The agent is better at it than we are.
 
-**Visual review** is the killer mode of `scholia_image`. Claude is multimodal; pure text won't tell it whether a figure caption attaches to the right figure or whether an equation rendered correctly. The `comment_id` mode is the fast path: human draws a rectangle around a figure (shift-drag in the PDF), files the comment, agent renders that region, sees what the human pointed at, fixes the LaTeX.
+**Visual review** is the killer mode of `scholia_image`. Claude is multimodal; pure text won't tell it whether a figure caption attaches to the right figure or whether an equation rendered correctly. The `comment_id` mode is the fast path: human draws a rectangle around a figure, files the comment, agent renders that region, sees what the human pointed at, fixes the LaTeX.
 
-The intended dialogue:
+**Active review** runs the loop in either direction:
 
 ```
-You:    [drop 8 comments on the PDF, then in Claude Code]
+You:    [drop 8 comments on the PDF; for "rephrase X" comments, fill
+         in the suggested rewrite (agent applies it directly)]
         "Process the open comments."
 
-Claude: scholia_paper()             # one call, sees comments + sections
-        for each open comment:
-          Read source around comment.resolved_source
-          Edit the source
-          scholia_comment(action="resolve", id=..., summary="...")
-        scholia_compile()           # verify the build
+Claude: scholia_paper()                           # see comments + sections
+        for each: Read/Edit source; if suggestion present, apply it
+        scholia_comment(action="resolve", id=..., summary="...")
+        scholia_compile()                         # verify build
 
-You:    [PDF rebuilds in your browser; sidebar updates over WebSocket]
-        [reply or dismiss anything that needs more work]
+You:    [PDF rebuilds; reply / dismiss as needed]
+
+You:    "Audit my methods section for notation drift."
+
+Claude: scholia_audit(focus="math")               # guidance primer
+        Read paper.tex; scholia_image() to inspect rendering
+        scholia_comment(action="add", author="claude",
+                        anchor=..., text="...", suggestion=...)
+        # filed back into the queue, distinct visual treatment
 ```
 
 ## Comment anchors
@@ -98,7 +106,16 @@ scholia mcp             # run the MCP server (stdio)
 
 That's the whole CLI. Comment management lives in the browser (for humans) and in the MCP tools (for the agent). There is no `scholia comment add` from the shell because nobody types that.
 
-## What changed in v0.5.0
+## What changed in v0.6.0 (active review)
+
+The framing shifted from "human reviews; agent dispatches" to "review goes both ways":
+
+- **Suggested rewrites.** Comments now optionally carry a structured `{old, new}` block. The agent applies the rewrite directly instead of parsing prose. Browser pre-fills "old" with the selected PDF text so the human only types the replacement.
+- **`scholia_audit(focus=...)`** primes agent-initiated review. The agent reads the paper, files findings back as `author="claude"` comments, and the human steps through them.
+- **Refactor: anchors resolve themselves.** The dispatch that used to live in three switch statements (`server._resolve_anchor`, `imaging.resolve_image_target`, staleness check) is now methods on each anchor type. Adding a new anchor kind is a 30-line addition to one file.
+- **Renamed from `texwatch`.** The old name reflected the v0.3.0 "TeX watcher" product; the v0.6.0 product is a corpus of marginal annotations, which is what the Greek *scholia* literally meant.
+
+## What changed in v0.5.x
 
 Aggressive simplification with the agentic-first frame:
 
@@ -108,8 +125,7 @@ Aggressive simplification with the agentic-first frame:
 - **Folded `scholia_comments` into `scholia_paper(include_comments=True)`** for one-call orientation.
 - **Inline reply / resolve / dismiss forms** in the viewer, not `prompt()` dialogs.
 - **Compile lock** prevents the watcher and `scholia_compile()` from racing.
-
-Net code change: roughly −1200 lines across the project.
+- **Visual review via `scholia_image()`** with four modes (page, page+bbox, source range, comment id). Shift-click-drag selects arbitrary rectangles for figures.
 
 ## Configuration
 

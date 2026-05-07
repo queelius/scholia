@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "scholia"
-version = "0.5.3"
+version = "0.6.0"
 description = "Agentic-first review tool for LaTeX papers: live PDF preview + comment queue, designed for Claude Code as author"
 readme = "README.md"
 license = "MIT"
