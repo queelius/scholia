@@ -109,6 +109,23 @@ def _clamp_dpi(value: str | int, default: int = 150) -> int:
     return max(36, min(n, 600))
 
 
+def _suggestion_from_dict(d: Any) -> "SuggestedEdit | None":
+    """Build a SuggestedEdit from a dict, or None if absent/malformed.
+
+    Lenient: missing keys default to empty strings.  An empty old/new
+    pair is treated as "no suggestion" so the agent doesn't see a
+    SuggestedEdit({old: '', new: ''}).
+    """
+    from .comments import SuggestedEdit
+
+    if not isinstance(d, dict):
+        return None
+    sugg = SuggestedEdit.from_dict(d)
+    if not sugg.old and not sugg.new:
+        return None
+    return sugg
+
+
 def _parse_bbox(spec: str) -> tuple[float, float, float, float]:
     """Parse ``x1,y1,x2,y2`` in PDF points."""
     try:
@@ -411,12 +428,14 @@ class ScholiaServer:
             return web.json_response({"error": f"invalid anchor: {exc}"}, status=400)
 
         resolved, snippet = self._resolve_anchor(anchor)
+        suggestion = _suggestion_from_dict(data.get("suggestion"))
         comment = self.comments.add(
             anchor=anchor,
             text=text,
             author=data.get("author", "human"),
             resolved_source=resolved,
             snippet=snippet,
+            suggestion=suggestion,
         )
         await self.broadcast({"type": "comment_added", "comment": _comment_to_dict(comment)})
         return web.json_response(_comment_to_dict(comment), status=201)

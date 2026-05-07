@@ -122,6 +122,45 @@ def test_anchor_from_dict_unknown_kind():
 
 
 # ---------------------------------------------------------------------------
+# SuggestedEdit (the structured rewrite that rides alongside a comment)
+# ---------------------------------------------------------------------------
+
+
+def test_suggested_edit_roundtrip():
+    from scholia.comments import SuggestedEdit
+
+    s = SuggestedEdit(old="The frumious bandersnatch", new="The slithy tove")
+    assert s.to_dict() == {"old": "The frumious bandersnatch", "new": "The slithy tove"}
+    assert SuggestedEdit.from_dict(s.to_dict()) == s
+
+
+def test_comment_with_suggestion_persists(tmp_path: Path):
+    from scholia.comments import SuggestedEdit
+
+    store = CommentStore(tmp_path / "comments.json")
+    c = store.add(
+        PaperAnchor(),
+        "tighten this",
+        suggestion=SuggestedEdit(old="historically, masked failure data", new="masked failure data"),
+    )
+    raw = json.loads((tmp_path / "comments.json").read_text())
+    sugg = raw["comments"][0]["suggestion"]
+    assert sugg == {"old": "historically, masked failure data", "new": "masked failure data"}
+
+    # Round-trip through Comment.from_dict
+    restored = Comment.from_dict(raw["comments"][0])
+    assert restored.suggestion == c.suggestion
+
+
+def test_comment_without_suggestion_omits_field(tmp_path: Path):
+    """Backward-compat: a comment without a suggestion has no `suggestion` key."""
+    store = CommentStore(tmp_path / "comments.json")
+    store.add(PaperAnchor(), "no rewrite proposed")
+    raw = json.loads((tmp_path / "comments.json").read_text())
+    assert "suggestion" not in raw["comments"][0]
+
+
+# ---------------------------------------------------------------------------
 # Comment serialization
 # ---------------------------------------------------------------------------
 

@@ -256,6 +256,32 @@ Status = Literal["open", "resolved", "dismissed"]
 
 
 @dataclass
+class SuggestedEdit:
+    """A concrete rewrite proposed alongside a comment.
+
+    When a reviewer says "rephrase this to be tighter," it's much faster
+    for the agent to read a structured ``{old, new}`` than to parse the
+    intent out of prose.  ``old`` should be a verbatim slice of the
+    rendered text or source the comment anchors to; ``new`` is the
+    proposed replacement.
+
+    The agent can either apply the suggestion verbatim, modify it, or
+    discuss it via ``reply``.  ``old`` is advisory: the agent should
+    locate it in the source itself rather than trusting line numbers.
+    """
+
+    old: str
+    new: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"old": self.old, "new": self.new}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SuggestedEdit":
+        return cls(old=str(d.get("old", "")), new=str(d.get("new", "")))
+
+
+@dataclass
 class ThreadEntry:
     author: Author
     at: str
@@ -286,6 +312,7 @@ class Comment:
     status: Status = "open"
     resolved_source: ResolvedSource | None = None
     snippet: str | None = None
+    suggestion: SuggestedEdit | None = None
     created: str = field(default_factory=_now)
     updated: str = field(default_factory=_now)
     stale: bool = False
@@ -308,6 +335,8 @@ class Comment:
             d["resolved_source"] = self.resolved_source.to_dict()
         if self.snippet is not None:
             d["snippet"] = self.snippet
+        if self.suggestion is not None:
+            d["suggestion"] = self.suggestion.to_dict()
         if self.stale:
             d["stale"] = True
         return d
@@ -315,6 +344,7 @@ class Comment:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Comment":
         rs = d.get("resolved_source")
+        sugg = d.get("suggestion")
         return cls(
             id=str(d["id"]),
             anchor=anchor_from_dict(d["anchor"]),
@@ -322,6 +352,7 @@ class Comment:
             status=d.get("status", "open"),  # type: ignore[arg-type]
             resolved_source=ResolvedSource.from_dict(rs) if rs else None,
             snippet=d.get("snippet"),
+            suggestion=SuggestedEdit.from_dict(sugg) if sugg else None,
             created=str(d.get("created", _now())),
             updated=str(d.get("updated", _now())),
             stale=bool(d.get("stale", False)),
@@ -523,6 +554,7 @@ class CommentStore:
         author: Author = "human",
         resolved_source: ResolvedSource | None = None,
         snippet: str | None = None,
+        suggestion: SuggestedEdit | None = None,
     ) -> Comment:
         now = _now()
         comment = Comment(
@@ -532,6 +564,7 @@ class CommentStore:
             status="open",
             resolved_source=resolved_source,
             snippet=snippet,
+            suggestion=suggestion,
             created=now,
             updated=now,
         )

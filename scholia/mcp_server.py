@@ -124,6 +124,7 @@ def _comment_add(
     text: str | None,
     anchor: dict[str, Any] | None,
     author: str,
+    suggestion: dict[str, Any] | None = None,
 ) -> str:
     """Implementation of ``scholia_comment(action="add", ...)``.
 
@@ -178,12 +179,15 @@ def _comment_add(
                 or None
             )
 
+    from .server import _suggestion_from_dict
+
     comment = store.add(
         anchor=a,
         text=text,
         author=author,
         resolved_source=resolved,
         snippet=snippet,
+        suggestion=_suggestion_from_dict(suggestion),
     )
     return _ok(comment.to_dict())
 
@@ -269,6 +273,7 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         summary: str | None = None,
         reason: str | None = None,
         edits: list[str] | None = None,
+        suggestion: dict[str, str] | None = None,
         author: str = "claude",
     ) -> str:
         """Mutate a comment.
@@ -286,8 +291,13 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
           {"kind": "source_range", "file": "intro.tex", "line_start": 42, "line_end": 58}
           {"kind": "pdf_region", "page": 3, "bbox": [x1, y1, x2, y2]}
 
-        Edits is an optional list of strings describing what changed when
-        resolving: ["intro.tex:42-58 -> :42-78"].
+        Optional ``suggestion={"old": "...", "new": "..."}`` (add only):
+        a structured rewrite the agent can apply directly instead of
+        parsing prose.  Use it when the comment proposes a concrete
+        edit; leave it off for open-ended discussion ("expand this").
+
+        Edits is an optional list of strings describing what changed
+        when resolving: ["intro.tex:42-58 -> :42-78"].
 
         To list the comment queue, call ``scholia_paper()`` (which
         returns comments by default).
@@ -295,7 +305,7 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         cfg, watch_dir, store = _load_project()
         try:
             if action == "add":
-                return _comment_add(store, cfg, watch_dir, text, anchor, author)
+                return _comment_add(store, cfg, watch_dir, text, anchor, author, suggestion)
             if action == "reply":
                 if not id or not text:
                     return _err("reply requires id and text")

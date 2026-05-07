@@ -67,6 +67,38 @@ async def test_paper_endpoint_returns_structure(client):
 
 
 @pytest.mark.asyncio
+async def test_create_comment_with_suggestion(client):
+    tc, _ = client
+    resp = await tc.post(
+        "/comments",
+        json={
+            "anchor": {"kind": "paper"},
+            "text": "rephrase",
+            "suggestion": {"old": "the original phrasing", "new": "the new phrasing"},
+        },
+    )
+    assert resp.status == 201
+    data = await resp.json()
+    assert data["suggestion"] == {"old": "the original phrasing", "new": "the new phrasing"}
+
+
+@pytest.mark.asyncio
+async def test_empty_suggestion_omitted(client):
+    """Both old and new empty -> no suggestion stored (avoid empty pair)."""
+    tc, _ = client
+    resp = await tc.post(
+        "/comments",
+        json={
+            "anchor": {"kind": "paper"},
+            "text": "x",
+            "suggestion": {"old": "", "new": ""},
+        },
+    )
+    data = await resp.json()
+    assert "suggestion" not in data
+
+
+@pytest.mark.asyncio
 async def test_create_paper_anchor_comment(client):
     tc, _ = client
     resp = await tc.post(
