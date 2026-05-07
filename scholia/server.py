@@ -424,47 +424,39 @@ class ScholiaServer:
     def _resolve_anchor(self, anchor: Any) -> tuple[ResolvedSource | None, str | None]:
         """Resolve a freshly-created anchor to (source location, snippet).
 
-        Section anchors don't store a snippet (they re-resolve via the
-        structure parser); paper anchors carry no source location at all.
+        Dispatch lives on the anchors themselves
+        (:meth:`Anchor.resolve_source`).  We capture a snippet only for
+        anchors that need content-addressed staleness (source / pdf
+        region) — section anchors re-resolve via the structure parser
+        on every recheck, so they don't need a content snapshot.
         """
+        from .comments import ResolveContext
+
         if isinstance(anchor, PaperAnchor):
             return None, None
 
+        # Lazy-load structure for section resolution.
+        if isinstance(anchor, SectionAnchor) and self.structure is None:
+            self.structure = parse_structure(self.watch_dir, self.main_file)
+
+        ctx = ResolveContext(
+            watch_dir=self.watch_dir,
+            structure=self.structure,
+            synctex=self.synctex_data,
+        )
+        resolved = anchor.resolve_source(ctx)
+        if resolved is None:
+            return None, None
+
+        # Section anchors are structurally re-resolvable; everything
+        # else falls back to snippet matching.
         if isinstance(anchor, SectionAnchor):
-            if self.structure is None:
-                self.structure = parse_structure(self.watch_dir, self.main_file)
-            return (
-                resolve_section_to_source(
-                    self.structure, self.watch_dir, anchor.title, anchor.label
-                ),
-                None,
-            )
+            return resolved, None
 
-        if isinstance(anchor, SourceRangeAnchor):
-            snippet = capture_snippet(
-                self.watch_dir / anchor.file, anchor.line_start, anchor.line_end
-            )
-            return (
-                ResolvedSource(
-                    file=anchor.file,
-                    line_start=anchor.line_start,
-                    line_end=anchor.line_end,
-                ),
-                snippet or None,
-            )
-
-        if isinstance(anchor, PdfRegionAnchor):
-            resolved = resolve_pdf_region_to_source(
-                self.synctex_data, anchor.page, anchor.bbox
-            )
-            if resolved is None:
-                return None, None
-            snippet = capture_snippet(
-                self.watch_dir / resolved.file, resolved.line_start, resolved.line_end
-            )
-            return resolved, snippet or None
-
-        return None, None
+        snippet = capture_snippet(
+            self.watch_dir / resolved.file, resolved.line_start, resolved.line_end
+        )
+        return resolved, snippet or None
 
     async def _read_json(self, request: web.Request) -> tuple[dict[str, Any] | None, web.Response | None]:
         """Decode the request JSON body or return a 400 error response."""
@@ -713,6 +705,7 @@ class ScholiaServer:
             bbox=bbox,
             source=source,
             comment_id=comment_id,
+            watch_dir=self.watch_dir,
         )
 
     # ----- lifecycle -----

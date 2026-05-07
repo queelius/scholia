@@ -359,7 +359,7 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         from .config import get_main_file
         from .server import _clamp_dpi, _parse_source_range
 
-        cfg, _, store = _load_project()
+        cfg, watch_dir, store = _load_project()
         pdf_path = get_main_file(cfg).with_suffix(".pdf")
         if not pdf_path.exists():
             return [TextContent(type="text",
@@ -385,6 +385,7 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
                 bbox=parsed_bbox,
                 source=parsed_source,
                 comment_id=comment_id,
+                watch_dir=watch_dir,
             )
             if resolved_bbox is None:
                 png = await asyncio.to_thread(

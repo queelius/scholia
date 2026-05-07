@@ -53,6 +53,9 @@ logger = logging.getLogger(__name__)
 
 AnchorKind = Literal["pdf_region", "section", "source_range", "paper"]
 
+# bbox in PDF points: (x1, y1, x2, y2) with top-left origin.
+BBox = tuple[float, float, float, float]
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -64,13 +67,54 @@ def _new_id() -> str:
 
 
 @dataclass
+class ResolveContext:
+    """Inputs anchors need to resolve themselves.
+
+    Anchors are dumb data; resolution requires either the parsed
+    document structure (for section anchors) or SyncTeX data (for PDF
+    regions, and for converting source ranges to image regions).
+    Callers assemble whichever pieces are available; anchors gracefully
+    return None when missing.
+    """
+
+    watch_dir: Path
+    structure: Any | None = None  # forward-ref to DocumentStructure
+    synctex: Any | None = None    # forward-ref to SyncTeXData
+
+
+def _source_anchor_to_image_target(anchor, ctx: ResolveContext) -> tuple[int, BBox] | None:
+    """Helper: source/section anchors produce image targets via SyncTeX."""
+    rs = anchor.resolve_source(ctx)
+    if rs is None or ctx.synctex is None:
+        return None
+    from . import imaging  # lazy: imaging is an optional dep
+    return imaging.resolve_source_to_region(
+        ctx.synctex, rs.file, rs.line_start, rs.line_end
+    )
+
+
+@dataclass
 class PdfRegionAnchor:
     page: int
-    bbox: tuple[float, float, float, float]  # (x1, y1, x2, y2) PDF points
+    bbox: BBox  # (x1, y1, x2, y2) PDF points
     kind: Literal["pdf_region"] = "pdf_region"
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "page": self.page, "bbox": list(self.bbox)}
+
+    def resolve_source(self, ctx: ResolveContext) -> "ResolvedSource | None":
+        if ctx.synctex is None:
+            return None
+        from .synctex import page_to_source
+        _, y1, _, y2 = self.bbox
+        src = page_to_source(ctx.synctex, self.page, (y1 + y2) / 2)
+        if src is None:
+            return None
+        return ResolvedSource(file=src.file, line_start=src.line, line_end=src.line)
+
+    def image_target(self, ctx: ResolveContext) -> tuple[int, BBox] | None:
+        # PDF anchors carry their own coordinates; no SyncTeX needed.
+        return self.page, self.bbox
 
 
 @dataclass
@@ -84,6 +128,26 @@ class SectionAnchor:
         if self.label is not None:
             d["label"] = self.label
         return d
+
+    def resolve_source(self, ctx: ResolveContext) -> "ResolvedSource | None":
+        if ctx.structure is None:
+            return None
+        from .structure import find_section
+        match = find_section(ctx.structure, title=self.title, label=self.label)
+        if match is None:
+            return None
+        file, line_start, line_end = match
+        if line_end < 0:
+            try:
+                line_end = len(
+                    (ctx.watch_dir / file).read_text(encoding="utf-8", errors="replace").splitlines()
+                )
+            except OSError:
+                line_end = line_start
+        return ResolvedSource(file=file, line_start=line_start, line_end=line_end)
+
+    def image_target(self, ctx: ResolveContext) -> tuple[int, BBox] | None:
+        return _source_anchor_to_image_target(self, ctx)
 
 
 @dataclass
@@ -101,6 +165,16 @@ class SourceRangeAnchor:
             "line_end": self.line_end,
         }
 
+    def resolve_source(self, ctx: ResolveContext) -> "ResolvedSource | None":
+        # Already a literal source range; the file existence check is
+        # left to staleness, not creation.
+        return ResolvedSource(
+            file=self.file, line_start=self.line_start, line_end=self.line_end
+        )
+
+    def image_target(self, ctx: ResolveContext) -> tuple[int, BBox] | None:
+        return _source_anchor_to_image_target(self, ctx)
+
 
 @dataclass
 class PaperAnchor:
@@ -108,6 +182,12 @@ class PaperAnchor:
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind}
+
+    def resolve_source(self, ctx: ResolveContext) -> "ResolvedSource | None":
+        return None
+
+    def image_target(self, ctx: ResolveContext) -> tuple[int, BBox] | None:
+        return None
 
 
 Anchor = PdfRegionAnchor | SectionAnchor | SourceRangeAnchor | PaperAnchor
