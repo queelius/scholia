@@ -1,1 +1,1 @@
-"""Tests for texwatch."""
+"""Tests for scholia."""

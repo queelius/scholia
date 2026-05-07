@@ -1,15 +1,15 @@
-"""MCP server for texwatch v0.4.0.
+"""MCP server for scholia v0.4.0.
 
 Exposes 5 tools to Claude Code via stdio:
 
-    texwatch_paper()                 paper state (sections, labels, citations, comments)
-    texwatch_compile()               recompile, return structured errors
-    texwatch_comments(status, tags)  list comments (queue of work)
-    texwatch_comment(action, ...)    add/reply/resolve/dismiss/reopen/delete
-    texwatch_goto(target)            tell the daemon to scroll the viewer (requires daemon)
+    scholia_paper()                 paper state (sections, labels, citations, comments)
+    scholia_compile()               recompile, return structured errors
+    scholia_comments(status, tags)  list comments (queue of work)
+    scholia_comment(action, ...)    add/reply/resolve/dismiss/reopen/delete
+    scholia_goto(target)            tell the daemon to scroll the viewer (requires daemon)
 
 The MCP server reads/writes the same files the daemon does
-(``.texwatch/comments.json`` and the .tex sources).  It does not require
+(``.scholia/comments.json`` and the .tex sources).  It does not require
 the daemon to be running for paper/compile/comment operations.  The
 ``goto`` tool is the exception: it speaks HTTP to a running daemon.
 
@@ -44,7 +44,7 @@ def _check_deps() -> None:
         print(
             "Error: MCP server requires the 'mcp' package.\n"
             "Install with:\n"
-            "  pip install texwatch[mcp]",
+            "  pip install scholia[mcp]",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -57,7 +57,7 @@ def _load_project():
 
     cfg = load_config()
     watch_dir = get_watch_dir(cfg)
-    store = CommentStore(watch_dir / ".texwatch" / "comments.json")
+    store = CommentStore(watch_dir / ".scholia" / "comments.json")
     return cfg, watch_dir, store
 
 
@@ -82,7 +82,7 @@ def _ok(payload: Any) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
-# In-process SyncTeX cache for the MCP server.  Each call to texwatch_image
+# In-process SyncTeX cache for the MCP server.  Each call to scholia_image
 # / _comment_add would otherwise re-parse the .synctex.gz from disk; on a
 # 50+ page paper that is tens of MB of gzipped data per call.  Keyed by
 # the synctex file's mtime so a recompile transparently invalidates.
@@ -125,7 +125,7 @@ def _comment_add(
     anchor: dict[str, Any] | None,
     author: str,
 ) -> str:
-    """Implementation of ``texwatch_comment(action="add", ...)``.
+    """Implementation of ``scholia_comment(action="add", ...)``.
 
     Resolves source-bearing anchors via the same helpers the HTTP server
     uses, so the two surfaces produce identical ``resolved_source``
@@ -195,10 +195,10 @@ def _comment_add(
 
 def create_server(daemon_port: int = 8765) -> "FastMCP":
     _check_deps()
-    mcp = FastMCP("texwatch")
+    mcp = FastMCP("scholia")
 
     @mcp.tool()
-    async def texwatch_paper(
+    async def scholia_paper(
         include_comments: bool = True,
         comments_status: str = "open",
     ) -> str:
@@ -244,7 +244,7 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         return _ok(result)
 
     @mcp.tool()
-    async def texwatch_compile() -> str:
+    async def scholia_compile() -> str:
         """Recompile the paper.  Returns structured errors and warnings, each
         with file/line/message and (when possible) source context lines.
 
@@ -261,7 +261,7 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         return _ok(_result_to_dict(result))
 
     @mcp.tool()
-    async def texwatch_comment(
+    async def scholia_comment(
         action: str,
         id: str | None = None,
         text: str | None = None,
@@ -289,7 +289,7 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         Edits is an optional list of strings describing what changed when
         resolving: ["intro.tex:42-58 -> :42-78"].
 
-        To list the comment queue, call ``texwatch_paper()`` (which
+        To list the comment queue, call ``scholia_paper()`` (which
         returns comments by default).
         """
         cfg, watch_dir, store = _load_project()
@@ -325,7 +325,7 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
             return _err(str(exc))
 
     @mcp.tool()
-    async def texwatch_image(
+    async def scholia_image(
         page: int | None = None,
         bbox: list[float] | None = None,
         source: str | None = None,
@@ -345,12 +345,12 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         rendering, overfull boxes, table positioning, or to verify a fix
         looks right.
 
-        Combine with texwatch_paper() for the workflow:
-          1. texwatch_paper()                          # see open comments
-          2. for each: texwatch_image(comment_id=...)  # see the rendered
+        Combine with scholia_paper() for the workflow:
+          1. scholia_paper()                          # see open comments
+          2. for each: scholia_image(comment_id=...)  # see the rendered
                                                        # region the human
                                                        # anchored
-          3. Read source, Edit, then texwatch_compile + texwatch_image
+          3. Read source, Edit, then scholia_compile + scholia_image
              again to verify visually.
         """
         import base64
@@ -363,7 +363,7 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         pdf_path = get_main_file(cfg).with_suffix(".pdf")
         if not pdf_path.exists():
             return [TextContent(type="text",
-                text=_err("no PDF on disk; run texwatch_compile() first"))]
+                text=_err("no PDF on disk; run scholia_compile() first"))]
 
         parsed_bbox: tuple[float, float, float, float] | None = None
         if bbox is not None:
@@ -408,16 +408,16 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         )]
 
     @mcp.tool()
-    async def texwatch_goto(target: str, port: int = daemon_port) -> str:
+    async def scholia_goto(target: str, port: int = daemon_port) -> str:
         """Tell a running daemon to scroll the viewer to a target.
 
         target: a section title, "pN" (page), file:line, or just N (line in main file).
-        Requires the texwatch server to be running.
+        Requires the scholia server to be running.
         """
         try:
             import httpx
         except ImportError:
-            return _err("httpx not installed; install texwatch[mcp]")
+            return _err("httpx not installed; install scholia[mcp]")
 
         cfg, _, _ = _load_project()
         body = parse_goto_target(target, default_file=cfg.main)

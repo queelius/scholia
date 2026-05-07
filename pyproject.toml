@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "texwatch"
+name = "scholia"
 version = "0.5.3"
 description = "Agentic-first review tool for LaTeX papers: live PDF preview + comment queue, designed for Claude Code as author"
 readme = "README.md"
@@ -42,22 +42,22 @@ dev = [
 ]
 
 [project.scripts]
-texwatch = "texwatch.cli:main"
+scholia = "scholia.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/queelius/texwatch"
-Repository = "https://github.com/queelius/texwatch"
+Homepage = "https://github.com/queelius/scholia"
+Repository = "https://github.com/queelius/scholia"
 
 [tool.hatch.build.targets.wheel]
-packages = ["texwatch"]
+packages = ["scholia"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-v --cov=texwatch --cov-report=term-missing"
+addopts = "-v --cov=scholia --cov-report=term-missing"
 
 [tool.coverage.run]
-source = ["texwatch"]
+source = ["scholia"]
 branch = true
 
 [tool.coverage.report]

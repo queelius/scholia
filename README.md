@@ -1,4 +1,4 @@
-# texwatch
+# scholia
 
 **Agentic-first PDF review for LaTeX papers, with Claude Code as the author.**
 
@@ -6,9 +6,9 @@ You read the rendered PDF in your browser. You drop comments on paragraphs, sect
 
 ## Why this exists
 
-texwatch is deliberately *not* an editor, *not* an IDE, *not* an Overleaf clone. The agent (Claude Code) is already smarter at reading source, parsing LaTeX, grepping citations, and editing files than any tool we could build. So we don't try.
+scholia is deliberately *not* an editor, *not* an IDE, *not* an Overleaf clone. The agent (Claude Code) is already smarter at reading source, parsing LaTeX, grepping citations, and editing files than any tool we could build. So we don't try.
 
-texwatch is a **substrate** for the agentic-first writing workflow:
+scholia is a **substrate** for the agentic-first writing workflow:
 
 - A **live PDF preview** the human can watch and gesture at.
 - A **comment queue** anchored to PDF regions, sections, source ranges, or the paper as a whole.
@@ -21,42 +21,42 @@ That's it. Three responsibilities. Anything that re-implements something the age
 Requires Python 3.10+ and `latexmk` (or `pdflatex`/`xelatex`/`lualatex`/`pandoc`) on your `PATH`.
 
 ```bash
-pip install texwatch
-pip install texwatch[mcp]   # adds MCP server for Claude Code
+pip install scholia
+pip install scholia[mcp]   # adds MCP server for Claude Code
 ```
 
 ## Quick start
 
 ```bash
 cd my-paper/
-texwatch init       # writes .texwatch.yaml (configures main file, port)
-texwatch            # starts the daemon at http://localhost:8765
+scholia init       # writes .scholia.yaml (configures main file, port)
+scholia            # starts the daemon at http://localhost:8765
 ```
 
 In the browser:
 
 - The PDF appears on the left, the comments sidebar on the right.
 - **Select text in the PDF** to anchor a comment to that region. SyncTeX maps the selection back to a source line range automatically.
-- **Shift-click-drag** to draw a rectangle around any region (figures, equations, whitespace) where text selection doesn't reach. Same `pdf_region` anchor; the agent can render exactly that region with `texwatch_image(comment_id=...)`.
+- **Shift-click-drag** to draw a rectangle around any region (figures, equations, whitespace) where text selection doesn't reach. Same `pdf_region` anchor; the agent can render exactly that region with `scholia_image(comment_id=...)`.
 - **"+ Note"** in the top bar for a paper-level comment ("the abstract is too long").
 - **Paper tab** lists sections with **"+ comment"** buttons for section-level comments.
 - **Reply / Resolve / Dismiss** are inline forms in each comment, not modals.
 
 ## The Claude Code workflow
 
-`texwatch` auto-registers an MCP server in `.mcp.json` when it starts, exposing **5 tools**:
+`scholia` auto-registers an MCP server in `.mcp.json` when it starts, exposing **5 tools**:
 
 | Tool | What it does |
 |---|---|
-| `texwatch_paper(include_comments=True)` | Paper state in one call: sections (with line ranges), the comments queue, last-compile cache, main-file paths. |
-| `texwatch_compile()` | Recompile and return structured errors with source context. |
-| `texwatch_comment(action, ...)` | `add` / `reply` / `resolve` / `dismiss` / `delete`. |
-| `texwatch_image(...)` | Render PDF region as PNG. Modes: `page=N`, `page+bbox`, `source="file:lstart-lend"`, `comment_id="c-..."`. |
-| `texwatch_goto(target)` | Scroll the running viewer to a section / page / line / label. |
+| `scholia_paper(include_comments=True)` | Paper state in one call: sections (with line ranges), the comments queue, last-compile cache, main-file paths. |
+| `scholia_compile()` | Recompile and return structured errors with source context. |
+| `scholia_comment(action, ...)` | `add` / `reply` / `resolve` / `dismiss` / `delete`. |
+| `scholia_image(...)` | Render PDF region as PNG. Modes: `page=N`, `page+bbox`, `source="file:lstart-lend"`, `comment_id="c-..."`. |
+| `scholia_goto(target)` | Scroll the running viewer to a section / page / line / label. |
 
-Notice what's absent: there's no `texwatch_labels()`, no `texwatch_citations()`, no `texwatch_environments()`. Use `Grep`. The agent is better at it than we are.
+Notice what's absent: there's no `scholia_labels()`, no `scholia_citations()`, no `scholia_environments()`. Use `Grep`. The agent is better at it than we are.
 
-**Visual review** is the killer mode of `texwatch_image`. Claude is multimodal; pure text won't tell it whether a figure caption attaches to the right figure or whether an equation rendered correctly. The `comment_id` mode is the fast path: human draws a rectangle around a figure (shift-drag in the PDF), files the comment, agent renders that region, sees what the human pointed at, fixes the LaTeX.
+**Visual review** is the killer mode of `scholia_image`. Claude is multimodal; pure text won't tell it whether a figure caption attaches to the right figure or whether an equation rendered correctly. The `comment_id` mode is the fast path: human draws a rectangle around a figure (shift-drag in the PDF), files the comment, agent renders that region, sees what the human pointed at, fixes the LaTeX.
 
 The intended dialogue:
 
@@ -64,12 +64,12 @@ The intended dialogue:
 You:    [drop 8 comments on the PDF, then in Claude Code]
         "Process the open comments."
 
-Claude: texwatch_paper()             # one call, sees comments + sections
+Claude: scholia_paper()             # one call, sees comments + sections
         for each open comment:
           Read source around comment.resolved_source
           Edit the source
-          texwatch_comment(action="resolve", id=..., summary="...")
-        texwatch_compile()           # verify the build
+          scholia_comment(action="resolve", id=..., summary="...")
+        scholia_compile()           # verify the build
 
 You:    [PDF rebuilds in your browser; sidebar updates over WebSocket]
         [reply or dismiss anything that needs more work]
@@ -89,14 +89,14 @@ Four kinds, with different staleness behavior:
 ## CLI
 
 ```
-texwatch                 # serve (default)
-texwatch init            # scaffold .texwatch.yaml
-texwatch compile         # one-shot compile, structured errors
-texwatch goto "Methods"  # tell the running viewer to scroll
-texwatch mcp             # run the MCP server (stdio)
+scholia                 # serve (default)
+scholia init            # scaffold .scholia.yaml
+scholia compile         # one-shot compile, structured errors
+scholia goto "Methods"  # tell the running viewer to scroll
+scholia mcp             # run the MCP server (stdio)
 ```
 
-That's the whole CLI. Comment management lives in the browser (for humans) and in the MCP tools (for the agent). There is no `texwatch comment add` from the shell because nobody types that.
+That's the whole CLI. Comment management lives in the browser (for humans) and in the MCP tools (for the agent). There is no `scholia comment add` from the shell because nobody types that.
 
 ## What changed in v0.5.0
 
@@ -104,16 +104,16 @@ Aggressive simplification with the agentic-first frame:
 
 - **Dropped the CLI comment surface entirely.** The agent and the browser are the only sane places to manage comments.
 - **Dropped `tags`, `reopen`, the `Errors` tab.** Tags were noise, reopen was Github-imitation, the Errors tab duplicated information the topbar already shows.
-- **Dropped `labels` / `citations` / `inputs` from `texwatch_paper()`.** Use `Grep`.
-- **Folded `texwatch_comments` into `texwatch_paper(include_comments=True)`** for one-call orientation.
+- **Dropped `labels` / `citations` / `inputs` from `scholia_paper()`.** Use `Grep`.
+- **Folded `scholia_comments` into `scholia_paper(include_comments=True)`** for one-call orientation.
 - **Inline reply / resolve / dismiss forms** in the viewer, not `prompt()` dialogs.
-- **Compile lock** prevents the watcher and `texwatch_compile()` from racing.
+- **Compile lock** prevents the watcher and `scholia_compile()` from racing.
 
 Net code change: roughly −1200 lines across the project.
 
 ## Configuration
 
-`.texwatch.yaml`:
+`.scholia.yaml`:
 
 ```yaml
 main: paper.tex
@@ -123,7 +123,7 @@ compiler: auto       # auto | latexmk | pdflatex | xelatex | lualatex | pandoc
 port: 8765
 ```
 
-Comments live in `.texwatch/comments.json`. `git add` it to keep your review history with the paper.
+Comments live in `.scholia/comments.json`. `git add` it to keep your review history with the paper.
 
 ## License
 

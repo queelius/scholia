@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from texwatch.config import Config
-from texwatch.server import TexWatchServer
+from scholia.config import Config
+from scholia.server import ScholiaServer
 
 
 @pytest.fixture
@@ -34,10 +34,10 @@ def project(tmp_path: Path) -> Path:
 
 @pytest.fixture
 async def client(project: Path):
-    cfg = Config(main="paper.tex", config_path=project / ".texwatch.yaml")
-    server = TexWatchServer(cfg)
+    cfg = Config(main="paper.tex", config_path=project / ".scholia.yaml")
+    server = ScholiaServer(cfg)
     # Trigger a structure parse without compiling
-    from texwatch.structure import parse_structure
+    from scholia.structure import parse_structure
     server.structure = parse_structure(project)
     test_server = TestServer(server.app)
     test_client = TestClient(test_server)
@@ -253,14 +253,14 @@ async def client_with_pdf(project: Path):
     from datetime import datetime, timezone
 
     import fitz
-    from texwatch.compiler import CompileResult
-    from texwatch.config import Config
-    from texwatch.server import TexWatchServer
-    from texwatch.structure import parse_structure
+    from scholia.compiler import CompileResult
+    from scholia.config import Config
+    from scholia.server import ScholiaServer
+    from scholia.structure import parse_structure
     from aiohttp.test_utils import TestClient, TestServer
 
-    cfg = Config(main="paper.tex", config_path=project / ".texwatch.yaml")
-    server = TexWatchServer(cfg)
+    cfg = Config(main="paper.tex", config_path=project / ".scholia.yaml")
+    server = ScholiaServer(cfg)
     server.structure = parse_structure(project)
 
     # Build a tiny real PDF the server can render.
@@ -367,7 +367,7 @@ async def test_image_no_pdf_returns_404(client):
 
 
 def test_clamp_dpi_in_range():
-    from texwatch.server import _clamp_dpi
+    from scholia.server import _clamp_dpi
     assert _clamp_dpi(150) == 150
     assert _clamp_dpi("96") == 96
 
@@ -375,7 +375,7 @@ def test_clamp_dpi_in_range():
 def test_clamp_dpi_caps_extreme_values():
     """Without clamping, ?dpi=10000 would let any caller allocate
     multi-gigabyte pixmaps and OOM the daemon."""
-    from texwatch.server import _clamp_dpi
+    from scholia.server import _clamp_dpi
     assert _clamp_dpi(10000) == 600
     assert _clamp_dpi(0) == 36
     assert _clamp_dpi("99999") == 600
@@ -397,13 +397,13 @@ async def test_image_extreme_dpi_clamped(client_with_pdf):
 
 
 def test_parse_goto_target_recognizes_page_form():
-    from texwatch.mcp_server import parse_goto_target
+    from scholia.mcp_server import parse_goto_target
 
     assert parse_goto_target("p3", default_file="paper.tex") == {"page": 3}
 
 
 def test_parse_goto_target_recognizes_bare_line_with_default_file():
-    from texwatch.mcp_server import parse_goto_target
+    from scholia.mcp_server import parse_goto_target
 
     assert parse_goto_target("42", default_file="paper.tex") == {
         "line": 42,
@@ -412,7 +412,7 @@ def test_parse_goto_target_recognizes_bare_line_with_default_file():
 
 
 def test_parse_goto_target_recognizes_file_line():
-    from texwatch.mcp_server import parse_goto_target
+    from scholia.mcp_server import parse_goto_target
 
     assert parse_goto_target("intro.tex:7", default_file="paper.tex") == {
         "file": "intro.tex",
@@ -421,7 +421,7 @@ def test_parse_goto_target_recognizes_file_line():
 
 
 def test_parse_goto_target_falls_back_to_section():
-    from texwatch.mcp_server import parse_goto_target
+    from scholia.mcp_server import parse_goto_target
 
     assert parse_goto_target("Methods", default_file="paper.tex") == {
         "section": "Methods"
@@ -429,8 +429,8 @@ def test_parse_goto_target_falls_back_to_section():
 
 
 def test_resolve_section_to_source_handles_eof(project):
-    from texwatch.server import resolve_section_to_source
-    from texwatch.structure import parse_structure
+    from scholia.server import resolve_section_to_source
+    from scholia.structure import parse_structure
 
     structure = parse_structure(project)
     rs = resolve_section_to_source(
@@ -445,8 +445,8 @@ def test_resolve_section_to_source_handles_eof(project):
 
 
 def test_resolve_section_to_source_returns_none_for_unknown(project):
-    from texwatch.server import resolve_section_to_source
-    from texwatch.structure import parse_structure
+    from scholia.server import resolve_section_to_source
+    from scholia.structure import parse_structure
 
     structure = parse_structure(project)
     assert (

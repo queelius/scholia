@@ -1,6 +1,6 @@
 """Comment thread storage for paper review.
 
-texwatch v0.4.0 reframes the tool as a code-review-style commenting system
+scholia v0.4.0 reframes the tool as a code-review-style commenting system
 for LaTeX papers: the human is the reviewer, Claude Code is the author.
 This module provides the data model, JSON-backed storage, and anchor-
 durability logic.
@@ -343,7 +343,7 @@ STORE_VERSION = 1
 class CommentStore:
     """JSON-backed comment storage.
 
-    Comments live in ``<watch_dir>/.texwatch/comments.json``.  The file
+    Comments live in ``<watch_dir>/.scholia/comments.json``.  The file
     is small (one paper, typically <1k comments), so we read/write the
     whole file on each operation.
 

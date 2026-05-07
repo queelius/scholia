@@ -1,4 +1,4 @@
-"""Tests for texwatch.comments — anchors, threads, staleness."""
+"""Tests for scholia.comments — anchors, threads, staleness."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from texwatch.comments import (
+from scholia.comments import (
     Comment,
     CommentStore,
     PaperAnchor,
@@ -422,7 +422,7 @@ def test_store_concurrent_writers_no_lost_updates(tmp_path: Path):
         return  # no fcntl
 
     def _worker(path_str: str, n: int):
-        from texwatch.comments import CommentStore, PaperAnchor
+        from scholia.comments import CommentStore, PaperAnchor
         store = CommentStore(Path(path_str))
         for i in range(n):
             store.add(PaperAnchor(), f"msg {i}")

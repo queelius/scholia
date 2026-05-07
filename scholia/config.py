@@ -1,4 +1,4 @@
-"""Configuration loading and validation for texwatch."""
+"""Configuration loading and validation for scholia."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,9 +9,9 @@ import yaml
 
 @dataclass
 class Config:
-    """Runtime configuration for a texwatch project.
+    """Runtime configuration for a scholia project.
 
-    Loaded from .texwatch.yaml or constructed programmatically.
+    Loaded from .scholia.yaml or constructed programmatically.
     Used by the server and compiler to determine watch behavior.
 
     Attributes:
@@ -22,7 +22,7 @@ class Config:
         port: HTTP server port.
         page_limit: Optional page count warning threshold.
         snippets: User-defined LaTeX snippets keyed by trigger name.
-        config_path: Path to .texwatch.yaml file (used to resolve watch_dir).
+        config_path: Path to .scholia.yaml file (used to resolve watch_dir).
     """
 
     main: str
@@ -64,11 +64,11 @@ class Config:
         return d
 
 
-DEFAULT_CONFIG_NAME = ".texwatch.yaml"
+DEFAULT_CONFIG_NAME = ".scholia.yaml"
 
 
 def find_config(start_dir: Path | None = None) -> Path | None:
-    """Find .texwatch.yaml in current or parent directories."""
+    """Find .scholia.yaml in current or parent directories."""
     if start_dir is None:
         start_dir = Path.cwd()
 
@@ -86,7 +86,7 @@ def load_config(path: Path | None = None, main_file: str | None = None) -> Confi
     """Load configuration from file or create default.
 
     Args:
-        path: Explicit path to config file. If None, searches for .texwatch.yaml.
+        path: Explicit path to config file. If None, searches for .scholia.yaml.
         main_file: Override main file from CLI argument.
 
     Returns:
@@ -121,7 +121,7 @@ def create_config(
     port: int = 8765,
     output_path: Path | None = None,
 ) -> Path:
-    """Create a new .texwatch.yaml configuration file.
+    """Create a new .scholia.yaml configuration file.
 
     Args:
         main: Main TeX file.
@@ -129,7 +129,7 @@ def create_config(
         ignore: List of glob patterns to ignore.
         compiler: Compiler to use.
         port: Server port.
-        output_path: Where to write config. Defaults to ./.texwatch.yaml.
+        output_path: Where to write config. Defaults to ./.scholia.yaml.
 
     Returns:
         Path to created config file.

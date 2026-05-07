@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from texwatch.synctex import (
+from scholia.synctex import (
     PDFPosition,
     SourcePosition,
     SyncTeXData,
@@ -319,46 +319,46 @@ class TestSyncTeXLogging:
 
     def test_source_to_page_logs_exact_match(self, synctex_data, caplog):
         """Test that exact match is logged."""
-        with caplog.at_level(logging.DEBUG, logger="texwatch.synctex"):
+        with caplog.at_level(logging.DEBUG, logger="scholia.synctex"):
             source_to_page(synctex_data, "main.tex", 10)
         assert "EXACT match" in caplog.text
 
     def test_source_to_page_logs_nearest_match(self, synctex_data, caplog):
         """Test that nearest match is logged with delta."""
-        with caplog.at_level(logging.DEBUG, logger="texwatch.synctex"):
+        with caplog.at_level(logging.DEBUG, logger="scholia.synctex"):
             source_to_page(synctex_data, "main.tex", 8)
         assert "NEAREST match" in caplog.text
         assert "delta=" in caplog.text
 
     def test_source_to_page_logs_no_match(self, synctex_data, caplog):
         """Test that no-match is logged."""
-        with caplog.at_level(logging.DEBUG, logger="texwatch.synctex"):
+        with caplog.at_level(logging.DEBUG, logger="scholia.synctex"):
             source_to_page(synctex_data, "nonexistent.tex", 1)
         assert "NO MATCH" in caplog.text
 
     def test_page_to_source_logs_closest_y(self, synctex_data, caplog):
         """Test that closest y lookup is logged."""
-        with caplog.at_level(logging.DEBUG, logger="texwatch.synctex"):
+        with caplog.at_level(logging.DEBUG, logger="scholia.synctex"):
             page_to_source(synctex_data, 1, y=650.0)
         assert "closest y=" in caplog.text
         assert "delta=" in caplog.text
 
     def test_page_to_source_logs_missing_page(self, synctex_data, caplog):
         """Test that missing page is logged."""
-        with caplog.at_level(logging.DEBUG, logger="texwatch.synctex"):
+        with caplog.at_level(logging.DEBUG, logger="scholia.synctex"):
             page_to_source(synctex_data, 99)
         assert "page NOT in data" in caplog.text
 
     def test_parse_synctex_logs_stats(self, synctex_file, caplog):
         """Test that parse_synctex logs file and page counts."""
-        with caplog.at_level(logging.DEBUG, logger="texwatch.synctex"):
+        with caplog.at_level(logging.DEBUG, logger="scholia.synctex"):
             parse_synctex(synctex_file)
         assert "input file" in caplog.text.lower()
         assert "pages" in caplog.text
 
     def test_parse_synctex_logs_failure(self, tmp_path, caplog):
         """Test that parse_synctex logs read failure."""
-        with caplog.at_level(logging.DEBUG, logger="texwatch.synctex"):
+        with caplog.at_level(logging.DEBUG, logger="scholia.synctex"):
             parse_synctex(tmp_path / "nonexistent.synctex.gz")
         assert "failed to read" in caplog.text
 

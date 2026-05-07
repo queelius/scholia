@@ -1,4 +1,4 @@
-// texwatch v0.5.0 viewer
+// scholia v0.5.0 viewer
 //
 // The browser is read-only by design.  The human is a reviewer; the
 // agent is the author.  The viewer's job:

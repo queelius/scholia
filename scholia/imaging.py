@@ -1,12 +1,12 @@
 """PDF page / region rendering via pymupdf.
 
-Used by the ``/image`` HTTP endpoint and the ``texwatch_image`` MCP tool
+Used by the ``/image`` HTTP endpoint and the ``scholia_image`` MCP tool
 to give Claude a visual on the rendered output.  Rendering is the one
 job the agent genuinely can't do for itself: PDF rendering nuances
 (figure placement, equation typesetting, overfull-box wrap, table
 spacing) only show up in the actual PDF.
 
-pymupdf is an optional dependency (``pip install texwatch[image]``).
+pymupdf is an optional dependency (``pip install scholia[image]``).
 We surface a friendly message when it's missing rather than crashing.
 """
 
@@ -38,7 +38,7 @@ def _open_pdf(pdf_path: Path, page: int):
     if fitz is None:
         raise ImagingError(
             "PDF imaging requires pymupdf. "
-            "Install with: pip install 'texwatch[image]'"
+            "Install with: pip install 'scholia[image]'"
         )
     if not pdf_path.exists():
         raise ImagingError(f"PDF not found: {pdf_path}")
@@ -121,7 +121,7 @@ def resolve_image_target(
 ) -> tuple[int, tuple[float, float, float, float] | None]:
     """Map ``(page | source | comment_id)`` to ``(page, optional bbox)``.
 
-    Shared by the HTTP ``/image`` endpoint and the ``texwatch_image`` MCP
+    Shared by the HTTP ``/image`` endpoint and the ``scholia_image`` MCP
     tool.  Inputs are pre-parsed primitives; *comment_lookup* is a
     callable ``cid -> Comment | None`` so callers can supply either a
     daemon's :class:`CommentStore` or a freshly-loaded one.

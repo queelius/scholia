@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from texwatch.structure import (
+from scholia.structure import (
     DocumentStructure,
     Section,
     _extract_braced,

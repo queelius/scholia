@@ -1,4 +1,4 @@
-"""Tests for texwatch.imaging — page / region rendering, SyncTeX resolution."""
+"""Tests for scholia.imaging — page / region rendering, SyncTeX resolution."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ import pytest
 # Skip the whole module if pymupdf isn't installed.
 fitz = pytest.importorskip("fitz")
 
-from texwatch.imaging import (
+from scholia.imaging import (
     ImagingError,
     render_page,
     render_region,
     resolve_source_to_region,
 )
-from texwatch.synctex import PDFPosition, SyncTeXData
+from scholia.synctex import PDFPosition, SyncTeXData
 
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"

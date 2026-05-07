@@ -1,4 +1,4 @@
-"""aiohttp web server for texwatch v0.4.0.
+"""aiohttp web server for scholia v0.4.0.
 
 Single paper, no workspace abstraction.  Three responsibilities:
 
@@ -48,7 +48,7 @@ from .synctex import (
     parse_synctex,
     source_to_page,
 )
-from .watcher import TexWatcher
+from .watcher import Scholiaer
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +202,7 @@ def load_synctex_for_main(main_file: Path) -> SyncTeXData | None:
 # ---------------------------------------------------------------------------
 
 
-class TexWatchServer:
+class ScholiaServer:
     """Single-paper watch + serve + comment store."""
 
     def __init__(self, config: Config):
@@ -214,14 +214,14 @@ class TexWatchServer:
         self.synctex_data: SyncTeXData | None = None
         self.structure: DocumentStructure | None = None
         self.compiling = False
-        # Serialize do_compile so the watcher and texwatch_compile() don't
+        # Serialize do_compile so the watcher and scholia_compile() don't
         # race; second caller awaits the in-flight build instead of
         # starting a parallel one.
         self._compile_lock = asyncio.Lock()
 
-        self.comments = CommentStore(self.watch_dir / ".texwatch" / "comments.json")
+        self.comments = CommentStore(self.watch_dir / ".scholia" / "comments.json")
         self.websockets: set[web.WebSocketResponse] = set()
-        self.watcher: TexWatcher | None = None
+        self.watcher: Scholiaer | None = None
 
         self.app = self._build_app()
 
@@ -722,7 +722,7 @@ class TexWatchServer:
         await self.do_compile()
         # Start watcher
         loop = asyncio.get_running_loop()
-        self.watcher = TexWatcher(
+        self.watcher = Scholiaer(
             watch_dir=self.watch_dir,
             watch_patterns=self.config.watch,
             ignore_patterns=self.config.ignore,
@@ -734,7 +734,7 @@ class TexWatchServer:
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", port)
         await site.start()
-        logger.info("texwatch serving on http://127.0.0.1:%d", port)
+        logger.info("scholia serving on http://127.0.0.1:%d", port)
         # Run until cancelled
         try:
             await asyncio.Event().wait()
@@ -746,7 +746,7 @@ class TexWatchServer:
 
 def run(config: Config, port: int) -> None:
     """Synchronous entry point: build server, run until KeyboardInterrupt."""
-    server = TexWatchServer(config)
+    server = ScholiaServer(config)
     try:
         asyncio.run(server.start(port))
     except KeyboardInterrupt:
