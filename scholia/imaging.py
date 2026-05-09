@@ -186,6 +186,51 @@ def resolve_image_target(
     return page, bbox
 
 
+def page_text_hashes(pdf_path: Path) -> list[str]:
+    """Compute one content hash per page in *pdf_path*.
+
+    Used to detect which pages changed between compiles.  We hash the
+    extracted text rather than rendered pixels: text-level diffs catch
+    real edits, are cheap, and don't fluctuate with anti-aliasing
+    noise.  Pages that differ only in figure layout but not text
+    content won't show up; that's a known limitation.
+
+    Returns a list of hex digests, one per page.  Empty list if
+    pymupdf is missing or the file can't be opened.
+    """
+    if fitz is None or not pdf_path.exists():
+        return []
+    import hashlib
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return []
+    try:
+        return [
+            hashlib.sha1(doc[i].get_text("text").encode("utf-8")).hexdigest()
+            for i in range(len(doc))
+        ]
+    finally:
+        doc.close()
+
+
+def diff_page_hashes(prev: list[str], curr: list[str]) -> list[int]:
+    """Return 1-indexed page numbers that changed between *prev* and *curr*.
+
+    Pages added or removed (length mismatch) are reported as changed
+    starting from the first differing index.  An empty *prev* (first
+    compile of the session) yields no changes; the agent doesn't need
+    a "first compile" diff.
+    """
+    if not prev or not curr:
+        return []
+    n_common = min(len(prev), len(curr))
+    changed = [i + 1 for i in range(n_common) if prev[i] != curr[i]]
+    if len(curr) > len(prev):
+        changed.extend(range(len(prev) + 1, len(curr) + 1))
+    return changed
+
+
 def resolve_source_to_region(
     synctex: SyncTeXData,
     file: str,

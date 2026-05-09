@@ -419,6 +419,118 @@ def create_server(daemon_port: int = 8765) -> "FastMCP":
         )]
 
     @mcp.tool()
+    async def scholia_section(
+        name: str,
+        include_image: bool = True,
+        dpi: int = 150,
+    ) -> list[ImageContent | TextContent]:
+        """Deep-dive on one section: source + image + scoped comments in one call.
+
+        *name* matches the section title (case-insensitive) or a
+        ``\\label{...}`` value.  Returns:
+
+          - JSON with the section metadata, the verbatim source slice,
+            and any open comments anchored within the section's lines.
+          - Optionally an ImageContent of the rendered section.
+
+        Use this when zooming in on one section instead of the whole
+        paper.  Saves the agent the round-trips of scholia_paper +
+        Read(file:line-range) + scholia_image(source=...).
+        """
+        import base64
+
+        from . import imaging
+        from .comments import (
+            PdfRegionAnchor,
+            SectionAnchor,
+            SourceRangeAnchor,
+        )
+        from .config import get_main_file
+        from .server import resolve_section_to_source
+        from .structure import parse_structure
+
+        cfg, watch_dir, store = _load_project()
+        structure = parse_structure(watch_dir, get_main_file(cfg))
+        resolved = resolve_section_to_source(structure, watch_dir, name, name)
+        if resolved is None:
+            return [TextContent(type="text",
+                text=_err(f"no section matches {name!r}"))]
+
+        # Read the verbatim source slice.  Section line ranges include the
+        # heading itself; we keep that for context.
+        source_path = watch_dir / resolved.file
+        try:
+            lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            slice_text = "\n".join(lines[resolved.line_start - 1 : resolved.line_end])
+        except OSError:
+            slice_text = ""
+
+        # Find comments scoped to this section.  Three cases:
+        #   - SectionAnchor matching by title or label
+        #   - Source/PDF anchors whose resolved_source lies in this range
+        #   - PdfRegionAnchor with no resolved_source: harder to scope,
+        #     skip (they show up in the global queue instead)
+        scoped: list = []
+        lc_name = name.lower()
+        for c in store.list(status="open"):
+            if isinstance(c.anchor, SectionAnchor):
+                title_match = c.anchor.title.lower() == lc_name
+                label_match = c.anchor.label is not None and c.anchor.label == name
+                if title_match or label_match:
+                    scoped.append(c)
+                    continue
+            if c.resolved_source is None:
+                continue
+            if (
+                c.resolved_source.file == resolved.file
+                and resolved.line_start <= c.resolved_source.line_start <= resolved.line_end
+            ):
+                scoped.append(c)
+
+        payload = {
+            "section": {
+                "name": name,
+                "file": resolved.file,
+                "line_start": resolved.line_start,
+                "line_end": resolved.line_end,
+            },
+            "source": slice_text,
+            "comments": [c.to_dict() for c in scoped],
+        }
+
+        results: list[ImageContent | TextContent] = [
+            TextContent(type="text", text=_ok(payload))
+        ]
+
+        if include_image:
+            from .server import _clamp_dpi
+            pdf_path = get_main_file(cfg).with_suffix(".pdf")
+            if pdf_path.exists():
+                synctex = _load_synctex_cached(get_main_file(cfg))
+                pair = imaging.resolve_source_to_region(
+                    synctex,
+                    resolved.file,
+                    resolved.line_start,
+                    resolved.line_end,
+                ) if synctex else None
+                if pair is not None:
+                    page, bbox = pair
+                    try:
+                        png = await asyncio.to_thread(
+                            imaging.render_region,
+                            pdf_path, page, bbox, _clamp_dpi(dpi),
+                        )
+                        results.append(ImageContent(
+                            type="image",
+                            data=base64.b64encode(png).decode("ascii"),
+                            mimeType="image/png",
+                        ))
+                    except imaging.ImagingError:
+                        pass  # rendering failed; the JSON payload still suffices
+
+        return results
+
+    @mcp.tool()
     async def scholia_audit(focus: str | None = None) -> str:
         """Workflow primer for agent-initiated review.
 

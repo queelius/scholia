@@ -236,6 +236,10 @@ button {
 }
 .cmt.status-resolved { opacity: 0.6; }
 .cmt.status-dismissed { opacity: 0.4; }
+.cmt.is-focused {
+  /* j/k keyboard focus indicator */
+  box-shadow: 0 0 0 2px var(--accent), 0 0 0 4px var(--accent-soft);
+}
 
 .cmt-head {
   display: flex;

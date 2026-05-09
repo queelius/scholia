@@ -42,10 +42,11 @@ In the browser:
 - **"+ Note"** in the top bar for a paper-level comment ("the abstract is too long").
 - **Paper tab** lists sections with **"+ comment"** buttons for section-level comments.
 - **Reply / Resolve / Dismiss** are inline forms in each comment, not modals.
+- **Keyboard navigation**: `j` / `k` step through comments, `r` opens a reply form, `R` opens resolve, `d` opens dismiss, `Esc` cancels.
 
 ## The Claude Code workflow
 
-`scholia` auto-registers an MCP server in `.mcp.json` when it starts, exposing **6 tools**:
+`scholia` auto-registers an MCP server in `.mcp.json` when it starts, exposing **7 tools**:
 
 | Tool | What it does |
 |---|---|
@@ -53,8 +54,11 @@ In the browser:
 | `scholia_compile()` | Recompile and return structured errors with source context. |
 | `scholia_comment(action, ...)` | `add` / `reply` / `resolve` / `dismiss` / `delete`. Optional `suggestion={"old", "new"}` on add. |
 | `scholia_image(...)` | Render PDF region as PNG. Modes: `page=N`, `page+bbox`, `source="file:lstart-lend"`, `comment_id="c-..."`. |
+| `scholia_section(name)` | Deep-dive: source slice + rendered image + scoped comments for one section in one call. |
 | `scholia_audit(focus=...)` | Workflow primer for agent-initiated review. Returns guidance; the agent then files comments back as `author="claude"`. |
 | `scholia_goto(target)` | Scroll the running viewer to a section / page / line / label. |
+
+When a compile finishes, the WebSocket broadcasts `{"type": "compiled", ..., "pages_changed": [3, 7]}` so the agent can verify only the pages that actually shifted, not re-render the whole document.
 
 Notice what's absent: there's no `scholia_labels()`, no `scholia_citations()`, no `scholia_environments()`. Use `Grep`. The agent is better at it than we are.
 

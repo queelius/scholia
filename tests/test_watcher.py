@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from scholia.watcher import TexFileHandler, Scholiaer
+from scholia.watcher import TexFileHandler, Watcher
 
 
 class TestTexFileHandler:
@@ -345,12 +345,12 @@ class TestTexFileHandler:
 
 
 class TestScholiaer:
-    """Tests for Scholiaer class."""
+    """Tests for Watcher class."""
 
     def test_init(self, tmp_path):
-        """Test Scholiaer initialization."""
+        """Test Watcher initialization."""
         callback = AsyncMock()
-        watcher = Scholiaer(
+        watcher = Watcher(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],
@@ -365,7 +365,7 @@ class TestScholiaer:
     def test_start_stop(self, tmp_path):
         """Test starting and stopping watcher."""
         callback = AsyncMock()
-        watcher = Scholiaer(
+        watcher = Watcher(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],
@@ -384,7 +384,7 @@ class TestScholiaer:
 
     def test_is_running_property(self, tmp_path):
         """Test is_running property."""
-        watcher = Scholiaer(
+        watcher = Watcher(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],
@@ -403,7 +403,7 @@ class TestScholiaer:
     def test_stop_cancels_pending_task(self, tmp_path):
         """Test that stop() cancels any pending debounce task."""
         callback = AsyncMock()
-        watcher = Scholiaer(
+        watcher = Watcher(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],
@@ -427,7 +427,7 @@ class TestScholiaer:
 
     def test_is_running_false_after_stop(self, tmp_path):
         """Test is_running returns False after stop."""
-        watcher = Scholiaer(
+        watcher = Watcher(
             watch_dir=tmp_path,
             watch_patterns=["*.tex"],
             ignore_patterns=[],
