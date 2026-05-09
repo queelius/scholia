@@ -48,7 +48,7 @@ from .synctex import (
     parse_synctex,
     source_to_page,
 )
-from .watcher import Scholiaer
+from .watcher import Watcher
 
 logger = logging.getLogger(__name__)
 
@@ -235,10 +235,14 @@ class ScholiaServer:
         # race; second caller awaits the in-flight build instead of
         # starting a parallel one.
         self._compile_lock = asyncio.Lock()
+        # Per-page text hashes from the previous compile, for change
+        # detection.  Empty after process startup; populated on each
+        # successful build.
+        self._prev_page_hashes: list[str] = []
 
         self.comments = CommentStore(self.watch_dir / ".scholia" / "comments.json")
         self.websockets: set[web.WebSocketResponse] = set()
-        self.watcher: Scholiaer | None = None
+        self.watcher: Watcher | None = None
 
         self.app = self._build_app()
 
@@ -271,6 +275,7 @@ class ScholiaServer:
         async with self._compile_lock:
             self.compiling = True
             await self.broadcast({"type": "compiling", "status": True})
+            changed_pages: list[int] = []
             try:
                 self.last_result = await compile_tex(
                     main_file=self.main_file,
@@ -292,17 +297,33 @@ class ScholiaServer:
                             self.structure, self.watch_dir, title, label
                         ),
                     )
+                # Compute per-page text hashes and diff against the
+                # previous compile.  Gives the agent a cheap "what
+                # changed visually" signal without rendering everything.
+                if self.last_result.success and self.last_result.output_file:
+                    from . import imaging
+                    new_hashes = imaging.page_text_hashes(self.last_result.output_file)
+                    changed_pages = imaging.diff_page_hashes(
+                        self._prev_page_hashes, new_hashes
+                    )
+                    self._prev_page_hashes = new_hashes
+
                 logger.info(
-                    "Compile %s in %.2fs",
+                    "Compile %s in %.2fs%s",
                     "succeeded" if self.last_result.success else "failed",
                     self.last_result.duration_seconds,
+                    f" (pages changed: {changed_pages})" if changed_pages else "",
                 )
             finally:
                 self.compiling = False
                 await self.broadcast({"type": "compiling", "status": False})
-                await self.broadcast(
-                    {"type": "compiled", "result": _result_to_dict(self.last_result)}
-                )
+                msg: dict[str, Any] = {
+                    "type": "compiled",
+                    "result": _result_to_dict(self.last_result),
+                }
+                if changed_pages:
+                    msg["pages_changed"] = changed_pages
+                await self.broadcast(msg)
             return self.last_result
 
     async def on_file_change(self, changed_path: str) -> None:
@@ -734,7 +755,7 @@ class ScholiaServer:
         await self.do_compile()
         # Start watcher
         loop = asyncio.get_running_loop()
-        self.watcher = Scholiaer(
+        self.watcher = Watcher(
             watch_dir=self.watch_dir,
             watch_patterns=self.config.watch,
             ignore_patterns=self.config.ignore,

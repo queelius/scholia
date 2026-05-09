@@ -81,6 +81,8 @@ const state = {
   expanded: new Set(),
   // {cid, mode} when an inline reply/resolve/dismiss form is open.
   activeForm: null,
+  // Currently keyboard-focused comment (for j/k navigation).
+  focusedCommentId: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -412,8 +414,9 @@ function renderCommentItem(c) {
     if (inlineForm) children.push(inlineForm);
   }
 
+  const focused = state.focusedCommentId === c.id;
   return h("div", {
-    class: `cmt status-${c.status}`,
+    class: `cmt status-${c.status}${focused ? " is-focused" : ""}`,
     data: { commentId: c.id },
   }, ...children);
 }
@@ -817,9 +820,65 @@ async function jumpToComment(cid) {
 // Setup
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Keyboard navigation: j/k step through comments, r/R/d open inline forms,
+// Esc cancels.  Disabled while a textarea/input has focus or a dialog is
+// open, so it never eats real text input.
+// ---------------------------------------------------------------------------
+
+function attachKeyboardNav() {
+  document.addEventListener("keydown", (ev) => {
+    // Don't capture keys while the human is typing or a modal is open.
+    const tag = (ev.target.tagName || "").toUpperCase();
+    if (tag === "TEXTAREA" || tag === "INPUT" || tag === "SELECT") return;
+    if (ev.target.isContentEditable) return;
+    if (document.querySelector("dialog[open]")) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+
+    const visibleComments = state.comments;
+    if (visibleComments.length === 0) return;
+
+    // Resolve current focus; -1 means "nothing focused yet."
+    const idx = Math.max(-1, visibleComments.findIndex((c) => c.id === state.focusedCommentId));
+
+    if (ev.key === "j" || ev.key === "ArrowDown") {
+      ev.preventDefault();
+      focusComment(visibleComments[Math.min(idx + 1, visibleComments.length - 1)]);
+    } else if (ev.key === "k" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      focusComment(visibleComments[Math.max(idx - 1, 0)]);
+    } else if (ev.key === "r" && !ev.shiftKey && idx >= 0) {
+      ev.preventDefault();
+      setActiveForm(visibleComments[idx].id, "reply");
+    } else if (ev.key === "R" || (ev.key === "r" && ev.shiftKey)) {
+      if (idx >= 0) {
+        ev.preventDefault();
+        setActiveForm(visibleComments[idx].id, "resolve");
+      }
+    } else if (ev.key === "d" && idx >= 0) {
+      ev.preventDefault();
+      setActiveForm(visibleComments[idx].id, "dismiss");
+    } else if (ev.key === "Escape" && state.activeForm) {
+      ev.preventDefault();
+      state.activeForm = null;
+      renderComments();
+    }
+  });
+}
+
+function focusComment(c) {
+  if (!c) return;
+  state.focusedCommentId = c.id;
+  state.expanded.add(c.id);
+  renderComments();
+  const node = document.querySelector(`[data-comment-id="${c.id}"]`);
+  node?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
 function init() {
   attachSelectionListener();
   attachRegionDragListener();
+  attachKeyboardNav();
 
   $("#recompile-btn").addEventListener("click", () => fetch("/compile", { method: "POST" }));
   $("#paper-comment-btn").addEventListener("click", () =>

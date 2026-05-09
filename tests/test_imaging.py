@@ -163,3 +163,69 @@ def test_resolve_source_to_region_partial_match_ok():
     result = resolve_source_to_region(sx, "intro.tex", 1, 10)
     assert result is not None
     assert result[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# page_text_hashes / diff_page_hashes — change-detection signal for the
+# agent's "did my edit do what I expected" loop.
+# ---------------------------------------------------------------------------
+
+
+def test_page_text_hashes_basic(tiny_pdf: Path):
+    from scholia.imaging import page_text_hashes
+    hashes = page_text_hashes(tiny_pdf)
+    assert len(hashes) == 2
+    assert all(len(h) == 40 for h in hashes)
+    assert hashes[0] != hashes[1]
+
+
+def test_page_text_hashes_missing_pdf(tmp_path: Path):
+    from scholia.imaging import page_text_hashes
+    assert page_text_hashes(tmp_path / "nope.pdf") == []
+
+
+def test_diff_page_hashes_no_changes():
+    from scholia.imaging import diff_page_hashes
+    hashes = ["a", "b", "c"]
+    assert diff_page_hashes(hashes, hashes) == []
+
+
+def test_diff_page_hashes_some_changes():
+    from scholia.imaging import diff_page_hashes
+    assert diff_page_hashes(["a", "b", "c"], ["a", "X", "c"]) == [2]
+    assert diff_page_hashes(["a", "b", "c"], ["a", "X", "Y"]) == [2, 3]
+
+
+def test_diff_page_hashes_empty_prev_means_no_changes():
+    """First compile has no prior; report no changes (we don't want the
+    agent to think every page changed on session start)."""
+    from scholia.imaging import diff_page_hashes
+    assert diff_page_hashes([], ["a", "b"]) == []
+
+
+def test_diff_page_hashes_appended_pages():
+    """A new page added at the end counts as changed."""
+    from scholia.imaging import diff_page_hashes
+    assert diff_page_hashes(["a", "b"], ["a", "b", "c"]) == [3]
+
+
+def test_page_text_hashes_changes_when_content_edits(tiny_pdf: Path, tmp_path: Path):
+    """Editing one page's content changes only that page's hash."""
+    import fitz
+    from scholia.imaging import page_text_hashes
+
+    h1 = page_text_hashes(tiny_pdf)
+
+    edited = tmp_path / "edited.pdf"
+    doc = fitz.open()
+    p1 = doc.new_page()
+    p1.insert_text((72, 72), "Page 1 line 1")
+    p1.insert_text((72, 144), "Page 1 line 2")
+    p2 = doc.new_page()
+    p2.insert_text((72, 72), "DIFFERENT TEXT")
+    doc.save(edited)
+    doc.close()
+
+    h2 = page_text_hashes(edited)
+    assert h1[0] == h2[0]
+    assert h1[1] != h2[1]
